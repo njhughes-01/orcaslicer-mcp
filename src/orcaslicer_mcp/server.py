@@ -1,13 +1,16 @@
 from __future__ import annotations
 import asyncio
+import contextlib
 import json
+import math
 import os
 import re
 import datetime
 import sys
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Iterable, Literal
 from mcp.server.mcpserver import MCPServer, Image, Context
 from pydantic import Field
 from mcp.types import ToolAnnotations
@@ -35,6 +38,11 @@ from .printer import match as _pmatch
 from .printer.errors import PrinterError
 from .printer.snapshot import take_snapshot
 from .printer.status import _dur as _duration_text
+from .printer import cc2_receipts as _cc2_receipts  # noqa: F401 — the receipt classes, reachable
+from .printer import cc2_start as _cc2_start        # from the tests through this module's names
+from .printer import cc2_state as _cc2_state
+from .printer import cc2_transport as _cc2_transport
+from .printer import cc2_upload as _cc2_upload
 
 try:
     import importlib.metadata as _md
@@ -1562,6 +1570,462 @@ async def check_printer_match() -> dict:
     return await _with_printer(run)
 
 
+# --- Direct Elegoo Centauri Carbon 2 printing (explicitly opt-in) -------------
+# Four tools — cc2_status, cc2_list_files, cc2_upload_gcode, cc2_start_print — speak to the
+# printer directly (LAN discovery, MQTT, HTTP upload, one start command) through the
+# printer/cc2_* adapters, with no OrcaSlicer and no Home Assistant in the path.
+#
+# These are the server's only printer WRITEs, and MCP tool annotations are advisory metadata, a
+# hint to clients, never an access control. The control is here: two server-side gates, read
+# (ORCA_CC2_READ) and write (ORCA_CC2_WRITE), independent and default off. A gated-off tool
+# returns its refusal before loading the printer config or opening a transport, so no gate
+# refusal can touch the network. Credentials from the cc2_transport config (ORCA_CC2_ACCESS_CODE
+# / ORCA_CC2_ACCESS_CODE_FILE) never leave the adapters: they go only into the MQTT password and
+# the upload header, never into a reply, and returned text is checked against the configured
+# code before it goes out. Raw printer replies never reach the model either — replies are built
+# field by field from the adapters' parsed, fail-closed state, and everything passes through
+# _cc2_out(): strings capped, control characters stripped, non-JSON-safe numbers turned to None.
+
+ENV_CC2_READ = "ORCA_CC2_READ"
+ENV_CC2_WRITE = "ORCA_CC2_WRITE"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+_CC2_STR_MAX = 255           # retain exact printer filenames (up to 255 characters)
+_CC2_LIST_MAX = 200          # per-printer lists (trays, colours, tools) inside one reply
+_CC2_FILES_MAX = _CC2_LIST_MAX  # report truncation before the generic output cap
+
+_CC2_MACHINE_WORDS = {
+    0: "initializing", 1: "idle", 2: "printing", 3: "filament operating",
+    4: "filament operating (alt)", 5: "auto-leveling", 6: "PID calibrating",
+    7: "resonance testing", 8: "self-checking", 9: "updating", 10: "homing",
+    11: "file transferring", 12: "video composing", 13: "extruder operating",
+    14: "emergency stop", 15: "power-loss recovery",
+}
+
+
+def _cc2_enabled(var: str) -> bool:
+    """One opt-in, read fresh per call: unset or blank is off, whitespace counts as unset."""
+    return (os.environ.get(var) or "").strip().lower() in _TRUTHY
+
+
+def _cc2_gate(tool: str, write: bool) -> dict | None:
+    """The refusal a gated-off tool returns, or None when its own opt-in is on. Reads need
+    ORCA_CC2_READ; upload and start need ORCA_CC2_WRITE — independently, each default off."""
+    if _cc2_enabled(ENV_CC2_WRITE if write else ENV_CC2_READ):
+        return None
+    if write:
+        scope = f"{ENV_CC2_WRITE} (the writes: upload and start)"
+        var = ENV_CC2_WRITE
+    else:
+        scope = f"{ENV_CC2_READ} (the reads: status and file listing)"
+        var = ENV_CC2_READ
+    return {
+        "error": "disabled",
+        "tool": tool,
+        "message": (f"{tool} is switched off by this server's policy. The direct CC2 tools are "
+                    f"hidden and refused by default; this one needs {scope}."),
+        "hint": (f"Turn it on deliberately, for the one project that prints: set {var}=1 in "
+                 "this MCP server's environment. Tool annotations are advisory metadata, not "
+                 "an access control; this gate is the control. Nothing was sent to the printer."),
+    }
+
+
+def _cc2_upload_http_factory():
+    """The seam tests use to stand a fake chunk sender in place of httpx."""
+    return _cc2_upload.Cc2UploadHttp
+
+
+def _cc2_configured_code() -> str | None:
+    """The configured access code's text, for checking returned text against it before it goes
+    out. Loaded only to compare — never printed, never returned as part of a reply. Resolution
+    failure means no configured code, which is also the honest answer for redaction purposes."""
+    try:
+        cfg = _cc2_transport.load_config()
+    except (PrinterError, ValueError, RuntimeError, OSError):
+        return None
+    return cfg.access_code.value if cfg.access_code is not None else None
+
+
+def _cc2_out(value, _depth: int = 0, _code: str | None = "unset"):
+    """A reply, made safe to hand the model: plain JSON types only, strings stripped of control
+    characters and capped, floats finite, depth and list lengths bounded, everything else None.
+    A configured access code, if one ever rode in with a string, is replaced along the way — the
+    code is resolved once per top-level call, not once per string ("unset" is a sentinel so the
+    environment is read at call time, never at import)."""
+    if _code == "unset":
+        _code = _cc2_configured_code()
+    if _depth > 6:
+        return None
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value if abs(value) < 2 ** 63 else None
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        text = re.sub(r"[\x00-\x1f\x7f\u2028\u2029]", " ", value).strip()
+        if len(text) > _CC2_STR_MAX:
+            text = text[:_CC2_STR_MAX] + "…"
+        if _code and len(_code) >= 4 and _code in text:
+            text = text.replace(_code, "<redacted>")
+        return text
+    if isinstance(value, datetime.datetime):
+        return _cc2_out(value.isoformat(), _depth, _code)
+    if isinstance(value, dict):
+        out = {}
+        for k, v in list(value.items())[:64]:
+            out[_cc2_out(str(k), _depth + 1, _code)] = _cc2_out(v, _depth + 1, _code)
+        return out
+    if isinstance(value, (list, tuple, set, frozenset)) or isinstance(value, Iterable):
+        return [_cc2_out(v, _depth + 1, _code) for v in list(value)[:_CC2_LIST_MAX]]
+    return None
+
+
+def _cc2_err(e: PrinterError) -> dict:
+    """A printer failure in the shape every printer tool speaks ({error, message, hint, ...}),
+    sanitised: no credentials and no raw replies — the adapters keep both out of their messages
+    by construction, and this is the belt."""
+    return _cc2_out(e.as_dict())
+
+
+class _Cc2Session:
+    """One tool call's session: the open transport once it exists, the password it was met with,
+    and the sanitised refusal when opening failed. Closed by _cc2_session on every path."""
+    __slots__ = ("error", "password", "transport")
+
+    def __init__(self) -> None:
+        self.transport = None
+        self.password = None
+        self.error: dict | None = None
+
+
+async def _cc2_open_transport():
+    """Open one registered CC2 session; return ``(transport, password)``, the very credential the
+    MQTT handshake was met with, so an upload in the same session reuses the credential
+    discovery chose instead of re-guessing it. The password is captured by decorating the
+    production link with the transport's own factory — the address is still resolved and pinned
+    once inside open_transport, and nothing here opens a second lookup. This is also the single
+    seam tests use to stand a scripted fake session in place of a live printer. Never print or
+    return the password; it lives only in the returned object's headers from here on."""
+    seen: dict = {}
+
+    def record(host, password, client_id):
+        seen["password"] = password
+        return _cc2_transport._aiomqtt_link(host, password, client_id)
+
+    transport = await _cc2_transport.open_transport(_cc2_transport.load_config(),
+                                                    link_factory=record)
+    return transport, seen.get("password")
+
+
+@asynccontextmanager
+async def _cc2_session():
+    """Open one registered CC2 session, run the tool body, close it on every path. When opening
+    fails the session carries the sanitised refusal in .error, and no command was ever sent."""
+    sess = _Cc2Session()
+    try:
+        try:
+            sess.transport, sess.password = await _cc2_open_transport()
+        except PrinterError as e:
+            sess.error = _cc2_err(e)
+        yield sess
+    finally:
+        if sess.transport is not None:
+            with contextlib.suppress(Exception):  # cleanup never masks the failure it followed
+                await sess.transport.close()
+
+
+def _cc2_tray_word(tray) -> str:
+    return {"empty": "empty", "present": "present", "active": "active"}.get(tray.state.value,
+                                                                            "unknown")
+
+
+def _cc2_status_reply(status, transport) -> dict:
+    """A status reply built from the parsed, fail-closed state only — machine and canvas fields
+    the adapters verified, named on purpose; the raw 1002/2005 replies are never carried."""
+    m, c = status.machine, status.canvas
+    ok, why = status.ready_for_job()
+    known = (m.machine_status or 0) > 0     # null/absent machine_status is unknown, never 0/'idle'
+    ready: dict = {"ready_for_job": ok}
+    if why:
+        ready["why_not"] = why
+    job: dict = {"state": m.raw_print_state or "idle",
+                 "state_known": m.print_state.value != "unknown"}
+    if m.job_filename:
+        job["filename"] = m.job_filename
+    for k, v in (("current_layer", m.current_layer), ("total_layer", m.total_layer),
+                 ("progress", m.progress)):
+        if v is not None:
+            job[k] = v
+    if m.state_message:
+        job["message"] = m.state_message
+    trays = []
+    for t in c.trays:
+        entry = {"tray_id": t.tray_id, "canvas_id": t.canvas_id, "state": _cc2_tray_word(t),
+                 "raw_state": t.raw_state, "may_print_from_it": t.may_run_job, "active": t.active,
+                 "material": t.material, "brand": t.brand, "name": t.name, "color": t.color,
+                 "min_nozzle_temp_c": t.min_nozzle_temp, "max_nozzle_temp_c": t.max_nozzle_temp}
+        trays.append({k: v for k, v in entry.items() if v is not None})
+    return {
+        "printer": {"serial": transport.sn,
+                    "display": getattr(transport, "display", None)},
+        "machine": {"status": m.machine_status if known else None,
+                    "state_word": _CC2_MACHINE_WORDS.get(m.machine_status, "unknown")
+                    if known else "unknown"},
+        "sub_status": m.sub_status,
+        "error": m.error,
+        "job": job,
+        "temps": {"nozzle_c": m.nozzle_temp, "nozzle_target_c": m.nozzle_target,
+                  "bed_c": m.bed_temp, "bed_target_c": m.bed_target},
+        "canvas": {"connected": c.connected, "active_canvas_id": c.active_canvas_id,
+                   "active_tray_id": c.active_tray_id, "auto_refill": c.auto_refill,
+                   "trays": trays},
+        "ready": ready,
+    }
+
+
+async def _cc2_files_reply(transport) -> dict:
+    inventory = await _cc2_state.list_files(transport)  # refuses incomplete listings
+    files = []
+    for f in inventory.files[:_CC2_FILES_MAX]:
+        entry: dict = {"name": f.filename, "size_bytes": f.size}
+        if f.layers is not None:
+            entry["layers"] = f.layers
+        if f.tools:
+            entry["tools"] = list(f.tools)
+        if f.created is not None:
+            entry["created"] = f.created.isoformat()
+        if f.print_seconds is not None:
+            entry["est_print_s"] = f.print_seconds
+        if f.filament_grams is not None:
+            entry["est_filament_g"] = f.filament_grams
+        files.append(entry)
+    out = {"storage": inventory.storage, "complete": True,
+           "pages_certified": inventory.pages, "total": inventory.total, "files": files}
+    if inventory.total > len(files):
+        out["truncated_in_reply"] = True  # complete on the printer, trimmed in this reply only
+    return out
+
+
+def _cc2_tool_map(tool_to_tray):
+    """The one-tool mapping, as whole numbers. JSON objects carry string keys, so the tool index
+    and the tray number normally arrive as text like {"0": "3"}; surrounding spaces and an
+    optional '#' are tolerated, and any other spelling refuses with the exact words the caller
+    needs. Ambiguity is refused, never guessed at — silently falling back to tray 0 is the
+    measured failure mode this adapter documents, so no partial mapping ever reaches it."""
+    err = PrinterError(
+        "protocol_error",
+        'tool_to_tray must name exactly one tool and one tray, e.g. {"0": "3"} for tool 0 '
+        f"printing from tray 3 — got {str(tool_to_tray)[:120]!r}. Nothing was sent.",
+        hint="Pass one entry: the file's tool index (from cc2_upload_gcode) mapped to the tray "
+             "id (from cc2_status). Plain whole numbers or their decimal text both read; "
+             "nothing else does.", reason="tool_map")
+
+    def one(value) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, str):
+            s = value.strip().lstrip("#").strip()
+            if s.isdigit():
+                return int(s)
+        return None
+
+    if not isinstance(tool_to_tray, dict) or len(tool_to_tray) != 1:
+        raise err
+    (raw_tool, raw_tray), = tool_to_tray.items()
+    tool, tray = one(raw_tool), one(raw_tray)
+    if tool is None or tray is None:
+        raise err
+    return {tool: tray}
+
+
+@mcp.tool()
+async def cc2_status() -> dict:
+    """Direct state of the configured Elegoo Centauri Carbon 2: machine state, the current job,
+    nozzle and bed temperatures, and every CANVAS tray (state, material, colour, rated nozzle
+    range) from one fresh read. Read-only — it sends status requests only, never commands. Needs
+    this server's read opt-in (ORCA_CC2_READ=1); off by default.
+
+    Tray state: empty has no filament, present is loaded, active is loaded and the active spool —
+    active is available, never treated as empty. When data is missing, stale or unknown the tool
+    says so instead of guessing, and may_print_from_it is false. Use it to pick a tray for
+    cc2_start_print and to check the printer is idle first; for what is on the printer's disk use
+    cc2_list_files."""
+    async def run(transport):
+        return _cc2_status_reply(await _cc2_state.fetch_status(transport), transport)
+    denied = _cc2_gate("cc2_status", False)
+    if denied is not None:
+        return denied
+    async with _cc2_session() as sess:
+        if sess.transport is None:
+            return sess.error
+        try:
+            out = await run(sess.transport)
+        except PrinterError as e:      # an unreadable reply is a refusal, told the same way
+            return _cc2_err(e)
+        return _cc2_out(out)
+
+
+@mcp.tool()
+async def cc2_list_files() -> dict:
+    """The complete G-code inventory of the configured CC2 printer, or an explicit failure —
+    never a first page passed off as a listing. Read-only (no commands); needs the read opt-in
+    (ORCA_CC2_READ=1), off by default.
+
+    Each file: name, size in bytes, and when the printer reported them, layers, estimated time
+    and filament. A listing that cannot be proven complete comes back as an error naming the
+    numbers instead of a partial list; uploads and starts refuse incomplete listings too."""
+    denied = _cc2_gate("cc2_list_files", False)
+    if denied is not None:
+        return denied
+    async with _cc2_session() as sess:
+        if sess.transport is None:
+            return sess.error
+        try:
+            out = await _cc2_files_reply(sess.transport)
+        except PrinterError as e:      # an incomplete listing is reported, never half-listed
+            return _cc2_err(e)
+        return _cc2_out(out)
+
+
+@mcp.tool()
+async def cc2_upload_gcode(
+    path: Annotated[str, Field(description=(
+        "Absolute path of the local sliced G-code file to upload, on the machine running this "
+        "MCP server — typically the file save_gcode returned. The file is read, never modified, "
+        "and its path is not echoed back in the reply."))],
+    destination: Annotated[str, Field(description=(
+        "New basename for the file on the printer: a plain name ending in .gcode, e.g. "
+        "benchy-petg-2026-11-04.gcode. Never a path, and never an existing file's name — this "
+        "tool does not overwrite."))],
+) -> dict:
+    """Upload one sliced G-code file directly to the configured CC2 printer under a NEW name,
+    in 1 MiB chunks, and verify it on the printer's complete listing before writing the private
+    receipt that cc2_start_print requires. Needs this server's write opt-in (ORCA_CC2_WRITE=1);
+    off by default. Not idempotent: a failed, refused or ambiguous upload is never automatically
+    retried, and a partial file may sit on the printer under this name (the CC2 protocol offers
+    no delete) — the error says so, and choosing a fresh name is a human decision.
+
+    The file is read as evidence: its material, first-layer and steady nozzle and bed
+    temperatures, and its single tool index come from the bytes actually sent (a non-extruding
+    preheat is fine; cold or unverified extrusion, multi-tool files, and files whose config and
+    commands disagree are refused before anything is sent). One file tool only. The reply lists
+    the verified name and size and what the file's own bytes said; tool_to_tray for
+    cc2_start_print maps the reported tool_index to the tray chosen from cc2_status."""
+    denied = _cc2_gate("cc2_upload_gcode", True)
+    if denied is not None:
+        return denied
+    try:
+        dest = _cc2_upload.validate_destination(destination)
+    except PrinterError as e:
+        return _cc2_err(e)
+    async with _cc2_session() as sess:
+        if sess.transport is None:
+            return sess.error
+        try:
+            # The upload token is the very credential the MQTT session was met with — the same
+            # one discovery chose, never a re-guess, and it never leaves the request headers.
+            receipt = await _cc2_upload.upload_gcode(
+                sess.transport, path, dest, token=sess.password,
+                http_factory=_cc2_upload_http_factory())
+        except PrinterError as e:
+            return _cc2_err(e)
+    out = {
+        "uploaded": receipt.remote_filename,
+        "size_bytes": receipt.reported_size_bytes,
+        "content_sha256": receipt.content_sha256,
+        "material": receipt.material,
+        "tool_index": receipt.tool_index,
+        "nozzle_temp_c": {"first_layer": receipt.nozzle_first_layer_temp,
+                          "steady": receipt.nozzle_temp},
+        "bed_temp_c": {"first_layer": receipt.bed_first_layer_temp,
+                       "steady": receipt.bed_temp},
+        "extrusion_nozzle_temps_c": sorted(receipt.extrusion_nozzle_temps),
+        "commanded_nozzle_setpoints_c": sorted(set(receipt.commanded_nozzle_setpoints)),
+        "uploaded_at": receipt.uploaded_at,
+        "next": ("start it with cc2_start_print: filename exactly as uploaded, tool_to_tray "
+                 "mapping the tool_index above to a tray from cc2_status, and bed_clear=true "
+                 "only after a human has looked at the bed."),
+    }
+    return _cc2_out(out)
+
+
+@mcp.tool()
+async def cc2_start_print(
+    filename: Annotated[str, Field(description=(
+        "The exact uploaded basename to start, as cc2_upload_gcode reported it. Starts refuse "
+        "without this workflow's private receipt for that printer and name — a file that reached "
+        "the printer any other way cannot be started from here."))],
+    tool_to_tray: Annotated[dict[str, str], Field(description=(
+        'Exactly one entry mapping the file\'s single tool index to the tray that must feed it, '
+        'e.g. {"0": "3"} for tool 0 printing from tray 3. Tool index from cc2_upload_gcode, '
+        'tray id from cc2_status; the tray must report the same material the file was sliced '
+        'with. Multi-tool starts are not supported.'))],
+    bed_clear: Annotated[bool, Field(description=(
+        "Physical bed-clear assertion: true only after a human has looked at the build plate "
+        "and taken anything off it. Only true starts a print; false refuses."))],
+    leveling: Annotated[bool, Field(description=(
+        "Bed leveling for THIS print: true sends printer_check=true; false — the default — "
+        "sends printer_check=false explicitly, because the printer remembers the last value."))] = False,
+    observe_running: Annotated[bool, Field(description=(
+        "After an accepted start, take one read-only look at the printer and report whether it "
+        "is observed printing this exact file. Default true; false returns acceptance only."))] = True,
+    bed_warning: Annotated[str | None, Field(description=(
+        "OPTIONAL, normally omit: a slicer bed warning for this exact file that YOU read from "
+        "the same slice, carried through verbatim so the start result keeps it. The server "
+        "cannot verify it belongs to the uploaded file and never attaches slicer warnings on its "
+        "own; when absent, the result says the bed warning is unavailable."))] = None,
+) -> dict:
+    """Start one already-uploaded file printing on the configured CC2 printer — exactly one
+    start command, only after every check passes, and never a retry. Needs this server's write
+    opt-in (ORCA_CC2_WRITE=1); off by default. A write, and not idempotent: an accepted start
+    moves the machine, and a lost answer is reported as ambiguous, never resent.
+
+    Before the command leaves, re-read inside the per-printer lock: the private upload receipt,
+    the printer's complete listing naming this file at the receipted size, idle with no error
+    and no file held, and the mapped tray present or active on a connected canvas carrying the
+    same material with a rated nozzle range covering every temperature the file extrudes at.
+    Any failed check refuses before the printer is asked, naming the check. Bed leveling is off
+    by default and sent explicitly either way; pass leveling=true only when it was requested
+    for this print. The reply keeps accepted (the printer did not refuse) and observed_running
+    (its status names this file as printing) strictly apart — acceptance alone never claims a
+    print is running. A slicer bed warning is never invented or attached here: unless the
+    caller carried one from the same slice, the reply says the warning is unavailable."""
+    denied = _cc2_gate("cc2_start_print", True)
+    if denied is not None:
+        return denied
+    if not isinstance(leveling, bool) or not isinstance(observe_running, bool):
+        return {"error": "invalid_argument", "message": "leveling and observe_running must be booleans"}
+    try:
+        mapping = _cc2_tool_map(tool_to_tray)
+    except PrinterError as e:
+        return _cc2_err(e)
+    async with _cc2_session() as sess:
+        if sess.transport is None:
+            return sess.error
+        try:
+            result = await _cc2_start.start_print(
+                sess.transport, filename, mapping, bed_clear=bed_clear,
+                printer_check=leveling,
+                observe_running=observe_running, bed_warning=bed_warning)
+        except PrinterError as e:
+            return _cc2_err(e)
+    out = result.as_dict()
+    if bed_warning:
+        out["bed_warning_provenance"] = (
+            "carried_from_slice_unverified: the caller states this warning came from the same "
+            "slice as this file; this server cannot verify that, and a valid slice never proves "
+            "a warning is resolved")
+    else:
+        out["bed_warning_provenance"] = (
+            "unavailable: no slicer bed warning was carried, and this server cannot verify any "
+            "slicer warning belongs to this uploaded file — bed warnings are never attached to "
+            "an arbitrary file, and the G-code carries no warning marker this adapter reads")
+    return _cc2_out(out)
+
+
 # --- Tool annotations (title + read-only/destructive hints) -----------------
 # The Claude connectors directory requires every tool to carry a title and the
 # applicable readOnlyHint / destructiveHint. Kept as one table so completeness
@@ -1626,12 +2090,25 @@ _TOOL_ANNOTATIONS: dict[str, tuple[str, bool, bool]] = {
     "wait_for_printer": ("Wait for the printer", True, False),
     "list_print_history": ("List print history", False, False),
     "check_printer_match": ("Check the profile against the printer", True, False),
+    # Direct CC2 tools. The two reads carry readOnlyHint; the two writes carry
+    # destructiveHint=False (neither deletes — the CC2 protocol offers no delete, which is
+    # exactly why upload never overwrites) and deliberately NO idempotency hint: an upload is
+    # not replay-safe and a start is the definition of not. Annotations are advisory metadata,
+    # not an access control — the server-side gates above are the control.
+    "cc2_status": ("Read CC2 printer state directly", True, False),
+    "cc2_list_files": ("List files on the CC2 printer", True, False),
+    "cc2_upload_gcode": ("Upload G-code to the CC2 printer", False, False),
+    "cc2_start_print": ("Start a print on the CC2 printer", False, False),
 }
 
 
 # Tools that reach outside OrcaSlicer (the printer on the network), and tools that are safe to repeat
-# although they write local state.
-_OPEN_WORLD_TOOLS = frozenset({"get_printer_status", "wait_for_printer", "list_print_history", "check_printer_match"})
+# although they write local state. The four direct CC2 tools reach the printer directly too, so all
+# four are open-world — including their writes, which are additionally gated server-side (off by
+# default) because openWorldHint, like every annotation, is a hint and not a permission.
+_OPEN_WORLD_TOOLS = frozenset({"get_printer_status", "wait_for_printer", "list_print_history",
+                               "check_printer_match", "cc2_status", "cc2_list_files",
+                               "cc2_upload_gcode", "cc2_start_print"})
 _IDEMPOTENT_TOOLS = frozenset({"list_print_history"})
 
 
