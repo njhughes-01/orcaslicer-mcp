@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 
 import orcaslicer_mcp.server as srv
+from orcaslicer_mcp.printer import cc2_receipts
 
 # --------------------------------------------------------------------------- stand-ins
 
@@ -314,7 +315,7 @@ def make_receipt(**over):
          "extrusion_nozzle_temps": (260.0,), "tool_index": 0,
          "uploaded_at": datetime(2026, 11, 4, 1, 47, tzinfo=UTC)}
     d.update(over)
-    return srv._cc2_receipts.Cc2UploadReceipt(**d)
+    return cc2_receipts.Cc2UploadReceipt(**d)
 
 
 # --------------------------------------------------------------------------- 1. defaults: refused, zero network
@@ -541,7 +542,7 @@ async def test_upload_sends_parse_verifies_and_receipts_with_no_secrets(
     assert http.puts[0]["body"] == gcode_file.read_bytes()
 
     # the private receipt is in the store, and it binds the very bytes that were sent
-    stored = srv._cc2_receipts.Cc2ReceiptStore(receipts_dir).load(SN, DEST)
+    stored = cc2_receipts.Cc2ReceiptStore(receipts_dir).load(SN, DEST)
     assert stored is not None and stored.material == "PETG"
     assert stored.extrusion_nozzle_temps == (260.0,)
     assert (stored.reported_size_bytes, stored.sent_bytes) == (size, size)
@@ -565,7 +566,7 @@ async def test_upload_refuses_a_collision_without_retrying_or_overwriting(
     assert http.puts == [] and http.closes == 0   # never a byte, let alone a second try
     assert transport.methods() == [srv._cc2_state.METHOD_FILES]
     assert "Nothing was retried" not in out["message"]  # the refusal itself is clean
-    assert srv._cc2_receipts.Cc2ReceiptStore(receipts_dir).load(SN, DEST) is None
+    assert cc2_receipts.Cc2ReceiptStore(receipts_dir).load(SN, DEST) is None
 
 
 async def test_an_unreadable_file_refuses_before_any_byte_and_says_so(
@@ -591,7 +592,7 @@ def start_transport(**overrides) -> ScriptedTransport:
 
 @pytest.fixture
 def with_receipt(receipts_dir):
-    srv._cc2_receipts.Cc2ReceiptStore(receipts_dir).save(make_receipt())
+    cc2_receipts.Cc2ReceiptStore(receipts_dir).save(make_receipt())
     return receipts_dir
 
 

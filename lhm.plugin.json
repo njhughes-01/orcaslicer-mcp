@@ -284,6 +284,22 @@
     {
       "name": "check_printer_match",
       "description": "Does the active OrcaSlicer profile match the printer it will print on? Compares nozzle size, bed size and height, the highest speeds and accelerations, nozzle and bed temperatures, and firmware retraction against the printer's own Klipper settings."
+    },
+    {
+      "name": "cc2_status",
+      "description": "Direct state of the configured Elegoo Centauri Carbon 2: machine state, the current job, nozzle and bed temperatures, and every CANVAS tray (state, material, colour, rated nozzle range) from one fresh read. It sends status requests only, never commands."
+    },
+    {
+      "name": "cc2_list_files",
+      "description": "The complete G-code inventory of the configured CC2 printer, or an explicit failure. It never reports a first page as a complete listing. Read-only (no commands); needs the read opt-in (ORCA_CC2_READ=1), off by default."
+    },
+    {
+      "name": "cc2_upload_gcode",
+      "description": "Upload one sliced G-code file directly to the configured CC2 printer under a NEW name, in 1 MiB chunks, and verify it on the printer's complete listing before writing the private receipt that cc2_start_print requires. Needs this server's write opt-in (ORCA_CC2_WRITE=1); off by default."
+    },
+    {
+      "name": "cc2_start_print",
+      "description": "Start one already-uploaded file on the configured CC2 printer. Send exactly one start command only after every check passes, and never retry. Needs this server's write opt-in (ORCA_CC2_WRITE=1); off by default."
     }
   ],
   "prompts": [

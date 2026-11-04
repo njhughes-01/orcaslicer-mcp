@@ -38,8 +38,7 @@ from .printer import match as _pmatch
 from .printer.errors import PrinterError
 from .printer.snapshot import take_snapshot
 from .printer.status import _dur as _duration_text
-from .printer import cc2_receipts as _cc2_receipts  # noqa: F401 — the receipt classes, reachable
-from .printer import cc2_start as _cc2_start        # from the tests through this module's names
+from .printer import cc2_start as _cc2_start
 from .printer import cc2_state as _cc2_state
 from .printer import cc2_transport as _cc2_transport
 from .printer import cc2_upload as _cc2_upload
@@ -1845,7 +1844,7 @@ def _cc2_tool_map(tool_to_tray):
 async def cc2_status() -> dict:
     """Direct state of the configured Elegoo Centauri Carbon 2: machine state, the current job,
     nozzle and bed temperatures, and every CANVAS tray (state, material, colour, rated nozzle
-    range) from one fresh read. Read-only — it sends status requests only, never commands. Needs
+    range) from one fresh read. It sends status requests only, never commands. Needs
     this server's read opt-in (ORCA_CC2_READ=1); off by default.
 
     Tray state: empty has no filament, present is loaded, active is loaded and the active spool —
@@ -1870,8 +1869,8 @@ async def cc2_status() -> dict:
 
 @mcp.tool()
 async def cc2_list_files() -> dict:
-    """The complete G-code inventory of the configured CC2 printer, or an explicit failure —
-    never a first page passed off as a listing. Read-only (no commands); needs the read opt-in
+    """The complete G-code inventory of the configured CC2 printer, or an explicit failure.
+    It never reports a first page as a complete listing. Read-only (no commands); needs the read opt-in
     (ORCA_CC2_READ=1), off by default.
 
     Each file: name, size in bytes, and when the printer reported them, layers, estimated time
@@ -1978,8 +1977,8 @@ async def cc2_start_print(
         "cannot verify it belongs to the uploaded file and never attaches slicer warnings on its "
         "own; when absent, the result says the bed warning is unavailable."))] = None,
 ) -> dict:
-    """Start one already-uploaded file printing on the configured CC2 printer — exactly one
-    start command, only after every check passes, and never a retry. Needs this server's write
+    """Start one already-uploaded file on the configured CC2 printer. Send exactly one start
+    command only after every check passes, and never retry. Needs this server's write
     opt-in (ORCA_CC2_WRITE=1); off by default. A write, and not idempotent: an accepted start
     moves the machine, and a lost answer is reported as ambiguous, never resent.
 
