@@ -13,9 +13,15 @@ standby, printing, paused, complete, cancelled, error) and machine-code table (0
 1 idle, 2 printing … 14 emergency stop, 15 power-loss recovery), the 2005 ``canvas_info`` shape
 the Home Assistant CC2 client parses field-for-field (snake_case units and trays), and the 1044
 request exactly as the upstream integration and the protocol doc send it: ``{"storage_media":
-"local", "path": "/"}`` — no paging parameters at all. Nothing here invents a field the printer
-has never been seen to send: the uppercase ``print_status.Status``/``Filename`` one earlier
-draft required were another library's *mapped* names, and real replies answered them never.
+"local", "path": "/"}`` — no paging parameters at all, the one 1044 shape ever observed to answer
+this printer (fw 02.01.00.00 returned all 54 files in one such reply). For paging there are two
+candidate shapes in the sources and neither has been observed answered here: Elegoo's own LAN web
+client sends ``dir``/``offset``/``limit``, while the protocol doc's one example shows
+``page``/``page_size`` — a spelling first-party software for this device never uses, so the walk
+asks with the client's shape and trusts only its replies. Nothing here invents a field the
+printer has never been seen to send: the uppercase ``print_status.Status``/``Filename`` one
+earlier draft required were another library's *mapped* names, and real replies answered them
+never.
 
 Two rules hold everywhere. Fields a safety decision stands on (the machine status pair, the
 print state string, a tray's identity, a file's name and size) are required, and absent-or-
@@ -43,8 +49,11 @@ METHOD_STATUS = 1002
 METHOD_CANVAS = 2005
 METHOD_FILES = 1044
 
-FILE_PAGE_LIMIT = 100     # the page size observed on the wire: an unpageable 1044 reply capped
-                          # at exactly 100 entries of a 112-file printer while reporting total 112
+FILE_REQUEST_LIMIT = 100  # the page size OUR paged asks ask for; ours, not the printer's — see
+                          # list_files: no source on record establishes a page size this firmware
+                          # imposes, so a short reply is only read as the end of the listing when
+                          # the printer's own total says so (the official client's own default
+                          # limit is 20 and the protocol doc's example sends 50)
 MAX_FILE_PAGES = 64       # generous for this printer, finite so a stalling walk cannot loop
 _HEX_RE = re.compile(r"#[0-9A-Fa-f]{6}")
 _FILENAME_MAX = 255
@@ -491,6 +500,9 @@ class Cc2CanvasStatus:
                                f"The printer's {METHOD_CANVAS} reply reports no canvas units — "
                                "with nothing to check against, no tray can be called available.",
                                reason="canvas_incomplete")
+        if len(units) != 1:
+            raise Cc2DataError("protocol_error", "Multiple CANVAS units are not supported safely.",
+                               reason="canvas_unsupported")
         active_canvas = _int(info.get("active_canvas_id", 0), info, "active_canvas_id",
                              METHOD_CANVAS, "active canvas id", "canvas")
         active_tray = _int(info.get("active_tray_id", -1), info, "active_tray_id",
@@ -684,9 +696,12 @@ class Cc2FileInventory:
     """A file listing the printer proved complete: every entry of every page that answers, the
     count matching the total the printer reported, and every entry parsed. Anything less
     raised instead.
-    ``total`` is the printer's own number when it named one, and the certified count when it
-    didn't; ``pages`` counts the listing pages of the certified read — probe requests are
-    additional (see ``list_files``)."""
+    ``total`` is always the printer's own number — a listing it never counted is never certified,
+    so there is no certified count to substitute for a missing total. ``pages`` counts the listing
+    replies the certified inventory was actually ASSEMBLED FROM: one when the un-paged reply
+    certified itself, otherwise the paged asks, because the un-paged probe's entries are dropped
+    rather than merged into a paged listing (see ``list_files``). It is not a count of the requests
+    the read sent."""
     storage: str
     pages: int
     total: int
@@ -706,10 +721,11 @@ class Cc2FileInventory:
 
 
 def _read_files_page(result: Any) -> tuple[list, int | None]:
-    """One 1044 reply, gate by gate: object, envelope, file_list, total. The total is optional
-    — the protocol doc's example answer carries none, and the measured small-listing reply
-    needed none — but when present it must read as a plain non-negative int, because it is what
-    a complete listing is certified against."""
+    """One 1044 reply, gate by gate: object, envelope, file_list, total. A reply is parsed whether
+    or not it carries a total — the protocol doc's example answer carries none — but absence is
+    tolerated at the PARSE level only: ``total`` is what a complete listing is certified against,
+    so a reply without one is read and never certified, while a total that IS present must read as
+    a plain non-negative int or the reply is malformed."""
     if not isinstance(result, dict):
         raise Cc2DataError("protocol_error",
                            f"The printer's {METHOD_FILES} reply was not an object at all.",
@@ -733,63 +749,119 @@ def _read_files_page(result: Any) -> tuple[list, int | None]:
     return entries, total
 
 
+def _read_rows(entries: list, seen: dict[str, Cc2File], *, where: str) -> list[Cc2File]:
+    """Every entry of one 1044 reply, parsed and added to ``seen`` — refusing the whole read the
+    moment a name arrives twice. Twice in one reply is a listing that does not add up; twice
+    across replies is pages that overlap, which is what a printer that ignores ``offset`` answers
+    with. Nothing is silently de-duplicated: Elegoo's own LAN client merges pages by filename, and
+    a merge is exactly how an overlap becomes invisible and a short listing starts passing for a
+    complete one."""
+    rows: list[Cc2File] = []
+    for entry in entries:
+        f = _parse_entry(entry)
+        if f.filename in seen:
+            raise Cc2IncompleteDataError(
+                "protocol_error",
+                f"{f.filename!r} arrived twice in the printer's file listing ({where}), so its "
+                "pages overlap and no complete listing can be proven from them — nothing is "
+                "merged here and nothing is re-asked.", reason="pagination_overlap")
+        seen[f.filename] = f
+        rows.append(f)
+    return rows
+
+
 async def list_files(transport: Any, storage: str = "local", *,
                      timeout_s: float | None = None,
                      max_pages: int = MAX_FILE_PAGES) -> Cc2FileInventory:
     """Every gcode the printer holds, or a refusal — never a first page passed off as a listing.
 
-    The first ask is the request exactly as the protocol doc and the upstream integration send
-    it, the only 1044 request shape ever verified on this printer: ``{"storage_media": "local",
-    "path": "/"}`` — no paging parameters. A reply that delivers the whole listing (the count
-    matching its own reported total) is certified as it stands. A missing total cannot prove
-    completeness and is refused.
+    The first ask is the request exactly as the protocol doc and the upstream integration send it,
+    the only 1044 request shape ever observed to answer this printer: ``{"storage_media": "local",
+    "path": "/"}`` — no paging parameters, and on firmware 02.01.00.00 it answered all 54 files in
+    one reply. A reply that carries its own total and delivers exactly that many distinct names is
+    certified as it stands, for exactly one request.
 
-    A reply capped short of its total — the observed 100 entries of a 112-file printer — is
-    incomplete data, and completing it means paging with the only parameters the protocol doc
-    documents, ``page`` (1-based) and ``page_size``. Those parameters have never been verified
-    page-to-page on this printer, so the walk proves its completeness at the reply level or
-    nothing: every name must arrive exactly once, the collected count must land on the total,
-    and a page that repeats, contradicts or stalls the walk raises ``Cc2IncompleteDataError``
-    naming the numbers — including the most likely failure, a printer that ignores ``page`` and
-    hands back the same first hundred twice, which the duplicate check catches dead. One ask
-    per page, ever: this function does not retry, so a stalled walk ends in an honest refusal
-    rather than an invented success or a loop. Nothing here claims a live-tested second page:
-    completeness is a property of the replies, and absent the proof the answer is 'incomplete',
-    never '100 of 112 and off you go' — the mistake this inventory exists not to repeat."""
+    A reply that cannot certify itself — short of its total, or reporting no total at all — is
+    completed by paging, and paging asks with the parameters Elegoo's own LAN web client sends:
+    ``{"storage_media": "local", "dir": "/", "offset": n, "limit": FILE_REQUEST_LIMIT}``. The
+    protocol doc's single example shows ``page``/``page_size``, but that example is the whole of
+    the evidence for those names, first-party software for this device has never been seen to send
+    them, and no paged request of either spelling has ever been observed answered on this printer.
+    So the walk trusts its replies and nothing else:
+
+    * ``total`` is the printer's own count of the WHOLE listing — the reading Elegoo's client
+      applies (it reads ``total`` and accumulates entries against it) and the only reading that
+      can certify anything. A listing is certified when the distinct names collected land exactly
+      on it, and never without it: a firmware that answers with no total anywhere gets an honest
+      incomplete refusal, because there is nothing there to certify against.
+    * paged asks start at ``offset`` 0 and the probe's entries are dropped rather than merged in.
+      The probe carried no paging parameters, so its semantics and the paged family's are not
+      known to be the same thing, and interleaving two request families is how an invented
+      semantics gets into a listing. The probe is still used: every file it named must turn up in
+      the paged result, or the two shapes disagree about what the printer holds and nothing here
+      is reported at all.
+    * a name that arrives twice — in one reply or again on a later page — refuses the read. That
+      is the gate a printer which ignores ``offset`` walks into: its second page is its first one
+      over again.
+    * a page shorter than ``FILE_REQUEST_LIMIT`` proves the listing ended only when the printer's
+      total says it did. A short page short of the total, an empty page, a total that moves
+      mid-walk, more names than the total, and a walk that runs out of ``max_pages`` each refuse
+      with their own numbers.
+    * one ask per offset, ever. This function never retries and never repeats an ask, so a
+      stalling or repeating walk ends in a refusal that names what it saw — not in a second try at
+      a request whose answer already contradicted the first, and not in a loop.
+
+    Nothing here claims a live-tested second page: completeness is a property of the replies, and
+    absent the proof the answer is 'incomplete', never '100 of 112 and off you go'."""
     if storage != "local":
         raise ValueError(
-            f"storage {storage!r} has no verified 1044 request shape: only 'local' at path '/' "
-            "has ever been asked and answered (the Home Assistant helper's one-page-100 mistake "
-            "is why 'complete' matters more here than 'broad').")
+            f"storage {storage!r} has no verified 1044 request shape: only 'local' at the root "
+            "has ever been asked and answered. The removable volumes appear in the sources under "
+            "two different parameter spellings and were never observed answered at all, so asking "
+            "anyway would be inventing a request.")
     if max_pages < 1:
         raise ValueError("max_pages must be at least 1")
 
+    # ---- 1. the un-paged probe: the one 1044 request on record that answers this printer in full
     probe = await transport.request(METHOD_FILES, {"storage_media": "local", "path": "/"},
                                     timeout_s=timeout_s)
     entries, total = _read_files_page(probe)
-    first = [_parse_entry(e) for e in entries]  # malformed entry: refuse before anything else
+    # the throwaway ``seen`` map is deliberate: a name twice inside the un-paged reply is the
+    # printer contradicting itself, and that refuses the read before any paging is considered
+    probe_rows = _read_rows(entries, {}, where="in one un-paged reply")
+    probe_names = {f.filename for f in probe_rows}
     if total is None:
-        raise Cc2IncompleteDataError("protocol_error", "The printer did not report a file total; listing completeness is unknown.",
-                                     reason="pagination_incomplete")
-    if total is not None:
-        if len(first) > total:
+        why_first = (f"the un-paged reply named {len(probe_rows)} files and reported no total to "
+                     "certify against")
+    elif len(probe_rows) == total:
+        return Cc2FileInventory(storage="local", pages=1, total=total, files=tuple(probe_rows))
+    else:
+        if len(probe_rows) > total:
             raise Cc2IncompleteDataError(
                 "protocol_error",
-                f"The printer's {METHOD_FILES} reply sent {len(first)} files while reporting "
+                f"The printer's {METHOD_FILES} reply sent {len(probe_rows)} files while reporting "
                 f"only {total} — the listing does not add up.", reason="pagination_mismatch")
-        if len(first) == total:
-            return Cc2FileInventory(storage="local", pages=1, total=total, files=tuple(first))
-    # Short of complete: walk with the documented parameters and let the replies certify it.
+        why_first = (f"the un-paged reply delivered {len(probe_rows)} of the {total} files it "
+                     "counts")
+
+    # ---- 2. paging with the official client's own parameters: the replies certify it, or nothing
     by_name: dict[str, Cc2File] = {}
     ordered: list[Cc2File] = []
     pages = 0
-    complete = False
-    for page_no in range(1, max_pages + 1):
-        pages = page_no
+    certified: int | None = None
+    blocker = ""
+    while True:
+        if pages >= max_pages:
+            blocker = (f"the walk stopped at its own bound of {max_pages} listing pages with "
+                       f"{len(ordered)}" + (f" of {total}" if total is not None else "") +
+                       " files, so later pages were never proven")
+            break
+        offset = len(ordered)
         result = await transport.request(
             METHOD_FILES,
-            {"storage_media": "local", "path": "/", "page": page_no, "page_size": FILE_PAGE_LIMIT},
+            {"storage_media": "local", "dir": "/", "offset": offset, "limit": FILE_REQUEST_LIMIT},
             timeout_s=timeout_s)
+        pages += 1
         entries, page_total = _read_files_page(result)
         if page_total is not None:
             if total is None:
@@ -797,57 +869,55 @@ async def list_files(transport: Any, storage: str = "local", *,
             elif page_total != total:
                 raise Cc2IncompleteDataError(
                     "protocol_error",
-                    f"The printer's file total moved from {total} to {page_total} mid-walk — "
-                    "the listing changed under the read and cannot be certified.",
+                    f"The printer's file total moved from {total} to {page_total} mid-walk — the "
+                    "listing changed under the read and cannot be certified.",
                     reason="pagination_mismatch")
-        for e in entries:
-            f = _parse_entry(e)
-            if f.filename in by_name:
-                raise Cc2IncompleteDataError(
-                    "protocol_error",
-                    f"{f.filename!r} arrived on listing page {page_no} after an earlier page "
-                    f"already carried it — the printer's paging with 'page'/'page_size' is not "
-                    "producing distinct pages, so later pages cannot be proven and no listing "
-                    "is claimed.", reason="pagination_mismatch")
-            by_name[f.filename] = f
-            ordered.append(f)
+        rows = _read_rows(entries, by_name, where=f"at offset {offset}, page {pages}")
+        ordered.extend(rows)
         if total is not None and len(ordered) > total:
             raise Cc2IncompleteDataError(
                 "protocol_error",
                 f"The listing walk collected {len(ordered)} files against a total of {total} — "
                 "the listing does not add up.", reason="pagination_mismatch")
         if total is not None and len(ordered) == total:
-            complete = True
+            certified = total  # the printer's own count and its own distinct names, agreeing
             break
-        if len(entries) < FILE_PAGE_LIMIT:
+        if not rows:
+            blocker = (f"a page at offset {offset} came back empty " +
+                       (f"while the printer counts {total} files and only {len(ordered)} had "
+                        "arrived" if total is not None else
+                        "and no reply has reported a total at all") + " — the walk stalled")
+            break
+        if len(rows) < FILE_REQUEST_LIMIT:
             if total is None:
-                if len(ordered) < len(first):
-                    raise Cc2IncompleteDataError(
-                        "protocol_error",
-                        f"The listing shrank under the read: the first reply named {len(first)} "
-                        f"files and the walk ends with {len(ordered)} — no claim is made.",
-                        reason="pagination_mismatch")
-                complete = True  # short page, no total: the page walk ended itself as measured
+                repeating = probe_names == set(by_name)
+                blocker = (f"a page at offset {offset} answered {len(rows)} of the "
+                           f"{FILE_REQUEST_LIMIT} entries asked for while no 1044 reply, paged or "
+                           "un-paged, has reported a total — a short page only proves a listing "
+                           "ended when the printer's own count says it did" +
+                           (", and the paged reply repeated the un-paged one entry for entry, "
+                            "which is what a printer that ignores offset/limit answers"
+                            if repeating else ""))
                 break
-            raise Cc2IncompleteDataError(
-                "protocol_error",
-                f"The listing walk ended at {len(ordered)} files with a short page while the "
-                f"printer still reported {total} total — later pages were never delivered, so "
-                "this is an incomplete listing, not a listing.", reason="pagination_incomplete")
-    if not complete:
+            blocker = (f"the walk ended at {len(ordered)} files with a short page at offset "
+                       f"{offset} while the printer still reports {total} total — later pages "
+                       "were never delivered")
+            break
+        # a full page, still short of the total: ask the next offset — a new ask, never a repeat
+    if certified is None:
         raise Cc2IncompleteDataError(
             "protocol_error",
-            f"Stopped after {pages} pages with {len(ordered)}"
-            + (f" of {total}" if total is not None else "")
-            + " files listed: later pages of the listing could not be proven, and a partial "
-              "one is not a listing.", reason="pagination_incomplete")
-    if total is not None and len(ordered) != total:  # defensive: the branches above certify it
-        raise Cc2IncompleteDataError("protocol_error",
-                                     f"The certified count ({len(ordered)}) does not match the "
-                                     f"printer's total ({total}).", reason="pagination_incomplete")
-    return Cc2FileInventory(storage="local", pages=pages,
-                            total=total if total is not None else len(ordered),
-                            files=tuple(ordered))
+            f"File listing incomplete: {why_first}; {blocker}, so no listing is claimed. "
+            "A partial one is not a listing.", reason="pagination_incomplete")
+    lost = probe_names - set(by_name)
+    if lost:
+        raise Cc2IncompleteDataError(
+            "protocol_error",
+            f"The un-paged 1044 reply named {len(probe_rows)} files while the paged walk delivered "
+            f"{certified} and cannot account for {len(lost)} of them (e.g. {sorted(lost)[0]!r}): "
+            "the two request shapes disagree about what the printer holds, so neither is a "
+            "listing.", reason="pagination_mismatch")
+    return Cc2FileInventory(storage="local", pages=pages, total=certified, files=tuple(ordered))
 
 
 # --------------------------------------------------------------------------- reads and combinations

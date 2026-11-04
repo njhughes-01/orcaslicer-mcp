@@ -4,16 +4,20 @@ file list 1044. The envelopes here are the shapes actually observed on the real 
 paused frames use the lowercase wire fields the printer names (print_status.state a string:
 "" idle, "printing" live; filename/uuid/current_layer lowercase), the 2005 canvas_info shape is
 the one the Home Assistant CC2 client parses field-for-field, and the 1044 request is the one
-shape ever verified on this printer, {"storage_media": "local", "path": "/"} — whose observed
-answer capped at 100 entries of an 112-file listing while reporting total 112. Paging with the
-protocol doc's page/page_size parameters is modelled here with every failure mode a printer has
-been known for (ignoring the page, refusing it, stalling), because no second page has been
-observed on the live printer; nothing in this file is live-tested, and nothing claims to be.
+shape ever verified on this printer, {"storage_media": "local", "path": "/"} — whose measured
+answer was ALL 54 of its files in one reply. NO paged 1044 reply has ever been seen on this
+machine, and the sources do not agree on paging: Elegoo's own LAN web client sends
+{storage_media, dir?, offset, limit} while the protocol doc's lone example shows page/page_size,
+so files_transport models a capped reply and every failure mode a paging printer has (ignoring
+offset, overlapping pages, refusing the paged ask, stalling, never reporting a total) as the
+HYPOTHETICAL firmwares they are — none of them a capture, and none of them evidence that the
+printer does it. Nothing in this file is live-tested and nothing claims to be.
 Tray semantics are the design's observed ones: 0 empty, 1 present, 2 active — both loaded
 states feed a start, with material and range checks reserved for the start itself. Nothing here
 opens a socket: the transport is a scripted fake whose replies arrive by id."""
 from __future__ import annotations
 
+import contextlib
 import copy
 
 import pytest
@@ -135,6 +139,14 @@ def canvas_envelope(tray_list=None, mutate=None, **kw) -> dict:
     return payload
 
 
+def test_multiple_canvas_units_are_not_treated_as_one_connected_unit():
+    payload = canvas_payload([tray(0, 1)])
+    payload["canvas_info"]["canvas_list"].append(
+        {"canvas_id": 1, "connected": 0, "tray_list": [tray(1, 1)]})
+    with pytest.raises(st.Cc2DataError):
+        st.Cc2CanvasStatus.from_result(payload)
+
+
 SKULLBOWL = {  # one 1044 entry exactly as the protocol doc records it (fw 02.01.00.00)
     "filename": "ECC2_0.4_skullbowl_Elegoo Rapid PLA+ _0.2_1h26m.gcode",
     "size": 12484158, "create_time": 1789680958, "layer": 251, "print_time": 5137,
@@ -177,27 +189,57 @@ class Scripted:
         return [p for m, p in self.requests if m == st.METHOD_FILES]
 
 
-def files_transport(files: list[dict], *, report_total=True, paging="honest",
-                    page_cap=st.FILE_PAGE_LIMIT, extra=None):
-    """A 1044 transport whose reply shapes are all measured or documented, one behaviour at a
-    time: the probe request ({"storage_media","path"} — the only verified shape) answers up to
-    the observed 100-entry cap with a total; paged requests (page/page_size, the protocol doc's
-    parameters) answer their page. `paging` models the printer's second page, which nobody has
-    yet observed on this machine: "honest" delivers the real page, "ignore" hands back page one
-    again (the printer does not page), "refuse" declines page 2 with an error_code, "stall"
-    never ends. `report_total=False` omits total the way the protocol doc's example does;
-    `extra` mutates each result (callable(result, params) or dict update)."""
+def files_transport(files: list[dict], *, probe="full", paging="honest",
+                    total_when="always", extra=None):
+    """A 1044 transport that models exactly ONE printer behaviour at a time.
+
+    One reply in here is a capture: the un-paged probe of a firmware 02.01.00.00 printer, which
+    answered ``{"storage_media": "local", "path": "/"}`` with ALL 54 of its files in one reply
+    (``probe="full"`` — the default, and the measured behaviour). Everything else is a
+    HYPOTHETICAL firmware, modelled on purpose: no paged 1044 answer has ever been observed on
+    this machine, and Elegoo's LAN client (``dir``/``offset``/``limit``) and the protocol doc's
+    lone example (``page``/``page_size``) do not agree, so the walk has to survive whichever
+    printer it turns out to be facing.
+
+    probe:      "full"       the measured answer — everything, in one reply
+                "capped:N"   a reply that stops at N entries while its total counts more: the
+                             truncation a paging walk exists for, never observed on this printer
+                "censored:K" a reply that quietly omits the last K entries
+    paging:     how the official ``{dir, offset, limit}`` request answers —
+                "honest"     honours offset and limit
+                "ignore"     ignores offset: the head of the list, every single time
+                "overlap"    each page starts three entries before the previous one ended
+                "shifted"    skips one entry at every offset, so a file goes unlisted
+                "short"      answers one entry however many were asked for
+                "refuse"     declines the paged request with an error_code
+                "drift"      lets its total move mid-walk
+    total_when: which replies carry ``total`` — "always", "paged" (only the paged asks report it)
+                or "never" (the protocol doc's example reply carries none).
+    extra:      dict, or callable(result, params) applied to every result, for one-off lies.
+    """
     def reply(params):
-        paged = "page" in params
-        if paged and paging == "refuse" and params["page"] > 1:
+        paged = "limit" in params
+        if paged and paging == "refuse":
             return {"error_code": 3001}
-        start, size = 0, page_cap
         if paged:
-            size = params.get("page_size", page_cap)
-            start = 0 if paging == "ignore" else (params["page"] - 1) * size
-        page = copy.deepcopy(files[start:start + size])
-        result: dict = {"error_code": 0, "file_list": page}
-        if report_total:
+            limit, offset = params["limit"], params["offset"]
+            if paging == "ignore":
+                offset = 0
+            elif paging == "overlap":
+                offset = max(0, offset - 3)
+            elif paging == "shifted":
+                offset += 1
+            rows = files[offset:offset + limit]
+            if paging == "short" and len(rows) > 1:
+                rows = rows[:1]
+        elif probe.startswith("capped:"):
+            rows = files[:int(probe.split(":", 1)[1])]
+        elif probe.startswith("censored:"):
+            rows = files[:max(0, len(files) - int(probe.split(":", 1)[1]))]
+        else:
+            rows = list(files)
+        result: dict = {"error_code": 0, "file_list": copy.deepcopy(rows)}
+        if total_when == "always" or (total_when == "paged" and paged):
             result["total"] = len(files)
         if callable(extra):
             extra(result, params)
@@ -576,98 +618,223 @@ async def test_canvas_auto_refill_and_active_tray_are_strict():
 # --------------------------------------------------------------------------- file inventory (1044)
 
 
-async def test_the_only_request_that_leaves_is_the_verified_shape():
-    # probe request locked to the protocol doc's and the upstream integration's parameters;
-    # the walk may add ONLY the documented page/page_size parameters — never offset or limit,
-    # which this printer has never been observed to accept.
-    t = files_transport(full_files(112))
-    await st.list_files(t)
-    assert t.file_params()[0] == {"storage_media": "local", "path": "/"}
-    for params in t.file_params():
-        assert set(params) <= {"storage_media", "path", "page", "page_size"}
-        assert params["storage_media"] == "local" and params["path"] == "/"
+PROBE = {"storage_media": "local", "path": "/"}   # the only 1044 request ever observed to answer
 
 
-async def test_the_observed_100_of_112_case_becomes_a_proven_112():
-    # exactly the direct read: the unpageable answer carries 100 of 112 with total 112. The
-    # walk over the documented page/page_size parameters must deliver the rest or refuse.
+def paged(offset: int, limit: int = st.FILE_REQUEST_LIMIT) -> dict:
+    """One paged ask, spelled exactly as Elegoo's own LAN web client spells it: the storage, the
+    root as ``dir``, and ``offset``/``limit``. Not ``page``/``page_size`` — see the shape test."""
+    return {"storage_media": "local", "dir": "/", "offset": offset, "limit": limit}
+
+
+async def test_the_probe_is_the_measured_un_paged_shape_and_it_costs_one_request():
+    # When the un-paged reply certifies itself that is the whole read: no page, no page_size,
+    # no offset, no limit. Paging parameters only ever appear in a request that needed them.
+    t = files_transport(full_files(54))
+    inv = await st.list_files(t)
+    assert inv.count == 54 and inv.total == 54 and inv.pages == 1
+    assert t.file_params() == [PROBE]
+
+
+async def test_the_measured_54_file_one_reply_listing_is_complete_as_it_arrives():
+    # fw 02.01.00.00, protocol doc: "without page/page_size the printer returned all 54 files in
+    # one response". That reply is the listing — every name in it, in the printer's own order.
+    files = full_files(54)
+    inv = await st.list_files(files_transport(files))
+    assert [f.filename for f in inv.files] == [f["filename"] for f in files]
+    assert inv.count == 54 and inv.pages == 1
+
+
+async def test_a_probe_without_a_total_is_certified_by_the_official_paged_ask():
+    # The protocol doc's example 1044 reply carries no total, so "no total on the un-paged reply"
+    # is an expected shape rather than a defect. Elegoo's paged request does report one, and when
+    # it does with every un-paged name present, that is a proven listing — for one extra read.
+    t = files_transport(full_files(54), total_when="paged")
+    inv = await st.list_files(t)
+    assert inv.count == 54 and inv.total == 54 and inv.pages == 1
+    assert t.file_params() == [PROBE, paged(0)]
+
+
+async def test_a_capped_probe_walks_the_official_offset_limit_shape():
+    # A HYPOTHETICAL firmware whose un-paged reply stops at 100 entries while its total counts
+    # 112 — never observed on this printer, and the only thing that justifies paging at all. The
+    # walk re-reads from offset 0 instead of splicing two request families into one listing.
     files = full_files(112)
-    t = files_transport(files)
+    t = files_transport(files, probe="capped:100")
     inv = await st.list_files(t)
     assert inv.count == 112 and inv.total == 112 and inv.pages == 2
     assert [f.filename for f in inv.files] == [f["filename"] for f in files]
-    assert len(t.file_params()) == 3  # probe + page 1 + page 2, each asked exactly once
-    assert t.file_params()[1] == {"storage_media": "local", "path": "/", "page": 1,
-                                  "page_size": st.FILE_PAGE_LIMIT}
-    assert t.file_params()[2] == {"storage_media": "local", "path": "/", "page": 2,
-                                  "page_size": st.FILE_PAGE_LIMIT}
+    assert t.file_params() == [PROBE, paged(0), paged(100)]
 
 
-async def test_a_printer_that_ignores_page_is_caught_by_the_duplicate_gate():
-    # the failure the review named: no second page has ever been observed, so the walk must
-    # never trust one. A printer that answers every page with the same first hundred is
-    # refused as unprovable, not reported as 200 names of a 112-file printer.
-    t = files_transport(full_files(112), paging="ignore")
+@pytest.mark.parametrize("n", [11, 19, 20, 21, 25])
+async def test_walk_boundaries_land_exactly_on_the_total(monkeypatch, n):
+    monkeypatch.setattr(st, "FILE_REQUEST_LIMIT", 10)   # small, so the arithmetic is legible
+    t = files_transport(full_files(n), probe="capped:1")
+    inv = await st.list_files(t)
+    assert inv.count == n and inv.total == n and inv.pages == -(-n // 10)
+    assert t.file_params() == [PROBE] + [paged(o, 10) for o in range(0, n, 10)]
+
+
+async def test_page_page_size_are_never_asked_for():
+    # The doc example showing them is the whole of their evidence, and Elegoo's own software for
+    # this device sends offset/limit instead. Asking a real printer with the shape first-party
+    # software never sends would be testing an invention against someone's hardware.
+    for scenario in (dict(), dict(probe="capped:2"), dict(paging="ignore"),
+                     dict(total_when="never"), dict(paging="refuse"), dict(paging="overlap")):
+        t = files_transport(full_files(20), **scenario)
+        with contextlib.suppress(st.Cc2DataError):
+            await st.list_files(t)
+        keys = {k for params in t.file_params() for k in params}
+        assert keys <= {"storage_media", "path", "dir", "offset", "limit"}, t.file_params()
+
+
+async def test_a_printer_that_ignores_offset_is_caught_by_the_duplicate_gate():
+    # The failure the walk must never paper over: a firmware that accepts offset and answers the
+    # head of the list anyway. Its second page repeats its first, and one name arriving twice
+    # refuses the whole read — nothing is merged, and nothing is asked a second time.
+    t = files_transport(full_files(112), probe="capped:100", paging="ignore")
     with pytest.raises(st.Cc2IncompleteDataError) as e:
         await st.list_files(t)
-    assert e.value.code == "protocol_error" and "cannot" in e.value.message.lower()
-    assert len(t.file_params()) <= 3  # found out at page two, never a retry storm
+    assert e.value.details["reason"] == "pagination_overlap"
+    assert "batch-00000.gcode" in e.value.message        # the head of the list, handed back twice
+    assert t.file_params() == [PROBE, paged(0), paged(100)]  # found out, not fought
 
 
-async def test_a_printer_that_refuses_the_paged_request_refuses_the_inventory():
-    t = files_transport(full_files(112), paging="refuse")
+async def test_pages_that_overlap_are_refused_not_merged():
+    # Elegoo's client merges pages by filename; a merge is exactly how an overlap becomes
+    # invisible. Here the second page starts three entries early and the walk says so instead.
+    t = files_transport(full_files(112), probe="capped:100", paging="overlap")
+    with pytest.raises(st.Cc2IncompleteDataError) as e:
+        await st.list_files(t)
+    assert e.value.details["reason"] == "pagination_overlap"
+    assert len(t.file_params()) == 3                     # probe + two pages, then the refusal
+
+
+async def test_a_paged_family_that_loses_a_file_the_probe_named_is_refused():
+    # Certifying against the printer's own total is only honest while the two request shapes
+    # agree about what the printer holds. A firmware that skips an entry at every offset reaches a
+    # perfectly consistent count while quietly not listing a file the un-paged reply had named.
+    def counted_by_what_it_lists(result, params):
+        if "limit" in params:
+            result["total"] = len(result["file_list"])
+    t = files_transport(full_files(6), paging="shifted", total_when="never",
+                        extra=counted_by_what_it_lists)
+    with pytest.raises(st.Cc2IncompleteDataError) as e:
+        await st.list_files(t)
+    assert e.value.details["reason"] == "pagination_mismatch"
+    assert "batch-00000.gcode" in e.value.message        # the file that went unlisted
+
+
+async def test_a_paged_ask_the_printer_refuses_refuses_the_listing():
+    t = files_transport(full_files(112), probe="capped:100", paging="refuse")
     with pytest.raises(st.Cc2DataError) as e:
         await st.list_files(t)
-    assert e.value.details["error_code"] == 3001  # the printer's own refusal, not our invention
-
-
-async def test_pages_that_stall_or_shrink_fall_closed_not_forever():
-    t = files_transport(full_files(10 ** 4))  # total 10000, pages keep coming
-    with pytest.raises(st.Cc2IncompleteDataError):
-        await st.list_files(t, max_pages=5)
-    assert len(t.file_params()) == 6  # probe + 5 pages: bounded walk, then the honest refusal
-
-    shrinking = {"n": 0}
-
-    def shrink(result, params):
-        shrinking["n"] += 1
-        if params.get("page") == 2:
-            result["total"] = 999  # total moved under the walk
-    t = files_transport(full_files(112), extra=shrink)
-    with pytest.raises(st.Cc2IncompleteDataError):
-        await st.list_files(t)
+    assert e.value.details["error_code"] == 3001   # the printer's refusal, not our invention
+    assert t.file_params() == [PROBE, paged(0)]    # refused once, and asked exactly once
 
 
 async def test_a_short_page_that_leaves_the_total_short_is_incomplete_not_creative():
-    def lie(result, params):
-        result["total"] = 150  # promises pages the walk's short page two never fills
-    t = files_transport(full_files(112), extra=lie)
+    # A page shorter than it was allowed to be means the printer ran out — which contradicts a
+    # total it has not delivered. Two of its numbers cannot both be true, so nothing is claimed.
+    t = files_transport(full_files(112), probe="capped:100", paging="short")
     with pytest.raises(st.Cc2IncompleteDataError) as e:
         await st.list_files(t)
     assert "incomplete" in e.value.details["reason"]
+    assert "112" in e.value.message
 
 
-async def test_measured_one_reply_listings_are_complete_as_they_arrive():
-    # protocol doc, fw 02.01.00.00: "without page/page_size the printer returned all 54 files
-    # in one response" — that reply carries no total in the doc's example either.
-    for total_kw in ({},):
-        t = files_transport(full_files(54), **total_kw)
-        inv = await st.list_files(t)
-        assert inv.count == 54 and inv.pages == 1
-        assert len(t.file_params()) == 1  # and it cost one request, exactly as measured
+async def test_a_total_that_moves_mid_walk_is_refused():
+    def drift(result, params):
+        if "limit" in params and params["offset"] > 0:
+            result["total"] = 999            # the printer's count moved under the read
+    t = files_transport(full_files(250), probe="capped:100", extra=drift)
+    with pytest.raises(st.Cc2IncompleteDataError) as e:
+        await st.list_files(t)
+    assert "moved" in e.value.message
 
 
-async def test_a_full_page_without_a_total_is_walked_not_believed():
-    # exactly FILE_PAGE_LIMIT entries and no total: "possibly more" is not "complete".
-    t = files_transport(full_files(st.FILE_PAGE_LIMIT), report_total=False)
+async def test_a_walk_that_never_runs_out_stops_at_its_bound_and_says_so():
+    t = files_transport(full_files(10 ** 4), probe="capped:1")
+    with pytest.raises(st.Cc2IncompleteDataError) as e:
+        await st.list_files(t, max_pages=5)
+    assert len(t.file_params()) == 6         # probe + 5 pages: a bounded walk, then the refusal
+    assert "bound of 5" in e.value.message
+
+
+async def test_an_empty_page_that_never_reached_the_total_is_a_stall_not_an_end():
+    def vanished(result, params):
+        if "limit" in params:
+            result["file_list"] = []         # the paged ask answers nothing at all
+    t = files_transport(full_files(112), probe="capped:100", extra=vanished)
+    with pytest.raises(st.Cc2IncompleteDataError) as e:
+        await st.list_files(t)
+    assert "stalled" in e.value.message and "112" in e.value.message
+    assert len(t.file_params()) == 2         # and it stopped after the empty page, once
+
+
+@pytest.mark.parametrize("scenario", [
+    dict(probe="capped:100", paging="ignore"),
+    dict(probe="capped:100", paging="overlap"),
+    dict(probe="capped:100", paging="short"),
+    dict(probe="capped:100", paging="refuse"),
+    dict(probe="capped:100", paging="shifted"),
+    dict(total_when="never"),
+    dict(paging="shifted", total_when="never"),
+    dict(total_when="paged"),
+])
+async def test_nothing_is_ever_asked_twice_whatever_the_printer_does(scenario):
+    # No automatic retry in ANY branch: every 1044 ask of a read is distinct and offsets only ever
+    # advance. A lost or self-contradictory reply is a refusal, never a second chance at it —
+    # which is also why a printer that ignores offset walks into the duplicate gate immediately.
+    t = files_transport(full_files(112), **scenario)
+    with contextlib.suppress(st.Cc2DataError):
+        await st.list_files(t)
+    asks = t.file_params()
+    assert asks, "the read asked nothing at all"
+    signatures = [tuple(sorted(params.items())) for params in asks]
+    assert len(set(signatures)) == len(signatures), f"the same ask went out twice: {asks}"
+    offsets = [p["offset"] for p in asks if "offset" in p]
+    assert offsets == sorted(set(offsets)), asks
+
+
+async def test_a_listing_nobody_counted_is_refused_naming_the_exact_blocker():
+    # The honest end of the road: a firmware that reports no total anywhere AND repeats itself
+    # under offset/limit cannot have its completeness proven from its replies. This is the case
+    # this module must refuse, and the refusal says which fact is missing rather than guessing.
+    t = files_transport(full_files(54), total_when="never", paging="ignore")
+    with pytest.raises(st.Cc2IncompleteDataError) as e:
+        await st.list_files(t)
+    assert "no 1044 reply" in e.value.message and "total" in e.value.message
+    assert "ignores offset/limit" in e.value.message
+    assert "no listing" in e.value.message.lower()
+
+
+async def test_a_reply_that_stops_answering_total_honestly_still_answers():
+    t = Scripted({st.METHOD_FILES: {"file_list": [PETG]}})   # one entry, no total: unprovable
     with pytest.raises(st.Cc2IncompleteDataError):
         await st.list_files(t)
+
+    over = Scripted({st.METHOD_FILES: {"error_code": 0, "file_list": [PETG, SKULLBOWL],
+                                       "total": 1}})
+    with pytest.raises(st.Cc2DataError):  # two entries against a total of one: does not add up
+        await st.list_files(over)
 
 
 async def test_empty_printer_is_a_complete_empty_inventory():
     t = files_transport([])
     inv = await st.list_files(t)
     assert inv.files == () and inv.count == 0 and inv.total == 0 and inv.pages == 1
+    assert t.file_params() == [PROBE]
+
+
+async def test_an_empty_reply_without_a_total_still_needs_the_printers_number():
+    # An empty un-paged reply proves nothing on its own — an empty printer and a refusing one
+    # look identical. It becomes a certified empty listing when the printer counts zero files.
+    t = files_transport([], total_when="paged")
+    inv = await st.list_files(t)
+    assert inv.files == () and inv.count == 0 and inv.total == 0 and inv.pages == 1
+    assert t.file_params() == [PROBE, paged(0)]
 
 
 async def test_a_matching_total_needs_no_walk():
@@ -683,32 +850,20 @@ async def test_a_matching_total_needs_no_walk():
     assert inv.files[1].size == 4839523
 
 
-@pytest.mark.parametrize("n", [99, 100, 101, 112, 200, 212])
-async def test_pagination_boundaries_stay_complete_or_refuse(n):
-    t = files_transport(full_files(n))
-    inv = await st.list_files(t)
-    assert inv.count == n and inv.pages == (n + st.FILE_PAGE_LIMIT - 1) // st.FILE_PAGE_LIMIT
+async def test_single_page_duplicate_names_are_not_a_complete_inventory():
+    with pytest.raises(st.Cc2IncompleteDataError) as e:
+        await st.list_files(files_transport([PETG, PETG]))
+    assert e.value.details["reason"] == "pagination_overlap"
 
 
 async def test_only_the_verified_storage_is_askable():
-    # the u-disk 1044 request has never been sent or answered by anything on record: the one
-    # helper that might have used it sends an undocumented "dir" parameter and was never
-    # observed doing so. Asking anyway would be inventing a request.
+    # Nobody has ever asked a removable volume for anything: the sources offer two different
+    # parameter spellings for them and no reply, so there is no request to send. Asking anyway
+    # would be inventing a request shape against someone's printer.
     t = files_transport([])
     with pytest.raises(ValueError):
         await st.list_files(t, storage="u-disk")
     assert t.file_params() == []
-
-
-async def test_a_reply_that_stops_answering_total_honestly_still_answers():
-    t = Scripted({st.METHOD_FILES: {"file_list": [PETG]}})  # one entry, no total: complete shape
-    with pytest.raises(st.Cc2IncompleteDataError):
-        await st.list_files(t)
-
-    over = Scripted({st.METHOD_FILES: {"error_code": 0, "file_list": [PETG, SKULLBOWL],
-                                       "total": 1}})
-    with pytest.raises(st.Cc2DataError):  # two entries against a total of one: does not add up
-        await st.list_files(over)
 
 
 @pytest.mark.parametrize("missing", ["exception_status", "filename"])
@@ -735,15 +890,6 @@ async def test_malformed_exception_entry_is_not_clear():
 async def test_malformed_pages_are_refused_not_interpreted(mutate):
     t = files_transport(full_files(7), extra=mutate)
     with pytest.raises(st.Cc2DataError):
-        await st.list_files(t)
-
-
-async def test_overlapping_pages_are_a_changing_target_not_a_merge():
-    def shift(result, params):
-        if params.get("page") == 2:
-            result["file_list"] = copy.deepcopy(full_files(10)[:st.FILE_PAGE_LIMIT])
-    t = files_transport(full_files(112), extra=shift)
-    with pytest.raises(st.Cc2IncompleteDataError):
         await st.list_files(t)
 
 

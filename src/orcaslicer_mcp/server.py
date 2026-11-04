@@ -10,10 +10,10 @@ import sys
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Iterable, Literal
+from typing import Annotated, Any, Iterable, Literal
 from mcp.server.mcpserver import MCPServer, Image, Context
 from pydantic import Field
-from mcp.types import ToolAnnotations
+from mcp.types import TextContent, ToolAnnotations
 from .config import load_config
 from .client import OrcaClient
 from .errors import ApiError, Validation, NotFound, Conflict, ConfigError
@@ -38,8 +38,14 @@ from .printer import match as _pmatch
 from .printer.errors import PrinterError
 from .printer.snapshot import take_snapshot
 from .printer.status import _dur as _duration_text
+from .printer import cc2_canvas as _cc2_canvas
+from .printer import cc2_control as _cc2_control
+from .printer import cc2_history as _cc2_history
+from .printer import cc2_info as _cc2_info
+from .printer import cc2_peripherals as _cc2_peripherals
 from .printer import cc2_start as _cc2_start
 from .printer import cc2_state as _cc2_state
+from .printer import cc2_temperature as _cc2_temperature
 from .printer import cc2_transport as _cc2_transport
 from .printer import cc2_upload as _cc2_upload
 
@@ -1569,29 +1575,134 @@ async def check_printer_match() -> dict:
     return await _with_printer(run)
 
 
-# --- Direct Elegoo Centauri Carbon 2 printing (explicitly opt-in) -------------
-# Four tools — cc2_status, cc2_list_files, cc2_upload_gcode, cc2_start_print — speak to the
-# printer directly (LAN discovery, MQTT, HTTP upload, one start command) through the
-# printer/cc2_* adapters, with no OrcaSlicer and no Home Assistant in the path.
+# --- Direct Elegoo Centauri Carbon 2 printing (configured, never switched on) ----------------
+# Fifteen tools — the reads cc2_status, cc2_list_files, cc2_printer_info, cc2_file_detail,
+# cc2_file_thumbnail and cc2_print_history, then cc2_upload_gcode, cc2_start_print, the job
+# controls cc2_pause_print, cc2_resume_print and cc2_stop_print, then the peripheral controls
+# cc2_set_light, cc2_set_print_speed and cc2_set_temperature, and the CANVAS switch
+# cc2_set_auto_refill — speak to the
+# printer directly (LAN discovery, MQTT, HTTP upload, one start command, one control command) through
+# the printer/cc2_* adapters, with no OrcaSlicer and no Home Assistant in the path.
 #
-# These are the server's only printer WRITEs, and MCP tool annotations are advisory metadata, a
-# hint to clients, never an access control. The control is here: two server-side gates, read
-# (ORCA_CC2_READ) and write (ORCA_CC2_WRITE), independent and default off. A gated-off tool
-# returns its refusal before loading the printer config or opening a transport, so no gate
-# refusal can touch the network. Credentials from the cc2_transport config (ORCA_CC2_ACCESS_CODE
-# / ORCA_CC2_ACCESS_CODE_FILE) never leave the adapters: they go only into the MQTT password and
-# the upload header, never into a reply, and returned text is checked against the configured
-# code before it goes out. Raw printer replies never reach the model either — replies are built
-# field by field from the adapters' parsed, fail-closed state, and everything passes through
+# They are declared the way every other tool on this server is: a client sees all fifteen in
+# tools/list whether or not a printer has been configured. What makes them safe is not hiding them.
+# With no address set (ORCA_CC2_URL empty) every one of them refuses in-process and says so —
+# not_configured, with printer_contacted=false — before any address is resolved and before any
+# socket is opened; configuring ORCA_CC2_URL, plus the printer's access code in
+# ORCA_CC2_ACCESS_CODE / ORCA_CC2_ACCESS_CODE_FILE, is the ordinary configuration step that makes
+# them able to reach anything, exactly as ORCA_PRINTER_URL is for the Klipper printer tools. Nothing
+# here asks a second time: the config IS the opt-in, and a not_configured refusal is the honest
+# answer until it exists.
+#
+# These are the server's only printer WRITEs, and MCP tool annotations are advisory metadata, a hint
+# to a client, never an access control: the nine writes carry readOnlyHint=false and
+# cc2_stop_print additionally destructiveHint=true, and what actually reaches a human is the
+# maintainer companion's two-phase confirm, enforced in every control tool's own body so it still
+# holds for a client running with permission prompts off. Credentials from the cc2_transport config
+# (ORCA_CC2_ACCESS_CODE / ORCA_CC2_ACCESS_CODE_FILE) never leave the adapters: they go only into the
+# MQTT password and the upload header, never into a reply, and returned text is checked against the
+# configured code before it goes out. Raw printer replies never reach the model either — replies are
+# built field by field from the adapters' parsed, fail-closed state, and everything passes through
 # _cc2_out(): strings capped, control characters stripped, non-JSON-safe numbers turned to None.
 
-ENV_CC2_READ = "ORCA_CC2_READ"
-ENV_CC2_WRITE = "ORCA_CC2_WRITE"
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
+# The fifteen direct tools, in declaration order: the six reads first (the live state, the file
+# inventory, what the printer is, what one of its files is, what that file looks like, and what it has
+# printed before), then the
+# upload and the start, then the three job controls, then the three peripheral controls, then the
+# CANVAS auto-refill switch. Each is
+# registered by its own @mcp.tool() below, and tests assert that
+# this roster and the registered cc2_* set are the same list, so a decorator lost in a refactor fails
+# a test instead of quietly shrinking what a client is shown.
+CC2_TOOL_NAMES: tuple[str, ...] = (
+    "cc2_status", "cc2_list_files", "cc2_printer_info", "cc2_file_detail", "cc2_file_thumbnail",
+    "cc2_print_history",
+    "cc2_upload_gcode", "cc2_start_print",
+    "cc2_pause_print", "cc2_resume_print", "cc2_stop_print",
+    "cc2_set_light", "cc2_set_print_speed", "cc2_set_temperature", "cc2_set_auto_refill",
+)
+
+# Every key name a CC2 reply may carry, as the strings this server and its printer/cc2_* adapters
+# write, gathered from the reply builders and from every key the mocked cc2 tests have seen
+# arrive. _cc2_out runs the credential pass over dictionary KEYS as well as their values, which is
+# right for a key a printer invented and wrong for a key this server wrote: an access code is
+# whatever the printer's LAN happens to use, and a short one made the pass rewrite the reply's own
+# contract — with the code "a" the keys "filename" and "state" arrived as "filen<redacted>me" and
+# "st<redacted>te", so a trusted reply no longer matched the schema the model was told to expect.
+# Exact membership is what makes the exemption safe rather than a redaction hole: a listed name is
+# a string this source contains, so it goes out the same way whether the code is unset, set, or
+# different, and an exempt key therefore carries no fact about the secret — including the
+# pathological case where a printer invents a key that happens to equal a listed name, which
+# arrives as that name and nothing else. What the schema cannot do is hide a code that is a
+# substring of one of these names: a credential that short is no secret, and every value is still
+# passed, so a code never comes back in text. Every entry is identifier-shaped ([a-z0-9_]) on
+# purpose, so an exempt key can never itself need cleaning. When a reply grows a field, add its
+# name here: the two tests written against this list — one scanning the adapters' dictionary
+# literals, one answering every read tool under a one-letter access code — fail with the missing
+# name in their output if you forget.
+_CC2_REPLY_KEYS = frozenset({
+     "_filaments_answered", "accepted", "action", "active", "active_canvas_id", "active_tray_id",
+    "actual_now_c", "ambiguous", "asked", "asked_percent", "attachments", "auto_refill",
+    "auto_refill_is_known", "auto_refill_now", "auto_refill_raw_now", "auxiliary", "axes",
+    "base64_chars", "bed", "bed_c", "bed_clear_required", "bed_first_layer_temp", "bed_target_c",
+    "bed_temp", "bed_temp_c", "bed_warning", "bed_warning_provenance", "began_at", "begin_time",
+    "brand", "brightness", "build", "bytes", "camera_connected", "cancelled", "canvas",
+    "canvas_id", "canvas_load", "canvas_unload", "ceiling_c", "chamber", "changed", "client_id",
+    "color", "command_attempted", "commanded_bed_setpoints", "commanded_nozzle_setpoints",
+    "commanded_nozzle_setpoints_c", "complete", "completeness", "config", "confirm_required",
+    "connected", "content_sha256", "created", "current_layer", "deletion_proved", "dir",
+    "display", "distance", "driving_a_filament_operation", "duration_seconds", "empty",
+    "end_time", "ended_at", "entries", "entries_in_reply", "entries_kept", "error", "error_code",
+    "est_filament_g", "est_print_s", "extruder", "extrusion_nozzle_temps",
+    "extrusion_nozzle_temps_c", "fans_now_raw", "field", "filament_grams", "filaments",
+    "file_in_this_listing", "file_name", "file_now", "file_path", "file_size_bytes", "filename",
+    "files", "firmware", "first_layer", "hardware", "hardware_version", "has_more", "heater",
+    "heater_bed", "heater_is_known", "hint", "home", "homed_axes", "homed_axes_now", "how", "id",
+    "identity", "idle_reason", "image_kind", "inventory_complete", "job", "job_filename",
+    "job_state", "job_state_known", "kind", "last_print_time", "last_printed", "layers",
+    "layers_from_field", "led_status", "led_status_now", "light", "light_is_known", "light_on",
+    "light_on_now", "limit", "limit_basis", "listing_certified", "listing_count",
+    "listing_proves_nothing_because", "listing_total", "listing_why", "machine", "machine_status",
+    "material", "max_bytes", "max_nozzle_temp_c", "max_video_connections", "may_print_from_it",
+    "mcu_version", "message", "method", "min_nozzle_temp_c", "mode", "mode_is_known",
+    "mode_name_now", "mode_now", "model", "move", "name", "name_matches_request", "network",
+    "never_printed", "next", "next_offset", "no_temperature_condition", "not_reported", "note",
+    "notes", "nozzle", "nozzle_c", "nozzle_first_layer_temp", "nozzle_target", "nozzle_target_c",
+    "nozzle_temp", "nozzle_temp_c", "numbers", "observed_active_canvas_id",
+    "observed_active_tray_id", "observed_actual_c", "observed_auto_refill",
+    "observed_auto_refill_raw", "observed_canvas_connected", "observed_fan_changed",
+    "observed_fan_raw", "observed_homed_axes", "observed_job", "observed_led_status",
+    "observed_light_on", "observed_position", "observed_running", "observed_speed_mode",
+    "observed_speed_name", "observed_state", "observed_target_c", "observed_tray_color",
+    "observed_tray_count", "observed_tray_raw_state", "observed_tray_state",
+    "observed_tray_states", "offset", "order", "ota_version", "pages_certified", "params", "path",
+    "pause", "paused", "peripherals", "position_now", "power", "present", "preview",
+    "print_seconds", "printer", "printer_check", "printer_display", "printer_idle",
+    "printer_says", "printer_sn", "printing", "progress", "protocol_version", "raw", "raw_state",
+    "readback_unit", "ready", "ready_for_job", "reason", "receipt_sha256",
+    "remaining_memory_bytes", "remote_filename", "reported_size_bytes", "request_id", "requested",
+    "resolution", "resume", "returned", "sent", "sent_bytes", "sent_params", "serial",
+    "serial_agree", "session_serial", "setting", "sign_convention", "size_bytes", "slot_map",
+    "soc_version", "speed", "speed_mode", "speed_name", "standby", "started_accepted", "state",
+    "state_known", "state_word", "status", "status_labels", "steady", "stop", "storage",
+    "storage_media", "sub_status", "sub_status_word", "target_now_c", "task_id", "task_name",
+    "task_status", "task_status_label", "temps", "then_reads", "time_lapse_video_duration",
+    "time_lapse_video_size", "time_lapse_video_status", "time_lapse_video_url",
+    "time_lapse_video_url_withheld", "tool", "tool_index", "toolhead_load", "toolhead_retreat",
+    "tools", "total", "total_from_printer", "total_layers", "total_print_times", "tray_id",
+    "trays", "truncated_in_reply", "type", "unverified", "uploaded", "uploaded_at", "url",
+    "usb_connected", "value", "vendor_loaded_tray_id", "vendor_loaded_tray_note",
+    "vendor_step_choices_mm", "verb", "verified_on_this_printer", "version", "video_connections",
+    "waited_s", "waits_up_to_s", "warning", "warnings", "why_not", "will_send", "wire_formula",
+    "would_refuse", "xyz_size",
+})
 
 _CC2_STR_MAX = 255           # retain exact printer filenames (up to 255 characters)
 _CC2_LIST_MAX = 200          # per-printer lists (trays, colours, tools) inside one reply
-_CC2_FILES_MAX = _CC2_LIST_MAX  # report truncation before the generic output cap
+# The most files one cc2_list_files reply may carry, and it is held equal to the sanitiser's own
+# list cap above on purpose: _cc2_out would cut a longer list on its way out, and a page quietly cut
+# by a second unmentioned cap is the hidden truncation this tool must never have. So the tool caps
+# what it pages by the same number, and refuses a limit above it by name instead of answering short.
+_CC2_FILES_MAX = _CC2_LIST_MAX
 
 _CC2_MACHINE_WORDS = {
     0: "initializing", 1: "idle", 2: "printing", 3: "filament operating",
@@ -1600,33 +1711,6 @@ _CC2_MACHINE_WORDS = {
     11: "file transferring", 12: "video composing", 13: "extruder operating",
     14: "emergency stop", 15: "power-loss recovery",
 }
-
-
-def _cc2_enabled(var: str) -> bool:
-    """One opt-in, read fresh per call: unset or blank is off, whitespace counts as unset."""
-    return (os.environ.get(var) or "").strip().lower() in _TRUTHY
-
-
-def _cc2_gate(tool: str, write: bool) -> dict | None:
-    """The refusal a gated-off tool returns, or None when its own opt-in is on. Reads need
-    ORCA_CC2_READ; upload and start need ORCA_CC2_WRITE — independently, each default off."""
-    if _cc2_enabled(ENV_CC2_WRITE if write else ENV_CC2_READ):
-        return None
-    if write:
-        scope = f"{ENV_CC2_WRITE} (the writes: upload and start)"
-        var = ENV_CC2_WRITE
-    else:
-        scope = f"{ENV_CC2_READ} (the reads: status and file listing)"
-        var = ENV_CC2_READ
-    return {
-        "error": "disabled",
-        "tool": tool,
-        "message": (f"{tool} is switched off by this server's policy. The direct CC2 tools are "
-                    f"hidden and refused by default; this one needs {scope}."),
-        "hint": (f"Turn it on deliberately, for the one project that prints: set {var}=1 in "
-                 "this MCP server's environment. Tool annotations are advisory metadata, not "
-                 "an access control; this gate is the control. Nothing was sent to the printer."),
-    }
 
 
 def _cc2_upload_http_factory():
@@ -1645,12 +1729,24 @@ def _cc2_configured_code() -> str | None:
     return cfg.access_code.value if cfg.access_code is not None else None
 
 
+def _cc2_key(key: str, _depth: int, _code: str | None) -> str:
+    """One dictionary key of a reply, made safe the way its key needs. A name in
+    _CC2_REPLY_KEYS was written by this server, so it is the contract and goes out exactly as
+    written; any other key is text that came from somewhere else and takes the same pass a value
+    takes (see _CC2_REPLY_KEYS)."""
+    if key in _CC2_REPLY_KEYS:
+        return key
+    return _cc2_out(key, _depth, _code)
+
+
 def _cc2_out(value, _depth: int = 0, _code: str | None = "unset"):
     """A reply, made safe to hand the model: plain JSON types only, strings stripped of control
     characters and capped, floats finite, depth and list lengths bounded, everything else None.
     A configured access code, if one ever rode in with a string, is replaced along the way — the
     code is resolved once per top-level call, not once per string ("unset" is a sentinel so the
-    environment is read at call time, never at import)."""
+    environment is read at call time, never at import). Dictionary keys are the one place where the
+    pass is not applied blindly: a key this server wrote is the contract, so keys go through
+    _cc2_key, which exempts the names in _CC2_REPLY_KEYS and redacts every other key."""
     if _code == "unset":
         _code = _cc2_configured_code()
     if _depth > 6:
@@ -1662,18 +1758,18 @@ def _cc2_out(value, _depth: int = 0, _code: str | None = "unset"):
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, str):
+        if _code:
+            value = value.replace(_code, "<redacted>")
         text = re.sub(r"[\x00-\x1f\x7f\u2028\u2029]", " ", value).strip()
         if len(text) > _CC2_STR_MAX:
             text = text[:_CC2_STR_MAX] + "…"
-        if _code and len(_code) >= 4 and _code in text:
-            text = text.replace(_code, "<redacted>")
         return text
     if isinstance(value, datetime.datetime):
         return _cc2_out(value.isoformat(), _depth, _code)
     if isinstance(value, dict):
         out = {}
         for k, v in list(value.items())[:64]:
-            out[_cc2_out(str(k), _depth + 1, _code)] = _cc2_out(v, _depth + 1, _code)
+            out[_cc2_key(str(k), _depth + 1, _code)] = _cc2_out(v, _depth + 1, _code)
         return out
     if isinstance(value, (list, tuple, set, frozenset)) or isinstance(value, Iterable):
         return [_cc2_out(v, _depth + 1, _code) for v in list(value)[:_CC2_LIST_MAX]]
@@ -1727,6 +1823,12 @@ async def _cc2_session():
             sess.transport, sess.password = await _cc2_open_transport()
         except PrinterError as e:
             sess.error = _cc2_err(e)
+            if sess.error.get("error") == "not_configured":
+                # The one fact a caller must not have to infer from a config error: this refusal
+                # happened in this process, on the config check, before any address was resolved and
+                # before any socket was opened. Every other failure in this module could only ever
+                # mean a network attempt, so this is the field that says it did not happen.
+                sess.error["printer_contacted"] = False
         yield sess
     finally:
         if sess.transport is not None:
@@ -1737,6 +1839,18 @@ async def _cc2_session():
 def _cc2_tray_word(tray) -> str:
     return {"empty": "empty", "present": "present", "active": "active"}.get(tray.state.value,
                                                                             "unknown")
+
+
+def _cc2_peripheral_words(m) -> dict:
+    """What the printer says about its own light and print speed mode — the two read-backs this
+    firmware actually reports (1002 ``led.status`` and ``gcode_move_inf.speed_mode``). Both are
+    None when the printer did not report them: an absent reading is never turned into the other
+    value, and the speed mode in particular is never defaulted to the protocol's "normal" mode.
+    ``speed_name`` is the doc's name for a number in the table and None for any other number, which
+    is reported as the number it is."""
+    light_on, led_raw = _cc2_peripherals.light_word(m)
+    mode, name = _cc2_peripherals.speed_word(m)
+    return {"light_on": light_on, "led_status": led_raw, "speed_mode": mode, "speed_name": name}
 
 
 def _cc2_status_reply(status, transport) -> dict:
@@ -1776,6 +1890,7 @@ def _cc2_status_reply(status, transport) -> dict:
         "job": job,
         "temps": {"nozzle_c": m.nozzle_temp, "nozzle_target_c": m.nozzle_target,
                   "bed_c": m.bed_temp, "bed_target_c": m.bed_target},
+        "peripherals": _cc2_peripheral_words(m),
         "canvas": {"connected": c.connected, "active_canvas_id": c.active_canvas_id,
                    "active_tray_id": c.active_tray_id, "auto_refill": c.auto_refill,
                    "trays": trays},
@@ -1783,10 +1898,62 @@ def _cc2_status_reply(status, transport) -> dict:
     }
 
 
-async def _cc2_files_reply(transport) -> dict:
+def _cc2_page_args(offset: Any, limit: Any) -> tuple[int, int]:
+    """(offset, limit) checked before a session opens, because a bad page number is a caller mistake
+    and no printer should be asked about it.
+
+    The bound on ``limit`` is ``_CC2_FILES_MAX``, which is ``_cc2_out``'s own list cap: a larger
+    number would be cut to it on the way out, so it is refused here by name rather than answered as
+    a page that quietly arrives short. A page of at most that many is the most one reply can carry,
+    which is why there is no "give me everything" spelling of ``limit`` — ``offset`` is how the rest
+    is fetched, and the reply says so with its own next offset."""
+    for name, value in (("offset", offset), ("limit", limit)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise PrinterError(
+                "protocol_error",
+                f"cc2_list_files {name} must be a whole number, not {str(value)[:40]!r}.",
+                hint=f"Pass a plain integer for {name}: offset=0 starts at the first file, and "
+                     f"limit=<files> is at most {_CC2_FILES_MAX}.", reason="page_bounds")
+    if offset < 0:
+        raise PrinterError("protocol_error",
+                           f"cc2_list_files offset must not be negative (got {offset}).",
+                           hint="offset counts files to skip, so 0 is the first file. To read the "
+                                "next page, pass the reply's next_offset.", reason="page_bounds")
+    if limit < 1:
+        raise PrinterError("protocol_error",
+                           f"cc2_list_files limit must be at least 1 file (got {limit}).",
+                           hint=f"limit is how many files this reply carries, from 1 up to "
+                                f"{_CC2_FILES_MAX}; the reply names the next offset for the rest.",
+                           reason="page_bounds")
+    if limit > _CC2_FILES_MAX:
+        raise PrinterError("protocol_error",
+                           f"cc2_list_files limit must be at most {_CC2_FILES_MAX} files (got "
+                           f"{limit}): one reply cannot carry more than that.",
+                           hint=f"Ask for limit<={_CC2_FILES_MAX} and follow the reply's next_offset "
+                                f"(offset={_CC2_FILES_MAX} is the second page) until has_more is "
+                                "false. Nothing is withheld without saying so.",
+                           reason="page_bounds")
+    return offset, limit
+
+
+async def _cc2_files_reply(transport, offset: int = 0, limit: int = _CC2_FILES_MAX) -> dict:
+    """One bounded page of a listing the printer has been made to account for in full.
+
+    Two facts stay two keys, because they are two different claims. The printer is still asked for a
+    complete listing and ``_cc2_state.list_files`` still refuses to certify a partial one — that is
+    ``inventory_complete``, and no page of this reply changes it. ``complete`` is this reply's own
+    claim: true only when the page in hand IS the whole listing, so a page of 200 files of an
+    inventory of 212 says ``complete: false``, ``has_more: true`` and ``next_offset: 200`` instead of
+    the old reply's ``complete: true`` beside a truncation flag nobody could act on. Nothing is ever
+    withheld without its count and the exact offset that fetches the rest.
+
+    Every page re-reads and re-certifies the listing: nothing here is cached, because a stale listing
+    that swore a file was absent is worse than one extra read, and paging a printer listing is
+    honest-but-not-free in exactly the way it says in the tool's own text."""
     inventory = await _cc2_state.list_files(transport)  # refuses incomplete listings
+    page = inventory.files[offset:offset + limit]
     files = []
-    for f in inventory.files[:_CC2_FILES_MAX]:
+    for f in page:
         entry: dict = {"name": f.filename, "size_bytes": f.size}
         if f.layers is not None:
             entry["layers"] = f.layers
@@ -1799,10 +1966,23 @@ async def _cc2_files_reply(transport) -> dict:
         if f.filament_grams is not None:
             entry["est_filament_g"] = f.filament_grams
         files.append(entry)
-    out = {"storage": inventory.storage, "complete": True,
-           "pages_certified": inventory.pages, "total": inventory.total, "files": files}
-    if inventory.total > len(files):
-        out["truncated_in_reply"] = True  # complete on the printer, trimmed in this reply only
+    end = offset + len(files)
+    has_more = end < inventory.count
+    out = {"storage": inventory.storage,
+           "complete": not has_more and offset == 0,
+           "inventory_complete": True,
+           "total": inventory.total,
+           "offset": offset,
+           "limit": limit,
+           "returned": len(files),
+           "has_more": has_more,
+           "next_offset": end if has_more else None,
+           "truncated_in_reply": has_more,
+           "pages_certified": inventory.pages,
+           "files": files}
+    if has_more:
+        out["note"] = (f"{inventory.count - end} of {inventory.total} certified files are not in "
+                       f"this reply; ask again with offset={end} (limit up to {_CC2_FILES_MAX})")
     return out
 
 
@@ -1844,8 +2024,14 @@ def _cc2_tool_map(tool_to_tray):
 async def cc2_status() -> dict:
     """Direct state of the configured Elegoo Centauri Carbon 2: machine state, the current job,
     nozzle and bed temperatures, and every CANVAS tray (state, material, colour, rated nozzle
-    range) from one fresh read. It sends status requests only, never commands. Needs
-    this server's read opt-in (ORCA_CC2_READ=1); off by default.
+    range) from one fresh read. It sends status requests only, never commands. With no printer address
+    configured (ORCA_CC2_URL) it reports not_configured and opens no connection; set the address and
+    this is the tool that says whether the printer is idle and which tray can feed a print.
+
+    It also reports the overhead light and the print speed mode when the printer states them (1002
+    led.status and gcode_move_inf.speed_mode) and leaves both null when it does not: an absent
+    reading is never turned into "off" or into the protocol's default mode. A light is on above
+    zero, since the protocol documents led as 0/1 on some firmware and a 0-255 brightness on others.
 
     Tray state: empty has no filament, present is loaded, active is loaded and the active spool —
     active is available, never treated as empty. When data is missing, stale or unknown the tool
@@ -1854,9 +2040,6 @@ async def cc2_status() -> dict:
     cc2_list_files."""
     async def run(transport):
         return _cc2_status_reply(await _cc2_state.fetch_status(transport), transport)
-    denied = _cc2_gate("cc2_status", False)
-    if denied is not None:
-        return denied
     async with _cc2_session() as sess:
         if sess.transport is None:
             return sess.error
@@ -1868,25 +2051,219 @@ async def cc2_status() -> dict:
 
 
 @mcp.tool()
-async def cc2_list_files() -> dict:
-    """The complete G-code inventory of the configured CC2 printer, or an explicit failure.
-    It never reports a first page as a complete listing. Read-only (no commands); needs the read opt-in
-    (ORCA_CC2_READ=1), off by default.
+async def cc2_list_files(
+    offset: Annotated[int, Field(description=(
+        "Files of the certified inventory to skip, 0 for the first page. To read the rest of a "
+        "listing, pass the previous reply's next_offset unchanged. A negative or non-integer "
+        "offset refuses before any connection is opened."))] = 0,
+    limit: Annotated[int, Field(description=(
+        f"Files this reply carries, 1 to {_CC2_FILES_MAX}; the default is the maximum, which is "
+        "the most one reply can hold. A larger limit refuses with that cap and the offset to page "
+        "with — it never answers as a short page that quietly dropped the rest."))] = _CC2_FILES_MAX,
+) -> dict:
+    """A bounded page of the G-code inventory of the configured CC2 printer, or an explicit failure.
+    It never reports a first page as a complete listing and it never cuts a reply without saying so.
+    It sends no commands, and with no printer address configured (ORCA_CC2_URL) it reports
+    not_configured and opens no connection.
+
+    The printer is always asked to account for every file it holds — a listing it cannot prove
+    complete comes back as an error naming the numbers, never as a partial list, and uploads and
+    starts refuse incomplete listings too — and that certified inventory is then paged in the reply,
+    because one reply cannot carry an unlimited number of names. ``offset`` (default 0) says where in
+    the certified inventory this reply starts and ``limit`` (default and maximum 200 files) how many
+    it carries; a limit above 200 refuses by name rather than arriving short, and a bad offset or
+    limit refuses before any connection is opened.
+
+    Read the three counts as three facts. ``total`` and ``inventory_complete`` are the printer's:
+    how many files it holds, and that every one of them was read and certified. ``complete`` is this
+    reply's own, and it is true only when the page in hand IS the whole listing — so the second page
+    of a big shelf says ``complete: false`` even though the inventory is certified, and so does the
+    last page, which is why it is not the paging stop. When ``has_more`` is true, ``next_offset`` is
+    the exact argument that fetches what is missing and ``note`` says how many were left out; keep
+    calling with ``offset=next_offset`` until ``has_more`` is false, which is the end of the shelf.
+    ``returned`` is what this page holds. Asking for a later page re-reads and re-certifies
+    the listing (nothing is cached), so paging is honest but costs one certification per page.
 
     Each file: name, size in bytes, and when the printer reported them, layers, estimated time
-    and filament. A listing that cannot be proven complete comes back as an error naming the
-    numbers instead of a partial list; uploads and starts refuse incomplete listings too."""
-    denied = _cc2_gate("cc2_list_files", False)
-    if denied is not None:
-        return denied
+    and filament."""
+    try:
+        page_offset, page_limit = _cc2_page_args(offset, limit)
+    except PrinterError as e:          # a bad page number is refused before a session exists
+        return _cc2_err(e)
     async with _cc2_session() as sess:
         if sess.transport is None:
             return sess.error
         try:
-            out = await _cc2_files_reply(sess.transport)
+            out = await _cc2_files_reply(sess.transport, page_offset, page_limit)
         except PrinterError as e:      # an incomplete listing is reported, never half-listed
             return _cc2_err(e)
         return _cc2_out(out)
+
+
+@mcp.tool()
+async def cc2_printer_info() -> dict:
+    """What the configured CC2 printer says about itself: model, the name its touchscreen carries,
+    serial, firmware versions, hardware and protocol versions, build volume (xyz_size) and resolution,
+    network type, remaining memory, and whether a camera or a USB drive is attached. It is one
+    read-only method (1001, which the protocol spells with no parameters at all), asked exactly once;
+    it sends no commands, and with no printer address configured (ORCA_CC2_URL) it reports
+    not_configured and opens no connection.
+
+    This is where a firmware version comes from: the protocol's `software_version.ota_version` is the
+    one the printer reports for the app update channel, and nothing else in this server reads it. Read
+    the reply with its `not_reported` list, because nothing here fills a gap in: every field the
+    printer did not answer is null *and* named there, since "it said nothing" and "it has no camera"
+    are different facts — this firmware is measured answering two of its three version strings empty,
+    and an empty string is not a version. The serial the printer names is compared with the serial
+    this session connected and pinned; if they disagree the reply says so under `identity`, because
+    the answer may then be describing a different machine than the one you configured.
+
+    What is deliberately absent: the printer's `ip` and `mac`. Nothing here needs them — the address is
+    the one you configured, and a MAC is a permanent hardware identifier with no job in these tools.
+    For live state use cc2_status; for what is on the printer's disk use cc2_list_files; for one file,
+    cc2_file_detail."""
+    async with _cc2_session() as sess:
+        if sess.transport is None:
+            return sess.error
+        try:
+            attrs = await _cc2_info.fetch_attributes(sess.transport)
+        except PrinterError as e:      # an unreadable reply is a refusal, told the same way
+            return _cc2_err(e)
+        return _cc2_out(attrs.as_dict())
+
+
+_FILE_ARG = (
+    "The file's name on the printer, exactly as cc2_list_files printed it: a plain name, case and "
+    "all, with no path and no directory. A name carrying a path separator, a control character or "
+    "leading or trailing space is refused before anything is sent, and the printer's own names are "
+    "never rewritten, case-folded or trimmed on the way to it.")
+
+
+@mcp.tool()
+async def cc2_file_detail(
+    filename: Annotated[str, Field(description=_FILE_ARG)],
+) -> dict:
+    """One file on the configured CC2 printer, read from the printer itself (method 1046, asked once):
+    its size, total layers, the slicer's estimated print seconds and filament grams, when it was
+    created, how many times it has printed and when last, and the per-tool colours it was sliced with,
+    where each entry's `tool` is the G-code tool index (T0, T1) and never a CANVAS tray, which is a
+    confusion the protocol warns about twice. It sends no commands; with no printer address configured
+    (ORCA_CC2_URL) it reports not_configured and opens no connection.
+
+    The reply uses the same words cc2_list_files uses for the same facts, plus what only a detail read
+    can say. Nothing is assumed to fill a gap: fields the printer did not answer are null and named in
+    `not_reported`. Two honest cases are worth knowing before a model reads one. The layer count
+    reaches this firmware under more than one field name in the wild, so the reply carries
+    `layers_from_field` (the name that answered) and, if two names answer with different numbers,
+    `layers_conflict` and a warning instead of an average. And if the printer answers about a different
+    file than the one asked for, `name_matches_request` is false and a warning says so, because a
+    detail read is only about your file if the printer said which file it read.
+
+    The printer's refusals come back as its own: a nonzero `error_code` is kept with its number and
+    never renamed "file not found", because nobody has established what this firmware's per-file codes
+    mean, and a request is never sent a second time to find out. A file's contents cannot be read back
+    on stock firmware by any method — this is metadata, and the picture is cc2_file_thumbnail."""
+    try:
+        name = _cc2_info.checked_lookup_name(filename)
+    except PrinterError as e:
+        return _cc2_err(e)
+    async with _cc2_session() as sess:
+        if sess.transport is None:
+            return sess.error
+        try:
+            detail = await _cc2_info.fetch_file_detail(sess.transport, name)
+        except PrinterError as e:      # a refusal keeps the printer's code; nothing was retried
+            return _cc2_err(e)
+        return _cc2_out(detail.as_dict())
+
+
+@mcp.tool()
+async def cc2_file_thumbnail(
+    filename: Annotated[str, Field(description=_FILE_ARG)],
+):
+    """The preview image the printer holds for one of its files (method 1045, asked once), returned as
+    an MCP image block plus one line of text naming the file, its byte count and the image type. The
+    picture is what the printer itself shows in its app for that file, so it is the cheapest way to see
+    what a job on the printer actually is. No commands, and with no printer address configured
+    (ORCA_CC2_URL) it reports not_configured and opens no connection.
+
+    Three things about this method are unusual and worth knowing. The image is the printer's own
+    embedded preview, so a file sliced without one simply has none — that comes back as a plain
+    sentence saying the printer had no thumbnail for it, never as a blank image, and the file is fine:
+    cc2_file_detail still reports its metadata. The image type is read from the bytes' own signature
+    (png, jpeg, gif, webp) rather than assumed, because the printer's own web interface stamps every
+    thumbnail image/png whatever it is holding; bytes of a type this server has not established are
+    refused with their first bytes named rather than sent on under a guessed type.
+
+    And size: the image travels inline in one tool reply, so a decoded image over 2 MiB is refused
+    with its size named and never truncated to fit — a
+    half an image is a corrupt image, and the limit is about the conversation, not the printer. The
+    picture is the printer's own bytes, handed over as it sent them: nothing here inspects, re-encodes
+    or vouches for what is drawn in it. Nothing is asked of the printer twice: a lost or unreadable
+    reply is reported as itself."""
+    try:
+        name = _cc2_info.checked_lookup_name(filename)
+    except PrinterError as e:
+        return _cc2_err(e)
+    async with _cc2_session() as sess:
+        if sess.transport is None:
+            return sess.error
+        try:
+            shot = await _cc2_info.fetch_file_thumbnail(sess.transport, name)
+        except PrinterError as e:      # no thumbnail, a refusal, a bad reply: each says which
+            return _cc2_err(e)
+        # The image goes to the client as an image; the text beside it is the sanitised metadata a
+        # caller needs even where a client renders nothing. shot.kind is one of the four types this
+        # module's own signature table names, so the mime type is a fact and not a guess.
+        meta = _cc2_out(shot.as_dict())
+        return [Image(data=shot.data, format=shot.kind),
+                TextContent(type="text", text=(
+                    f"{meta.get('filename')}: {meta.get('bytes')} bytes of "
+                    f"{meta.get('image_kind')} preview, read from the printer's own file store "
+                    f"(method {meta.get('method')})."))]
+
+
+@mcp.tool()
+async def cc2_print_history() -> dict:
+    """The print history the configured CC2 printer keeps for itself, read from the printer (method
+    1036, asked exactly once with no parameters at all). Each entry is one print: its name, the
+    printer's own status number alongside the word the printer's own app paints for that number, when
+    it began and ended, how long it ran, and whether a time-lapse exists. It sends no commands, never
+    removes a history record, and with no printer address configured (ORCA_CC2_URL) it reports
+    not_configured and opens no connection.
+
+    Read its `unverified` field before believing a success. This is the one CC2 read whose response
+    shape has never been captured from this printer: the fields it reads are exactly the fields
+    Elegoo's own LAN web client reads out of `history_task_list` when it sends method 1036 with no
+    parameters, and its duration is the same subtraction that client performs. A reply shaped any
+    differently is refused rather than fitted to that shape, so a refusal from this tool is evidence
+    about this firmware, not a broken printer, and it is worth recording.
+
+    Three claims it deliberately does not make. It never says a list is complete unless the printer's
+    own `total` meets the entries it actually sent, so `complete` comes with `completeness` saying why
+    it is true or false; because the request carries no paging, a long history is capped at 100
+    entries and `truncated_in_reply` then says so loudly, with both counts, and there is no next page
+    to ask for (1038 removes history entries and this server does not send it). The status word is
+    labelled as the app's vocabulary, not a protocol's, and the raw number is always carried too — two
+    of the app's numbers share one word. And entries stay in the printer's own order: nothing here
+    sorts, filters or de-duplicates what it sent.
+
+    Method 1037 (one print's detail) is not offered, and neither is 1038 (deleting history). 1037 has
+    no published request or response anywhere in the official sources — its name appears in Elegoo's
+    own web bundle only in the enum that defines it, never called — so there is nothing reliable to
+    read, and this tool will not take a `uuid` from a live status frame and send it somewhere as a task
+    handle. A time-lapse link that carries a login in it is withheld rather than echoed: this server
+    repeats no credentials, not even one a printer handed over.
+
+    For what is on the printer now use cc2_list_files; for live state cc2_status."""
+    async with _cc2_session() as sess:
+        if sess.transport is None:
+            return sess.error
+        try:
+            history = await _cc2_history.fetch_history(sess.transport)
+        except PrinterError as e:      # refused, unreadable or not the LAN shape: each says which
+            return _cc2_err(e)
+        return _cc2_out(history.as_dict())
 
 
 @mcp.tool()
@@ -1902,10 +2279,12 @@ async def cc2_upload_gcode(
 ) -> dict:
     """Upload one sliced G-code file directly to the configured CC2 printer under a NEW name,
     in 1 MiB chunks, and verify it on the printer's complete listing before writing the private
-    receipt that cc2_start_print requires. Needs this server's write opt-in (ORCA_CC2_WRITE=1);
-    off by default. Not idempotent: a failed, refused or ambiguous upload is never automatically
-    retried, and a partial file may sit on the printer under this name (the CC2 protocol offers
-    no delete) — the error says so, and choosing a fresh name is a human decision.
+    receipt that cc2_start_print requires. This writes to the printer, so running it is a human
+    decision; with no printer address configured (ORCA_CC2_URL) it reports not_configured and sends
+    nothing. Not idempotent: a failed, refused or ambiguous upload is never automatically
+    retried, and a partial file may sit on the printer under this name (no CC2 delete has been
+    proven to work on this printer, so this tool never deletes) — the error says so, and choosing a
+    fresh name is a human decision.
 
     The file is read as evidence: its material, first-layer and steady nozzle and bed
     temperatures, and its single tool index come from the bytes actually sent (a non-extruding
@@ -1913,9 +2292,6 @@ async def cc2_upload_gcode(
     commands disagree are refused before anything is sent). One file tool only. The reply lists
     the verified name and size and what the file's own bytes said; tool_to_tray for
     cc2_start_print maps the reported tool_index to the tray chosen from cc2_status."""
-    denied = _cc2_gate("cc2_upload_gcode", True)
-    if denied is not None:
-        return denied
     try:
         dest = _cc2_upload.validate_destination(destination)
     except PrinterError as e:
@@ -1978,8 +2354,9 @@ async def cc2_start_print(
         "own; when absent, the result says the bed warning is unavailable."))] = None,
 ) -> dict:
     """Start one already-uploaded file on the configured CC2 printer. Send exactly one start
-    command only after every check passes, and never retry. Needs this server's write
-    opt-in (ORCA_CC2_WRITE=1); off by default. A write, and not idempotent: an accepted start
+    command only after every check passes, and never retry. This is a write that moves the machine,
+    so it is a human decision to call: with no printer address configured (ORCA_CC2_URL) it reports
+    not_configured and sends nothing. A write, and not idempotent: an accepted start
     moves the machine, and a lost answer is reported as ambiguous, never resent.
 
     Before the command leaves, re-read inside the per-printer lock: the private upload receipt,
@@ -1992,9 +2369,6 @@ async def cc2_start_print(
     (its status names this file as printing) strictly apart — acceptance alone never claims a
     print is running. A slicer bed warning is never invented or attached here: unless the
     caller carried one from the same slice, the reply says the warning is unavailable."""
-    denied = _cc2_gate("cc2_start_print", True)
-    if denied is not None:
-        return denied
     if not isinstance(leveling, bool) or not isinstance(observe_running, bool):
         return {"error": "invalid_argument", "message": "leveling and observe_running must be booleans"}
     try:
@@ -2023,6 +2397,390 @@ async def cc2_start_print(
             "slicer warning belongs to this uploaded file — bed warnings are never attached to "
             "an arbitrary file, and the G-code carries no warning marker this adapter reads")
     return _cc2_out(out)
+
+
+async def _cc2_control_tool(tool: str, action: str, confirm: bool) -> dict:
+    """The one body the three job-control tools share. Like the other direct tools it can only reach
+    a printer once one is configured; with no address set the session seam refuses in-process, before
+    any method of any kind is sent.
+
+    Two-phase like the maintainer's Klipper MCP companion, and enforced here rather than hoped for
+    in the client because a client can run with permission prompts off: a call that is not exactly
+    confirm=True opens a session, sends exactly one read-only 1002, and hands back the
+    confirm_required preview — no control method ever leaves the wire on a preview path, which the
+    tests prove by watching the scripted wire. A confirmed call sends the one control method, once,
+    through the adapter — which never resends an unanswered command — and reports its honest result.
+    The confirmation is a decision-for-a-human device, not an access control: it exists so the call
+    carries the user's authorization for this action — which they may well have given already, since
+    their standing yes for this print or session is enough, and no fresh question is owed to the
+    tool — and the preview is what reaches them when nothing authorizes it yet."""
+    async with _cc2_session() as sess:
+        if sess.transport is None:
+            return sess.error
+        try:
+            if confirm is True:
+                out = (await _cc2_control.control_job(sess.transport, action)).as_dict()
+            else:
+                out = await _cc2_control.read_preview(sess.transport, action)
+        except PrinterError as e:
+            return _cc2_err(e)
+        return _cc2_out(out)
+
+
+@mcp.tool()
+async def cc2_pause_print(
+    confirm: Annotated[bool, Field(description=(
+        "Second-call only: omitted or false returns a preview and sends nothing; exactly true sends "
+        "the one pause command. Confirm once the user has authorized the pause: a yes they already "
+        "gave for this print or this session covers it and needs no fresh question, so ask only when "
+        "nothing authorizes it — read them the preview first then."))] = False,
+) -> dict:
+    """Pause the print on the configured CC2 printer. TWO-PHASE: without confirm=true this reads the
+    printer and returns a preview (its current job read fresh, and the exact command a confirmed call
+    would send) and changes nothing. Call it again with confirm=true once the user has authorized the
+    pause: their existing explicit yes for this print or session is that authorization and needs no
+    fresh question, so ask only when nothing authorizes it.
+
+    A confirmed call sends one 1021 command, no params, and waits 60 s for the answer — the official
+    Elegoo UI's own pause budget. The reply keeps three facts apart: accepted (the printer answered
+    with an explicit error_code 0 — it did not refuse), refused (an explicit nonzero code kept;
+    1010 is the documented 'no active print'), and ambiguous (no answer, an unreadable one, or a
+    dead session). A timeout is never called a refusal and the command is never resent; after an
+    accepted or unanswered command one read-only look reports what the printer says it is doing,
+    apart from acceptance. Nothing here checks whether pausing makes sense right now — that is the
+    human's read of the preview, and the printer itself refuses (1010) when there is nothing to
+    pause."""
+    return await _cc2_control_tool("cc2_pause_print", "pause", confirm)
+
+
+@mcp.tool()
+async def cc2_resume_print(
+    confirm: Annotated[bool, Field(description=(
+        "Second-call only: omitted or false returns a preview and sends nothing; exactly true sends "
+        "the one resume command. Confirm once the user has authorized the resume: a yes they already "
+        "gave for this print or this session covers it and needs no fresh question, so ask only when "
+        "nothing authorizes it — read them the preview first then."))] = False,
+) -> dict:
+    """Resume the paused print on the configured CC2 printer. TWO-PHASE: without confirm=true this
+    reads the printer and returns a preview (its current job read fresh, and the exact command a
+    confirmed call would send) and changes nothing. Call it again with confirm=true once the user has
+    authorized the resume: their existing explicit yes for this print or session is that
+    authorization and needs no fresh question, so ask only when nothing authorizes it.
+
+    Know what a resume costs: the printer is measured answering the resume command only once the
+    resume has actually completed — it reheats, homes and returns to position first, 122 s to its
+    error_code 0 answer on firmware 02.01.00.00 — so this call can take up to two full minutes.
+    One 1023 command, no params, waited for 120 s (the official UI's own window, which the measured
+    answer exceeded). An accepted resume is the printer's own completion word; an expired window is
+    NOT a refusal and NOT a failure — the print may well be resuming right now — and the command is
+    never resent. The result never requires the printer to report running: after an accepted or
+    unanswered resume one read-only look says what the printer claims, kept strictly apart from
+    acceptance. 1010 is the documented refusal when there is nothing to resume."""
+    return await _cc2_control_tool("cc2_resume_print", "resume", confirm)
+
+
+@mcp.tool()
+async def cc2_stop_print(
+    confirm: Annotated[bool, Field(description=(
+        "Second-call only: omitted or false returns a preview and sends nothing; exactly true sends "
+        "the one stop command. A yes for this print is not a yes for ending it early: confirm once "
+        "the user has authorized the stop itself, and when nothing authorizes it yet, read them the "
+        "preview and ask first."))] = False,
+) -> dict:
+    """Stop (cancel) the print on the configured CC2 printer, the irreversible one of the three: the
+    documented machine state ends a stopped job at STOPPED and the protocol offers no way back, pause
+    and resume being the reversible pair. TWO-PHASE: without confirm=true this reads the printer and
+    returns a preview (its current job read fresh, and the exact command a confirmed call would send)
+    and changes nothing. Call it again with confirm=true once the user has authorized ending this job:
+    an existing explicit yes of theirs is that authorization, but a yes for the print is not a yes
+    for stopping it early, so make sure what they authorized is the stop.
+
+    A confirmed call sends one 1022 command, no params, and waits 60 s for the answer — the official
+    Elegoo UI's own stop budget. Accepted (explicit error_code 0 — the printer did not refuse),
+    refused (an explicit nonzero code kept; 1010 is the documented 'no active print') and ambiguous
+    (no answer, an unreadable one, or a dead session) are kept apart; a timeout is never called a
+    refusal and the command is never resent. After an accepted or unanswered command one read-only
+    look reports what the printer says it is doing, apart from acceptance."""
+    return await _cc2_control_tool("cc2_stop_print", "stop", confirm)
+
+
+async def _cc2_peripheral_tool(setting: str, params: dict, confirm: bool) -> dict:
+    """The one body the two peripheral tools share, and the same two phases the job controls run.
+    Like every direct tool it can only reach a printer once one is configured; with no address set
+    the session seam refuses in-process, before any method of any kind is sent.
+
+    A call that is not exactly ``confirm=True`` opens a session, sends exactly one read-only 1002,
+    and hands back the ``confirm_required`` preview carrying this call's own exact params — so what
+    a confirmed call would do is on the record before anything is changed, and no control method
+    ever leaves the wire on a preview path (the tests watch the recorded wire for exactly that). A
+    confirmed call sends the one command once through the adapter, which never resends an unanswered
+    command. The confirmation is a decision-for-a-human device, not an access control: it carries the
+    user's authorization for this action, which their standing yes for this print or session may
+    already supply, so it obliges no fresh question of its own."""
+    async with _cc2_session() as sess:
+        if sess.transport is None:
+            return sess.error
+        try:
+            if confirm is True:
+                out = (await _cc2_peripherals.set_peripheral(sess.transport, setting,
+                                                             params)).as_dict()
+            else:
+                out = await _cc2_peripherals.read_preview(sess.transport, setting, params)
+        except PrinterError as e:
+            return _cc2_err(e)
+        return _cc2_out(out)
+
+
+@mcp.tool()
+async def cc2_set_light(
+    on: Annotated[bool, Field(description=(
+        "true turns the printer's overhead light on, false turns it off — a plain boolean, and the "
+        "only thing it takes: the CC2 light is on or off in every source and does not dim, so a "
+        "brightness level is not what this asks for. Anything the tool cannot read as exactly true "
+        "or exactly false is refused with nothing sent."))],
+    confirm: Annotated[bool, Field(description=(
+        "Second-call only: omitted or false returns a preview and sends nothing; exactly true sends "
+        "the one light command. Confirm once the user has authorized the light: a yes they already "
+        "gave for this print or this session covers it and needs no fresh question, so ask only when "
+        "nothing authorizes it — read them the preview first then."))] = False,
+) -> dict:
+    """Turn the configured CC2 printer's overhead light on or off. TWO-PHASE: without confirm=true
+    this reads the printer once and returns a preview (what the printer says its light is doing now,
+    and the exact command a confirmed call would send) and changes nothing; only an exact
+    confirm=true sends it. The confirmation carries the user's authorization: a yes they already gave
+    for this print or session is that authorization and needs no fresh question, so ask only when
+    nothing authorizes it.
+
+    One 1029 command, sent once and never resent, waited for 10 s. The CC2's own documentation and
+    its own web client disagree about this parameter — the doc's table says brightness, the doc's own
+    findings and the LAN client say power (1 on, 0 off) — so the command carries both spellings
+    paired so they cannot contradict each other (power 1 with brightness 255, power 0 with
+    brightness 0), which is what the Home Assistant integration sends for the same reason. Accepted
+    (the printer answered with an explicit error_code 0), refused (an explicit code kept) and
+    ambiguous (no answer, an unreadable one, or a dropped session) are kept apart; a timeout is never
+    called a refusal and the command is never resent. After an accepted or unanswered command one
+    read-only look reports what the printer says its light is doing now, apart from acceptance — and
+    if that look contradicts the command the printer accepted, a note says so plainly without
+    doubting the answer. Nothing is pre-checked: whether the light should be on is a human judgement,
+    and the printer refuses what it will not do with its own code."""
+    try:
+        want = _cc2_peripherals.parse_light(on)
+    except PrinterError as e:
+        return _cc2_err(e)
+    return await _cc2_peripheral_tool("light", _cc2_peripherals.light_params(want), confirm)
+
+
+@mcp.tool()
+async def cc2_set_print_speed(
+    mode: Annotated[int, Field(description=(
+        "The printer's own speed MODE number, not a percentage: 0 Silent (50%), 1 Balanced (100%, "
+        "the printer's default), 2 Sport (150%), 3 Ludicrous (200%). Any other number, a percentage "
+        "or a name is refused with those four named and nothing sent."))],
+    confirm: Annotated[bool, Field(description=(
+        "Second-call only: omitted or false returns a preview and sends nothing; exactly true sends "
+        "the one speed command. Confirm once the user has authorized the speed change — mid-print it "
+        "changes how the rest of the job runs. A yes they already gave for this print or session "
+        "covers it and needs no fresh question, so ask only when nothing authorizes it — read them "
+        "the preview first then."))] = False,
+) -> dict:
+    """Set the print speed MODE on the configured CC2 printer: one of four discrete modes
+    (0 Silent/50%, 1 Balanced/100% which is the printer's default, 2 Sport/150%, 3 Ludicrous/200%),
+    never a percentage. Any other number, 45 and 150 included, refuses with the four modes named and
+    nothing sent. TWO-PHASE: without confirm=true this reads the printer once and returns a preview
+    (the mode the printer reports right now, and the exact command a confirmed call would send) and
+    changes nothing; only an exact confirm=true sends it.
+
+    There is no percentage on this protocol at all — the middleware turns Klipper's speed factor into
+    that mode number, which is why a speed is never spelled in percent here, and why the Home
+    Assistant integration's percentage-to-mode bucketing is an HA convenience rather than something
+    this tool copies. The confirmation carries the user's authorization, which their standing yes for
+    this print or session may already supply.
+
+    One 1031 command carrying the mode number, sent once and never resent, waited for 10 s — the
+    longer of the two first-party windows, since the official LAN client waits 5 s for this method
+    and the Home Assistant integration waits 10 s for every command it sends. Accepted (explicit
+    error_code 0 — the printer did not refuse), refused (its code kept) and ambiguous (no answer, an
+    unreadable one, or a dropped session) are kept apart, and a lost answer is never a reason to
+    send again. After an accepted or unanswered command one read-only look reports the mode the
+    printer now reports, kept apart from acceptance; a number outside the documented four is
+    reported as that number with no name invented for it, and a disagreement between the accepted
+    command and the look after it is said out loud. Changing the mode mid-print changes how the rest
+    of the print runs — that is what the preview is for."""
+    try:
+        want = _cc2_peripherals.parse_mode(mode)
+    except PrinterError as e:
+        return _cc2_err(e)
+    return await _cc2_peripheral_tool("speed", {"mode": want}, confirm)
+
+
+async def _cc2_temperature_tool(field: str, params: dict, confirm: bool) -> dict:
+    """The one body behind cc2_set_temperature, and the same two phases the job and peripheral
+    controls run. Like every direct tool it can only reach a printer once one is configured; with no
+    address set the session seam refuses in-process, before any method of any kind is sent.
+
+    A call that is not exactly ``confirm=True`` opens a session, sends exactly one read-only 1002,
+    and hands back the ``confirm_required`` preview carrying this call's own exact params and the
+    ceiling it enforced — so what a confirmed call would do, and the bound that number was checked
+    against, are both on the record before anything is changed, and no control method ever leaves the
+    wire on a preview path (the tests watch the recorded wire for exactly that). A confirmed call
+    sends the one 1028 command once through the adapter, which never resends an unanswered command.
+    The confirmation is a decision-for-a-human device, not an access control: it carries the user's
+    authorization for this action, which their standing yes for this print or session may already
+    supply, so it obliges no fresh question of its own."""
+    async with _cc2_session() as sess:
+        if sess.transport is None:
+            return sess.error
+        try:
+            if confirm is True:
+                out = (await _cc2_temperature.set_temperature(sess.transport, field,
+                                                              params)).as_dict()
+            else:
+                out = await _cc2_temperature.read_preview(sess.transport, field, params)
+        except PrinterError as e:
+            return _cc2_err(e)
+        return _cc2_out(out)
+
+
+@mcp.tool()
+async def cc2_set_temperature(
+    heater: Annotated[str, Field(description=(
+        "Which heater to command: 'extruder' (the nozzle — 'nozzle' reads too) or 'heater_bed' "
+        "('bed' reads too) — the only two heaters this protocol can command. The chamber is a "
+        "reading only, so anything else refuses with these two named and nothing sent."))],
+    target: Annotated[float, Field(description=(
+        "The new target in degrees Celsius for that heater: 0 to 350 for the extruder, 0 to 110 for "
+        "the bed — the bounds the CC2's own official LAN control accepts, which are not a hardware "
+        "rating. 0 turns a heater off, which is what the printer's own end-of-print G-code sends. "
+        "One heater per call: the other keeps whatever it is already at."))],
+    confirm: Annotated[bool, Field(description=(
+        "Second-call only: omitted or false returns a preview and sends nothing; exactly true sends "
+        "the one temperature command. Confirm once the user has authorized the setpoint — it heats "
+        "hardware, so a nozzle number matters while a print is running. A yes they already gave for "
+        "this print or session covers it and needs no fresh question, so ask only when nothing "
+        "authorizes it — read them the preview first then."))] = False,
+) -> dict:
+    """Set one heater's target temperature on the configured CC2 printer: heater is 'extruder' (the
+    nozzle) or 'heater_bed' (the bed, also read as 'bed'), target in degrees Celsius, one heater per
+    call. The ceiling a call may ask for is the printer's own official control's — 350 for the nozzle
+    and 110 for the bed — and a number outside 0 to that ceiling refuses with nothing sent.
+
+    TWO-PHASE: without confirm=true this reads the printer once and returns a preview (what the
+    printer reports for that heater right now, the exact one-heater command a confirmed call would
+    send, and the ceiling it enforced with its source) and changes nothing; only an exact confirm=true
+    sends it. The confirmation carries the user's authorization, which their standing yes for this
+    print or session may already supply, so it obliges no fresh question.
+
+    Where the bounds come from, because a temperature tool must not invent them: the 0-350 and 0-110
+    windows are the input bounds of Elegoo's own official LAN control for this printer (its web
+    client, release 20260625), which clamps a typed number into them before it sends, and they are
+    reported with every reply as that — a bound of the official control, never a claim about what the
+    hot end or the bed is rated to. The two other numbers in the sources are not followed blindly and
+    none is a slicer profile's: the printer's firmware refuses a setpoint outside its own configured
+    window by itself (max_temp 600 extruder, 125 bed, a sensor envelope rather than a target), and
+    Elegoo's LAN SDK records 300 for that extruder in a capability row that contradicts itself, so a
+    call above 300 is sent — the machine's own control reaches that high — with the disagreement said
+    out loud rather than resolved on a hunch. There is no parameter that raises a ceiling, because a
+    caller-supplied ceiling is exactly the guess this refuses to make: ask for a lower number instead.
+
+    One 1028 command carrying the one heater field, sent once and never resent, waited for 10 s — the
+    longer of the two first-party windows, since the official LAN client waits 5 s for this method and
+    the Home Assistant integration waits 10 s for every command. Accepted (the printer answered with
+    an explicit error_code 0), refused (an explicit code kept) and ambiguous (no answer, an
+    unreadable one, or a dropped session) are kept apart, and a lost answer is never a reason to send
+    again. After an accepted or unanswered command one read-only look reports both the target and the
+    actual temperature the printer states now, kept apart from acceptance: a target still climbing is
+    never read as a failure, while a target the printer states as something other than the number it
+    just accepted is said out loud without earning a second command. Nothing is pre-checked — whether
+    a setpoint makes sense now is a human read of the preview, and the printer refuses what it will
+    not do with its own code."""
+    try:
+        field = _cc2_temperature.parse_heater(heater)
+        params = _cc2_temperature.temp_params(field, target)
+    except PrinterError as e:
+        return _cc2_err(e)
+    return await _cc2_temperature_tool(field, params, confirm)
+
+
+async def _cc2_auto_refill_tool(params: dict, confirm: bool) -> dict:
+    """The one body behind cc2_set_auto_refill, and the same two phases every other CC2 control runs.
+    Like every direct tool it can only reach a printer once one is configured; with no address set the
+    session seam refuses in-process, before any method of any kind is sent.
+
+    A call that is not exactly ``confirm=True`` opens a session, sends exactly one read-only 2005
+    CANVAS read, and hands back the ``confirm_required`` preview carrying this call's own exact params
+    and the candidate label, so what a confirmed call would do is on the record before anything is
+    changed and no command ever leaves the wire on a preview path (the tests watch the recorded wire
+    for exactly that). A confirmed call sends the one 2004 command once through the adapter, which
+    never resends an unanswered command. The confirmation is a decision-for-a-human device, not an
+    access control: it carries the user's authorization for this action, which their standing yes for
+    this print or session may already supply, so it obliges no fresh question of its own."""
+    async with _cc2_session() as sess:
+        if sess.transport is None:
+            return sess.error
+        try:
+            if confirm is True:
+                out = (await _cc2_canvas.set_auto_refill(sess.transport,
+                                                         params)).as_dict()
+            else:
+                out = await _cc2_canvas.read_preview(sess.transport, params)
+        except PrinterError as e:
+            return _cc2_err(e)
+        return _cc2_out(out)
+
+
+@mcp.tool()
+async def cc2_set_auto_refill(
+    auto_refill: Annotated[bool, Field(description=(
+        "true asks the printer to refill automatically from another CANVAS tray when one runs out, "
+        "false stops it doing that: a plain boolean, and the only thing it takes. Nothing else is "
+        "sent with it, so this cannot change the active tray, a spool's filament info or a slot map. "
+        "Anything the tool cannot read as exactly true or exactly false is refused with nothing "
+        "sent."))],
+    confirm: Annotated[bool, Field(description=(
+        "Second-call only: omitted or false returns a preview and sends nothing; exactly true sends "
+        "the one auto-refill command. Confirm once the user has authorized the switch: a yes they "
+        "already gave for this print or session covers it and needs no fresh question, so ask only "
+        "when nothing authorizes it, read them the preview first then."))] = False,
+) -> dict:
+    """Turn the configured CC2 printer's CANVAS auto-refill switch on or off with one boolean, and
+    read this before calling it: no CC2 has ever answered this command on this project, so every
+    reply says it is unverified. The shape is Elegoo's own, method 2004 carrying the one field
+    auto_refill that the printer's own LAN web client sends and that the printer answers back in its
+    CANVAS info, and that field is all this tool ever sends, so a call changes the switch and nothing
+    else: not which tray is active, not a spool's filament info, no slot map. The older integration
+    manual spells this command's parameter enable, and that spelling is never sent here in any
+    combination: the manual is the only source for it, the printer's own client and that same manual's
+    own CANVAS sample both say auto_refill, and the manual makes the same class of mistake on the
+    delete command, so a table row of that manual is not proof about this firmware.
+
+    TWO-PHASE, like every other control here: without confirm=true this sends only the read-only
+    CANVAS read (method 2005) and returns a preview, what the printer says the flag is now and the
+    exact one-field command a confirmed call would send, and changes nothing; only an exact
+    confirm=true sends it. The confirmation carries the user's authorization, which their standing yes
+    for this print or session may already supply, so it obliges no fresh question. A printer with no
+    CANVAS attached still gets its preview: the flag is the printer's own setting, and a CANVAS read
+    that answers nothing is reported as unknown, never as off, and is never a reason to withhold the
+    switch.
+
+    One 2004 command, sent once and never resent, waited for 10 s, the longer of the two first-party
+    windows (Elegoo's LAN client passes no override for this method so its 5 s default applies, and
+    the Home Assistant integration waits 10 s for every command it sends). Accepted (an explicit
+    error_code 0, which is the printer not refusing), refused (its code kept, and it earns no further
+    read) and ambiguous (no answer, an unreadable one, or a dropped session) are kept apart exactly as
+    the job and peripheral controls keep them, and a lost answer is never a refusal and never a reason
+    to send again. After an accepted or unanswered command one read-only CANVAS look reports what the
+    printer says the flag is now, kept apart from acceptance, and a look that contradicts the command
+    the printer accepted is said out loud without earning a second command.
+
+    What has not been established is the whole reason for the label: no CC2 has ever answered 2004 for
+    anyone on this project and no print has ever shown the flag doing its job, so every reply carries
+    verified_on_this_printer false beside the sentence saying why. A refusal from this tool is worth
+    recording for that reason: it is evidence about this firmware, not a broken printer."""
+    try:
+        want = _cc2_canvas.parse_refill(auto_refill)
+    except PrinterError as e:
+        return _cc2_err(e)
+    return await _cc2_auto_refill_tool(_cc2_canvas.refill_params(want), confirm)
 
 
 # --- Tool annotations (title + read-only/destructive hints) -----------------
@@ -2089,25 +2847,71 @@ _TOOL_ANNOTATIONS: dict[str, tuple[str, bool, bool]] = {
     "wait_for_printer": ("Wait for the printer", True, False),
     "list_print_history": ("List print history", False, False),
     "check_printer_match": ("Check the profile against the printer", True, False),
-    # Direct CC2 tools. The two reads carry readOnlyHint; the two writes carry
-    # destructiveHint=False (neither deletes — the CC2 protocol offers no delete, which is
-    # exactly why upload never overwrites) and deliberately NO idempotency hint: an upload is
-    # not replay-safe and a start is the definition of not. Annotations are advisory metadata,
-    # not an access control — the server-side gates above are the control.
+    # Direct CC2 tools. The six reads carry readOnlyHint; the file writes carry
+    # destructiveHint=False (neither deletes — no CC2 delete is proven on this firmware: 1047 is
+    # described by the protocol and sent by Elegoo's own LAN client, and this branch carries it only
+    # as an unregistered, untested candidate, which is why upload still never overwrites) and
+    # deliberately NO idempotency hint: an upload is
+    # not replay-safe and a start is the definition of not. Of the job controls, stop alone is
+    # destructive — it ends the job past the documented state machine's STOPPED end, with no way
+    # back — while pause and resume are the reversible pair and say so (the maintainer's Klipper
+    # companion marks all three destructive; here the hint is set per what each command undoes).
+    # Annotations are advisory metadata, not an access control: what reaches a person is the
+    # two-phase confirm enforced in the job-control bodies, and what reaches a printer at all is
+    # simply whether an address is configured.
     "cc2_status": ("Read CC2 printer state directly", True, False),
     "cc2_list_files": ("List files on the CC2 printer", True, False),
+    # The three new reads are reads: one request each (1001, 1046, 1045), no command, nothing written
+    # on the printer or on disk. cc2_file_thumbnail carries no idempotency hint either: re-asking for a
+    # picture is harmless in the ordinary sense, but this server never promises a second request lands
+    # the same way, and the hint is not the place to imply it has been tested on this firmware.
+    "cc2_printer_info": ("Read CC2 printer attributes", True, False),
+    "cc2_file_detail": ("Read one CC2 file's detail", True, False),
+    "cc2_file_thumbnail": ("Read one CC2 file's thumbnail", True, False),
+    # The fourth CC2 read is a read: one parameterless 1036, no command, nothing written on the
+    # printer or on disk. Its reply carries its own admission that no 1036 answer has ever been
+    # captured from this firmware — a read can be a candidate for live verification, which is exactly
+    # why 1037 (task detail) and 1038 (history delete) are absent instead of guessed at.
+    "cc2_print_history": ("Read CC2 print history", True, False),
     "cc2_upload_gcode": ("Upload G-code to the CC2 printer", False, False),
     "cc2_start_print": ("Start a print on the CC2 printer", False, False),
+    "cc2_pause_print": ("Pause the CC2 print", False, False),
+    "cc2_resume_print": ("Resume the CC2 print", False, False),
+    "cc2_stop_print": ("Stop the CC2 print (ends the job for good)", False, True),
+    # The two peripheral controls change what the printer does but destroy nothing: the light is a
+    # lamp and the speed mode is reversible by asking for another one, so neither carries
+    # destructiveHint. Both are writes, both reach the printer over the network, and both enforce the
+    # two-phase confirm in their own bodies exactly like the job controls do.
+    "cc2_set_light": ("Set the CC2 overhead light", False, False),
+    "cc2_set_print_speed": ("Set the CC2 print speed mode", False, False),
+    # The temperature setpoint is a write that reaches the printer over the network and enforces the
+    # two-phase confirm in its own body, and it is not destructive: any setpoint it sends can be
+    # replaced by another call (0 turns the heater off), which is what the printer's own end-of-print
+    # G-code does. What makes it careful is the ceiling it refuses to exceed and the preview that
+    # names its source, not a destructiveHint.
+    "cc2_set_temperature": ("Set a CC2 heater temperature", False, False),
+    # The CANVAS switch is the same kind of write as the other three and no more destructive than the
+    # light: it flips one stored boolean on the printer, it can be flipped back by asking again, and
+    # it destroys nothing. What makes it careful is that it has never met this firmware, which is said
+    # in its replies rather than hidden in a hint, and it is a write that reaches the printer over the
+    # network with the two-phase confirm enforced in its own body exactly like the others.
+    "cc2_set_auto_refill": ("Set the CC2 CANVAS auto-refill switch", False, False),
 }
 
 
 # Tools that reach outside OrcaSlicer (the printer on the network), and tools that are safe to repeat
-# although they write local state. The four direct CC2 tools reach the printer directly too, so all
-# four are open-world — including their writes, which are additionally gated server-side (off by
-# default) because openWorldHint, like every annotation, is a hint and not a permission.
+# although they write local state. The direct CC2 tools reach the printer directly too, so all of
+# them are open-world, because openWorldHint, like every annotation, is a hint and not a permission:
+# a configured printer answers any of them, which is why the job controls enforce their two-phase
+# confirm in the tool body instead of relying on a hint or a switch.
 _OPEN_WORLD_TOOLS = frozenset({"get_printer_status", "wait_for_printer", "list_print_history",
                                "check_printer_match", "cc2_status", "cc2_list_files",
-                               "cc2_upload_gcode", "cc2_start_print"})
+                               "cc2_printer_info", "cc2_file_detail", "cc2_file_thumbnail",
+                               "cc2_print_history",
+                               "cc2_upload_gcode", "cc2_start_print", "cc2_pause_print",
+                               "cc2_resume_print", "cc2_stop_print", "cc2_set_light",
+                               "cc2_set_print_speed", "cc2_set_temperature",
+                               "cc2_set_auto_refill"})
 _IDEMPOTENT_TOOLS = frozenset({"list_print_history"})
 
 

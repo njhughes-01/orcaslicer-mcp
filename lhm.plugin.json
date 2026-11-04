@@ -2,7 +2,7 @@
   "identifier": "maxellis-orcaslicer-mcp",
   "version": "0.1.19",
   "name": "OrcaSlicer MCP",
-  "description": "Work a running OrcaSlicer with AI: load models, arrange the plate, tune settings, slice, and understand the result through slice breakdowns, setting explanations, and physics checks. Talks to OrcaSlicer on localhost or a host you configure and, for the printer tools, makes read-only requests to your printer; no cloud calls from this server.",
+  "description": "Work a running OrcaSlicer with AI: load models, arrange the plate, tune settings, slice, and understand the result through slice breakdowns, setting explanations, and physics checks. Talks to OrcaSlicer on localhost or a host you configure; the printer tools read your printer, and the direct Elegoo Centauri Carbon 2 tools can also control that printer once you configure its address. No cloud calls from this server.",
   "category": "developer",
   "tags": [
     "mcp",
@@ -291,15 +291,59 @@
     },
     {
       "name": "cc2_list_files",
-      "description": "The complete G-code inventory of the configured CC2 printer, or an explicit failure. It never reports a first page as a complete listing. Read-only (no commands); needs the read opt-in (ORCA_CC2_READ=1), off by default."
+      "description": "A bounded page of the G-code inventory of the configured CC2 printer, or an explicit failure. It never reports a first page as a complete listing and it never cuts a reply without saying so."
+    },
+    {
+      "name": "cc2_printer_info",
+      "description": "What the configured CC2 printer says about itself: model, the name its touchscreen carries, serial, firmware versions, hardware and protocol versions, build volume (xyz_size) and resolution, network type, remaining memory, and whether a camera or a USB drive is attached."
+    },
+    {
+      "name": "cc2_file_detail",
+      "description": "One file on the configured CC2 printer, read from the printer itself (method 1046, asked once): its size, total layers, the slicer's estimated print seconds and filament grams, when it was created, how many times it has printed and when last, and the per-tool colours it was sliced with, where each entry's `tool` is the G-code tool index (T0, T1) and never a CANVAS tray, which is a confusion the protocol warns about twice."
+    },
+    {
+      "name": "cc2_file_thumbnail",
+      "description": "The preview image the printer holds for one of its files (method 1045, asked once), returned as an MCP image block plus one line of text naming the file, its byte count and the image type."
+    },
+    {
+      "name": "cc2_print_history",
+      "description": "The print history the configured CC2 printer keeps for itself, read from the printer (method 1036, asked exactly once with no parameters at all)."
     },
     {
       "name": "cc2_upload_gcode",
-      "description": "Upload one sliced G-code file directly to the configured CC2 printer under a NEW name, in 1 MiB chunks, and verify it on the printer's complete listing before writing the private receipt that cc2_start_print requires. Needs this server's write opt-in (ORCA_CC2_WRITE=1); off by default."
+      "description": "Upload one sliced G-code file directly to the configured CC2 printer under a NEW name, in 1 MiB chunks, and verify it on the printer's complete listing before writing the private receipt that cc2_start_print requires."
     },
     {
       "name": "cc2_start_print",
-      "description": "Start one already-uploaded file on the configured CC2 printer. Send exactly one start command only after every check passes, and never retry. Needs this server's write opt-in (ORCA_CC2_WRITE=1); off by default."
+      "description": "Start one already-uploaded file on the configured CC2 printer. Send exactly one start command only after every check passes, and never retry."
+    },
+    {
+      "name": "cc2_pause_print",
+      "description": "Pause the print on the configured CC2 printer. TWO-PHASE: without confirm=true this reads the printer and returns a preview (its current job read fresh, and the exact command a confirmed call would send) and changes nothing."
+    },
+    {
+      "name": "cc2_resume_print",
+      "description": "Resume the paused print on the configured CC2 printer. TWO-PHASE: without confirm=true this reads the printer and returns a preview (its current job read fresh, and the exact command a confirmed call would send) and changes nothing."
+    },
+    {
+      "name": "cc2_stop_print",
+      "description": "Stop (cancel) the print on the configured CC2 printer, the irreversible one of the three: the documented machine state ends a stopped job at STOPPED and the protocol offers no way back, pause and resume being the reversible pair."
+    },
+    {
+      "name": "cc2_set_light",
+      "description": "Turn the configured CC2 printer's overhead light on or off. TWO-PHASE: without confirm=true this reads the printer once and returns a preview (what the printer says its light is doing now, and the exact command a confirmed call would send) and changes nothing; only an exact confirm=true sends it."
+    },
+    {
+      "name": "cc2_set_print_speed",
+      "description": "Set the print speed MODE on the configured CC2 printer: one of four discrete modes (0 Silent/50%, 1 Balanced/100% which is the printer's default, 2 Sport/150%, 3 Ludicrous/200%), never a percentage. Any other number, 45 and 150 included, refuses with the four modes named and nothing sent."
+    },
+    {
+      "name": "cc2_set_temperature",
+      "description": "Set one heater's target temperature on the configured CC2 printer: heater is 'extruder' (the nozzle) or 'heater_bed' (the bed, also read as 'bed'), target in degrees Celsius, one heater per call."
+    },
+    {
+      "name": "cc2_set_auto_refill",
+      "description": "Turn the configured CC2 printer's CANVAS auto-refill switch on or off with one boolean, and read this before calling it: no CC2 has ever answered this command on this project, so every reply says it is unverified."
     }
   ],
   "prompts": [

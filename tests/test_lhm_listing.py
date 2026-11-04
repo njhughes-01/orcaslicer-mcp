@@ -70,6 +70,26 @@ def test_listing_matches_the_live_server():
     assert listed == live, REGEN
 
 
+def test_listing_keeps_the_direct_cc2_tools(monkeypatch):
+    # they are declared the way every other tool is, so nothing may filter them out of the listing:
+    # what a client can call is what the marketplace says is there, direct tools included
+    from types import SimpleNamespace
+
+    async def mixed_tools():
+        return [SimpleNamespace(name="get_status", description="Slicer status."),
+                SimpleNamespace(name="cc2_status", description="Printer status.")]
+
+    monkeypatch.setattr(srv.mcp, "list_tools", mixed_tools)
+    assert [t["name"] for t in _gen().listing_tools()] == ["get_status", "cc2_status"]
+
+
+def test_listing_carries_every_direct_cc2_tool():
+    # the roster, not a count: a tool the server declares but the listing does not carry is invisible
+    # to a client reading this file, whatever the number of direct tools happens to be this week
+    listed = {t["name"] for t in json.loads(LISTING.read_text(encoding="utf-8"))["tools"]}
+    assert set(srv.CC2_TOOL_NAMES) <= listed
+
+
 def test_listing_text_ends_each_summary_and_has_no_dashes():
     for t in json.loads(LISTING.read_text(encoding="utf-8"))["tools"]:
         d = t["description"]

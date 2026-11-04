@@ -7,7 +7,7 @@ private address, 1 MiB raw chunks, ``Content-Range: bytes <start>-<end>/<total>`
 and carry no documented required acknowledgment, so no test requires or reads one. The G-code
 fixture is a trim of the reference slice actually uploaded to this printer on 2026-11-04 — the
 140 °C flush hold before ``M109 S260``, the ``M6211 ... T0 ...`` flush command whose T parameter
-is no tool select, the template config lines quoting ``T[next_extruder]`` inside comments, the
+is a real filament select (the firmware runs ``CANVAS_SWITCH_FILAMENT T=<n>`` inside the purge), the
 trailing cooldown S0s, and the tail config block whose four setpoints must appear among the
 commands. Those heater commands are additionally read in order: the 140 °C flush hold is legal
 because it never extrudes, the purge and every E move may only run behind an M109 that waited at
@@ -38,6 +38,17 @@ from orcaslicer_mcp.printer.errors import PrinterError
 
 HOST = "192.0.2.10"          # the documented TEST-NET range the transport lane already uses
 SN = "CC2TESTSN0001"
+
+
+def test_upload_http_ignores_environment_proxies(monkeypatch):
+    seen = {}
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:8080")
+    def fake_client(**kwargs):
+        seen.update(kwargs)
+        return object()
+    monkeypatch.setattr(up.httpx, "AsyncClient", fake_client)
+    up.Cc2UploadHttp("http://192.0.2.10:80")
+    assert seen["trust_env"] is False
 TOKEN = "97-531-01"          # a simulated access code, the same stand-in role the fake MQTT password plays
 DEST = "part-flat-petg-2026-11-04.gcode"
 CHUNK = 64                    # test-sized; the 1 MiB default is pinned by its own test below
@@ -129,7 +140,7 @@ class FakeTransport:
     """Stands in for the registered session the way cc2_state's Scripted did, narrowed to the
     one method an upload asks: 1044. Each list_files() pass consumes the next listing snapshot
     (the last repeats forever); a snapshot is a list of (name, size) plus optional 'total' —
-    short of total with paging ignored is the observed capped-100 shape, which cc2_state must
+    short of total with paging ignored is a simulated capped-100 shape, which cc2_state must
     refuse. Anything else on the wire is unknown, and unknown raises here exactly as it does
     live."""
 
@@ -157,7 +168,7 @@ class FakeTransport:
 
 
 
-def short_listing(files):  # the observed capped reply: fewer files than the reported total
+def short_listing(files):  # a simulated capped reply: fewer files than the reported total
     return {"files": files, "total": len(files) + 1}
 
 
@@ -487,6 +498,778 @@ def test_no_printing_temperature_range_is_hardcoded_anywhere(preheat, first, lat
     assert s.extrusion_nozzle_temps == (first, later)
 
 
+# --------------------------------------------------------------------------- compact & alternative forms
+
+
+# Case helpers: fold the command region only. The old parser matched M-code heads and their S
+# parameter as uppercase literals ("M104", "S"), so a whole-file lower() trips it on its own
+# M140/M104 before it ever reaches the reproduction; to test the reproductions' *own* case-
+# insensitivity we fold just their command words and leave the config and the rest as written.
+_CONFIG_PREFIXES = ("; curr_bed_type", "; filament_type", "; nozzle_temp", "; hot_plate",
+                    "; cool_plate", "; eng_plate", "; textured_plate")
+
+
+def _fold(text: str, *, upper: bool) -> str:
+    fn = (lambda s: s.upper()) if upper else (lambda s: s.lower())
+    return "\n".join(ln if ln.lstrip().startswith(_CONFIG_PREFIXES) else fn(ln)
+                     for ln in text.split("\n"))
+
+
+# A valid preheat→wait→purge→tool prefix and a cooldown tail, the shape the real mount file and
+# the pre-fix parser both read without trouble, so a reproduction inserted between them is
+# refused (or wrongly accepted) for its *own* reason and nothing else.
+_PRE = ["M104 S140", "M140 S60", "M190 S60 A", "M109 S240",
+        "M6211 A1 L200 T0 Q240 R240 S240", "T0"]
+_TAIL = ["G1 X10 F3000", "M109 S240", "G1 E6 F131.773", "M104 S0", "M140 S0"]
+
+# The three reproductions, each carried in upper and lower case of its own command words. For
+# every one the pre-fix parser let the file through; the fixed parser refuses it.
+_STATE_CHANGING_REPS = [
+    # 1. a compact E welded inside a token — X1E6 is X1 then E6 — issued before any nozzle wait.
+    #    The old parser's ``t.startswith("E")`` saw only X1E6's leading X, so the extrusion
+    #    vanished and the file was read as having no extrusion at all — a cold unverified extrusion
+    #    that no wait ever proved, recorded as nothing, sailed to a start that trusts the record.
+    ("compact-E move before any wait",
+     ["M140 S60", "M190 S60 A", "T0", "G1 X1E6 F131.773", "M109 S240",
+      "M104 S0", "M140 S0"]),
+    # 2. a welded ``M104S0`` (``M104`` + ``S0`` with no space) cools the hot end mid-file; the old
+    #    parser read ``M104S0`` as neither a cooldown nor an unknown-requiring-refusal, so the
+    #    cooled extrusion after it rode on the stale pre-cooldown 240 wait.
+    ("compact heater-off mid-file, extrusion still to come",
+     ["M104 S140", "M140 S60", "M190 S60 A", "M109 S240",
+      "M6211 A1 L200 T0 Q240 R240 S240", "T0", "M104S0", "G1 X10",
+      "M109 S240", "G1 E6 F131", "M104 S0", "M140 S0"]),
+    # 3. Klipper's word-form heater command — the parser cannot tell ``HEATER=whatever`` which
+    #    physical heater moves, nor read a ``WAIT``, so a heater command it cannot resolve to one
+    #    M109-verifiable setpoint is refused outright rather than skipped.
+    ("SET_HEATER_TEMPERATURE word-form",
+     ["M104 S140", "M140 S60", "M190 S60 A", "M109 S240",
+      "M6211 A1 L200 T0 Q240 R240 S240", "T0",
+      "SET_HEATER_TEMPERATURE HEATER=extruder TARGET=0", "G1 X10",
+      "M109 S240", "G1 E6 F131", "M104 S0", "M140 S0"]),
+]
+
+
+@pytest.mark.parametrize("repro, cmds", _STATE_CHANGING_REPS,
+                         ids=[r[0] for r in _STATE_CHANGING_REPS])
+def test_state_changing_compact_and_alternative_forms_are_refused(repro, cmds):
+    # the reproduction as written, and in upper- and lower-case command words (Klipper matches
+    # every command word case-insensitively), must each be refused — none may slip past as an
+    # inert line the way the pre-fix parser let them
+    base = _heat_frame(*cmds, nozzle=240.0)
+    for text in (base, _fold(base, upper=True), _fold(base, upper=False)):
+        with pytest.raises(PrinterError) as bad:
+            up.parse_gcode_text(text)
+        assert "Nothing was sent" in bad.value.message
+
+
+@pytest.mark.parametrize("heater_line", [
+    "SET_HEATER_TEMPERATURE HEATER=extruder TARGET=0",    # off mid-file: cooldown + unresolvable
+    "SET_HEATER_TEMPERATURE HEATER=extruder TARGET=260",   # to a hot target no M109 waited at
+    "set_heater_temperature heater=extruder target=260",   # lower, nonzero target
+])
+def test_word_form_heater_command_refused_however_its_target_reads(heater_line):
+    # on the valid prefix, the extrusion after a word-form heater command is refused whether the
+    # command aims to cool or to heat, so neither a hidden cooldown nor an unverifiable hot target
+    # slips a cold or unproven extrusion past
+    body = _heat_frame(*_PRE, heater_line, *_TAIL, nozzle=240.0)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(body)
+    assert "heater" in bad.value.message.lower()
+
+
+def test_compact_e_is_counted_as_extrusion_and_recorded_by_a_verified_wait():
+    # the reproduction's real danger, isolated: a hidden E the pre-fix parser never saw. Behind a
+    # verified wait the compact-E move is a real extrusion the fix now counts and records at the
+    # temperature its wait proves (the pre-fix parser recorded only the purge and left the E move
+    # unattributed); before any wait the same hidden E is an unverified cold extrusion and refused.
+    warm = _heat_frame(*_PRE, "G1 X1E6 F131.773", "M104 S0", "M140 S0", nozzle=240.0)
+    assert up.parse_gcode_text(warm).extrusion_nozzle_temps == (240.0,)
+    # the very same compact-E move, now issued before any wait, is a cold unverified extrusion
+    cold = _heat_frame("M140 S60", "M190 S60 A", "T0", "G1 X1E6 F131.773", "M109 S240",
+                       "M104 S0", "M140 S0", nozzle=240.0)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(cold)
+    assert "no nozzle temperature has even been commanded" in bad.value.message
+
+
+@pytest.mark.parametrize("line", [
+    "M106 S255", "M106", "M106 S0",              # fan on, fan at default, the fixture's own fan off
+    "G92 E0", "M83", "G90", "G21", "G28",         # coordinate/unit/mode/home commands
+    "M204 S=1500 T=5000", "M73 P50", "M84",       # acceleration, progress display, steppers off
+    "G1 X50 Y50 F6000", "G1 X127 Y-1.2 F20000",   # the two travel spellings the fixture writes
+    "G2 X10 Y10 I5 J5",                            # a non-extruding arc
+    "BED_MESH_CALIBRATE",                          # a probe pass: Z moves, no filament, no nozzle
+    "SET_PRESSURE_ADVANCE ADVANCE=0.04",           # a flow-tuning number
+    "SET_PRINT_STATS_INFO TOTAL_LAYER=120 CURRENT_LAYER=3",
+    "SET_VELOCITY_LIMIT VELOCITY=300",
+    "bed_mesh_calibrate", "set_velocity_limit velocity=300",   # Klipper matches words by case
+])
+def test_the_allowed_commands_from_the_mount_fixture_still_parse(line):
+    # every one of these changes no heater target and moves no filament on its own — the file must
+    # parse with its one real extrusion temperature recorded. The list is the parser's allow list, so
+    # this is the concrete set an uploaded file may contain, not a guess about what is harmless.
+    body = _heat_frame(*_PRE, line, "G1 E6 F131.773", "M104 S0", "M140 S0", nozzle=240.0)
+    assert up.parse_gcode_text(body).extrusion_nozzle_temps == (240.0,)
+
+
+@pytest.mark.parametrize("line", [
+    "M82",                                   # absolute-E mode: no entry, and no reason written for it
+    "SET_FAN_SPEED FAN=part_fan SPEED=1",    # a Klipper word that is not on the list
+    "M600", "M601",                          # filament change/pause: a macro round an extrusion
+    "M141 S60", "M191 S60",                  # chamber heater set/wait — a heater this parser never reads
+    "G38.2 X100 F100",                       # a probe move: a code, and not one this list carries
+    "G4 U255", "M107 R200",                  # a dwell and a fan-off carrying letters no dialect documents
+    "G4 P100E6",                             # an E welded into a dwell is not a duration
+    "g4 u255", "m107 r200",                  # and folding its case does not smuggle one past
+])
+def test_commands_outside_the_allow_list_refuse_however_ordinary_they_look(line):
+    # "usually harmless" is not a fact this adapter can establish, and an unread line is an executed
+    # one: M141 above is a heater command the parser does not read, which is the whole case for the
+    # list, and a dwell is inert because its documented parameters are durations — so a dwell whose
+    # parameter is not one refuses for the same reason that lets the command in. Each of these must
+    # refuse the file with nothing sent, not parse as an inert line. (G0, G3, G4 and M107 were here
+    # until they were entered on the list with their reasons and the tests below.)
+    body = _heat_frame(*_PRE, line, "G1 E6 F131.773", "M104 S0", "M140 S0", nozzle=240.0)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(body)
+    assert "Nothing was sent" in bad.value.message
+    assert line.upper()[:20] in bad.value.message.upper()
+
+
+@pytest.mark.parametrize("line", [
+    "G0 X127 Y-1.2 F3000",       # a rapid travel: a linear move, and this parser already reads one
+    "g0 x127 y-1.2 f3000",
+    "G3 X87 Y12 I-4 J6 F3000",   # a counter-clockwise arc: an arc move, as G2 is
+    "G4", "G4 P500", "G4 S2", "G4 D1.5",   # a dwell: a duration, and a duration moves nothing
+    "g4 p500",
+    "M107", "M107 S0", "m107",              # the part-cooling fan's own off-switch, M106 S0's equal
+])
+def test_the_commands_widened_onto_the_list_parse_and_change_no_accounting(line):
+    # G0/G3 are the moves G1/G2 already were (their E parameter is gated below), G4 waits and M107
+    # stops a fan: none of them may set a nozzle or bed target, and none may move the one recorded
+    # extrusion off the temperature its M109 proved. This is the widening rule in its positive form —
+    # an entry enters with a reason, and this test is that reason for these four.
+    body = _heat_frame(*_PRE, line, "G1 E6 F131.773", "M104 S0", "M140 S0", nozzle=240.0)
+    s = up.parse_gcode_text(body)
+    assert s.extrusion_nozzle_temps == (240.0,)
+    assert s.nozzle_setpoints == (140.0, 240.0)   # the 140 preheat stays evidence; nothing new heats
+    assert s.bed_setpoints == (60.0,)
+    assert s.tool_index == 0
+
+
+def test_g0_and_g3_extrude_under_the_m109_gate_exactly_like_g1_and_refuse_without_it():
+    # the reason allowing G0 and G3 as travels costs nothing: they were already in _MOVE_HEADS, so an
+    # E on either was already read as an extrusion and already had to find a wait at the target in
+    # force. Behind the wait both record their temperature; before any wait both are refused, which
+    # is what "it was only a move" would have been if the gate had not already been running.
+    warm = _heat_frame(*_PRE, "G0 X10 E6 F131.773", "G3 X20 Y5 I2 J2 E3 F300", "M104 S0",
+                       "M140 S0", nozzle=240.0)
+    assert up.parse_gcode_text(warm).extrusion_nozzle_temps == (240.0,)
+    for cold_move in ("G0 X10 E6 F131.773", "G3 X10 I2 J2 E6 F300", "G0 X1E6 F131.773"):
+        body = _heat_frame("M140 S60", "M190 S60 A", "T0", cold_move, "M109 S240", "M104 S0",
+                           "M140 S0", nozzle=240.0)
+        with pytest.raises(PrinterError) as bad:
+            up.parse_gcode_text(body)
+        assert "no nozzle temperature has even been commanded" in bad.value.message
+
+
+def test_parameter_letters_are_matched_whatever_their_case_without_loosening_ambiguity():
+    # Klipper matches a command and its parameters case-insensitively, and this parser already read
+    # the command word (m104), the tool select (t0), a compact heater code (m109s240) and a move's
+    # letters (g1 x1e6) that way. What it refused was a spaced parameter written in lower case, so an
+    # otherwise ordinary file saying `M104 s140` or `G180 s7` died on its spelling. Only the LETTER
+    # folds: two S parameters are still two setpoints whatever their mixture of cases.
+    upper = _heat_frame(*_PRE, "G1 X127 Y-1.2 F20000", "G1 E6 F131.773", "M104 S0", "M140 S0",
+                        nozzle=240.0)
+    lower = _fold(upper, upper=False)
+    assert "m104 s140" in lower and "m6211" in lower      # the fold really did reach the parameters
+    s_low, s_up = up.parse_gcode_text(lower), up.parse_gcode_text(upper)
+    assert (s_low.nozzle_setpoints, s_low.bed_setpoints, s_low.extrusion_nozzle_temps) == (
+        s_up.nozzle_setpoints, s_up.bed_setpoints, s_up.extrusion_nozzle_temps)
+    assert (s_low.material, s_low.tool_index, s_low.nozzle_temp, s_low.bed_temp) == (
+        s_up.material, s_up.tool_index, s_up.nozzle_temp, s_up.bed_temp)
+
+    # every heater line and the read G180 macro, written in lower case, give the same receipt
+    folded = _heat_frame("M104 s140", "m140 s60", "M190 s60 a", "m109 s240",
+                         "M6211 a1 l200 t0 q240 r240 s240", "T0", "G180 s7",
+                         "G1 E6 F131.773", "M104 s0", "M140 s0", nozzle=240.0)
+    s_fold = up.parse_gcode_text(folded)
+    assert s_fold.extrusion_nozzle_temps == (240.0,)
+    assert s_fold.nozzle_setpoints == (140.0, 240.0) and s_fold.bed_setpoints == (60.0,)
+
+    # and the ambiguity checks are untouched by the fold: two S parameters refuse in any spelling,
+    # and so does a second numbered parameter, which some dialects read as a different temperature
+    for ambiguous in ("M104 S140 s200", "M104 s140 S200", "M104 s140 s140", "M104 s140 r200",
+                      "M104 S140 R200", "m104 s140 s200"):
+        body = _heat_frame("M140 S60", "M190 S60 A", ambiguous, "M109 S240", "T0",
+                           "M6211 A1 L200 T0 Q240 R240 S240", "G1 E6 F131.773", "M104 S0",
+                           "M140 S0", nozzle=240.0)
+        with pytest.raises(PrinterError) as bad:
+            up.parse_gcode_text(body)
+        assert "Nothing was sent" in bad.value.message, ambiguous
+
+
+@pytest.mark.parametrize("macro", [
+    "G_CODE_MACRO",                              # a name this printer really carries
+    "PRINT_START_RETRACTION", "WIPE_TOWER_PRIME", "PURGE_LINE_AND_SINGE",
+    "FILAMENT_SWAP", "DO_THE_THING_X", "a7x_random_name",
+])
+def test_word_form_macros_that_are_not_on_the_list_refuse_whatever_they_might_do(macro):
+    # a word-form name in Klipper is a macro: its body can heat, extrude, cool or swap filament and no
+    # reader of the printed file can see it. A macro that is not on the list therefore refuses even
+    # when its name says nothing about heaters (WIPE_TOWER_PRIME moves the carriage and the filament),
+    # and case-folding it changes nothing — Klipper would run it either way, this parser refuses both.
+    body = _heat_frame(*_PRE, macro, "G1 E6 F131.773", "M104 S0", "M140 S0", nozzle=240.0)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(body)
+    assert macro.upper() in bad.value.message.upper() and "Nothing was sent" in bad.value.message
+
+
+def test_an_unknown_macro_beside_heater_and_move_commands_refuses_the_whole_file():
+    # the shape the review asked for: a clean heater frame (preheat, bed, wait, purge, select), a
+    # travel, then a macro, then an extrusion. Everything the parser tracks is in order — the macro is
+    # the only fact wrong with the file — and the macro alone refuses it, because the extrusion after a
+    # command whose body nobody read is an extrusion whose temperature history is unknown.
+    body = _heat_frame("M104 S140", "M140 S60", "M190 S60 A", "M109 S240",
+                       "M6211 A1 L200 T0 Q240 R240 S240", "T0",
+                       "G1 X10 Y10 F6000", "G_CODE_MACRO", "G1 E6 F131.773",
+                       "M104 S0", "M140 S0", nozzle=240.0)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(body)
+    assert "G_CODE_MACRO" in bad.value.message and "Nothing was sent" in bad.value.message
+    assert bad.value.details["reason"] == "gcode_unreadable"
+
+
+def test_a_macro_that_heats_without_naming_a_heater_is_refused_by_the_list_not_the_keyword():
+    # SET_HEATER_TEMPERATURE names itself, and the heater-word rule catches it. A printer's own macro
+    # called HEAT_AND_PRIME_LIKE_MAYBE (or anything else) may do the same thing in a body the file
+    # never shows, and its name may say nothing at all: the allow list is what refuses it, so the
+    # refusal is about an unread command rather than a keyword match.
+    for macro in ("HOTEND_BAKE", "MY_HEATERS_ON", "G180_STYLE_MACRO"):
+        body = _heat_frame(*_PRE, macro, "G1 E6 F131.773", "M104 S0", "M140 S0", nozzle=240.0)
+        with pytest.raises(PrinterError) as bad:
+            up.parse_gcode_text(body)
+        assert "Nothing was sent" in bad.value.message
+
+
+@pytest.mark.parametrize("line", ["G10", "G10 P1 R1", "G11", "G12", "G12 Z-1", "g10 p1"])
+def test_g10_g11_g12_refuse_as_unverified_firmware_extrusion(line):
+    # in the dialects the CC2 firmware derives from, G10 with R re-primes filament and G12 runs a
+    # clean-up purge, while in others they only bookkeep coordinates. What this firmware does was never
+    # established, and a command that may move filament without ever passing an M109 check is exactly
+    # what the extrusion gate cannot afford to miss — so they are refused until understood, by name.
+    body = _heat_frame(*_PRE, line, "G1 E6 F131.773", "M104 S0", "M140 S0", nozzle=240.0)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(body)
+    assert "G1" in bad.value.message and "filament" in bad.value.message.lower()
+    assert "Nothing was sent" in bad.value.message
+
+
+@pytest.mark.parametrize("line", ["G180 S1", "G180 S6", "G180 S800", "G180 S0", "G180 S999",
+                                   "G180 S1234", "G180 S7 S8", "G180 s1", "G180 s7 s8",
+                                   "G180 S7 X1", "G180 s7.5", "G180", "G180S7", "G0180 S7",
+                                   "G180 S{nozzle_temperature}"])
+def test_g180_forms_this_guard_cannot_pin_to_one_read_macro_refuse_never_skip(line):
+    # G180 is the CC2 firmware's own macro dispatcher (see _G180_MACROS in cc2_upload.py): the S
+    # number selects a macro body held in the printer's [g180] config section, so the code name says
+    # nothing and the number says everything. S1 waits at M109 S200 and hot-wipes, S6 switches every
+    # heater off, the unload chain's S800 waits at M109 S140 — all published in Elegoo's own
+    # printer_dsp.cfg — and none of them is accounted for here, so they refuse. So does every spelling
+    # whose number cannot be read at all (no S, a welded G180S7, a padded G0180, an unresolved
+    # template, two parameters where the firmware reads one), because an unread number is an unread
+    # macro and skipping it is trusting it. Folding the S letter changes none of that: `G180 s1`
+    # selects S1 for the firmware and for this guard alike, so it refuses exactly as `G180 S1` does
+    # while `G180 s7` parses exactly as `G180 S7` does.
+    body = _heat_frame(*_PRE, line, "G1 E6 F131.773", "M104 S0", "M140 S0", nozzle=240.0)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(body)
+    msg = bad.value.message
+    assert "G180" in msg and "Nothing was sent" in msg
+    assert bad.value.hint and len(bad.value.hint) <= up._REPLY_CAP
+    assert len(msg) <= up._REPLY_CAP, msg
+
+
+@pytest.mark.parametrize("line", ["G180 S7", "g180 S7", "G180  S7", "G180 S7 ; mesh select",
+                                   "G180 S07", "G180 S007", "G180 S008"])
+def test_g180_read_numbers_are_accepted_whatever_their_spelling_and_change_no_accounting(line):
+    # the read numbers (S7, S8, S9) must pass on the spellings a slicer or an editor may really write:
+    # the command word is case-folded like every other code, whitespace is free, a trailing comment is
+    # stripped, and the firmware reads the number with get_int, so S07 selects the same macro as S7.
+    # Acceptance is not a bypass: the parser still demands the M109 wait behind every extrusion here,
+    # which is why the same frame with the wait removed is refused below.
+    body = _heat_frame(*_PRE, line, "G1 X127 Y-1.2 F20000", "M109 S240", "G1 E6 F131.773",
+                       "M104 S0", "M140 S0", nozzle=240.0)
+    s = up.parse_gcode_text(body)
+    assert s.extrusion_nozzle_temps == (240.0,)
+    cold = _heat_frame("M140 S60", "M190 S60 A", line, "T0", "G1 E6 F131.773", "M104 S0",
+                       "M140 S0", nozzle=240.0)
+    with pytest.raises(PrinterError):
+        up.parse_gcode_text(cold)
+
+
+def test_g180_s7_and_s8_in_the_mount_files_own_order_parse_verbatim():
+    # the two mesh macros exactly where the CC2 profile puts them and exactly as it writes them
+    # (lines 100 and 114 of the 2026-11-04 mount slice): S7 between the flush purge and the first E
+    # move, S8 after the wipe and before the print body. Both bodies are conditional bed-mesh profile
+    # loads plus M400 in the published config, which move Z and not filament and set no heater, so
+    # the wait the extrusions ride on is still the file's own M109 S260 and the receipt records 260.
+    body = _heat_frame("M104 S140", "M140 S80", "M190 S80 A", "M106 S0", "M109 S260",
+                       "M6211 A1 L200 T0 Q260 R260 S260", "T0",
+                       "G180 S7",
+                       "G1 X127 Y-1.2 F20000", "G1 Z0.5 F900", "M73 P0 R62", "M109 S260", "M83",
+                       "G92 E0", "G1 E6 F131.773", "M106 S200", "G1 X87 E20 F1200", "G1 F6000",
+                       "G1 X82 E0.8", "M106 S0",
+                       "G180 S8",
+                       "G1 F20000", "G92 E0", "SET_PRINT_STATS_INFO TOTAL_LAYER=240 CURRENT_LAYER=0",
+                       "M104 S0", "M140 S0",
+                       material="PETG", nozzle=260.0, bed=80.0)
+    s = up.parse_gcode_text(body)
+    assert (s.material, s.nozzle_temp, s.bed_temp, s.tool_index) == ("PETG", 260.0, 80.0, 0)
+    assert s.extrusion_nozzle_temps == (260.0,)
+    assert s.nozzle_setpoints == (140.0, 260.0)  # the preheat stays evidence, never an extrusion temp
+
+
+def test_g180_s9_end_of_print_unload_is_read_and_the_end_block_still_parses():
+    # the mount file's own end block (lines 190723-190734): bed off, a retract while the nozzle is
+    # still hot, an arc to lift Z, then G180 S9, then the nozzle off and the steppers down. The unload
+    # is accepted there because the published body — PRINTER_UNLOAD_FILAMENT inside a SET_CONDITION on
+    # the CANVAS being connected — belongs at the end of a print, and nothing in this frame extrudes
+    # after it. Its effects are still conditional on runtime state the file cannot show, which is why
+    # the parser treats the line as the end of what it can account for (see the two tests below).
+    body = _heat_frame("M104 S140", "M140 S80", "M190 S80 A", "M109 S260",
+                       "M6211 A1 L200 T0 Q260 R260 S260", "T0", "G1 X127 Y-1.2 F20000",
+                       "M109 S260", "G1 E6 F131.773", "M140 S0", "M83", "G92 E0",
+                       "G1 E-1.5 F1800", "G2 I0 J1 Z48.5 F3000", "M106 S0", "G90", "G1 Z80 F20000",
+                       "G180 S9", "M104 S0", "M84", "M73 P100 R0",
+                       material="PETG", nozzle=260.0, bed=80.0)
+    s = up.parse_gcode_text(body)
+    assert s.extrusion_nozzle_temps == (260.0,)
+    assert s.nozzle_setpoints == (140.0, 260.0)
+
+
+@pytest.mark.parametrize("move", ["G1 E6 F131.773", "G1 X120 E3 F131.773", "G1 X1E6 F131.773",
+                                  "G2 I0 J1 Z1 E0.5 F3000",
+                                  "M6211 A1 L200 T0 Q260 R260 S260"])
+def test_nothing_may_extrude_after_a_g180_s9_unload(move):
+    # S9's body is conditional on runtime state this file cannot show (is the CANVAS linked? is there
+    # filament in the head? is the nozzle already under 100 °C?), and when it runs it cuts the
+    # filament, withdraws it by device routine, and calls S800 — which waits at M109 S140. So after an
+    # S9 the nozzle target, its verified wait and whether there is filament in the path at all are all
+    # unknown, and the guard says so instead of carrying 260 °C forward: an E move (spaced, compact,
+    # or on an arc) or another flush purge past the unload is refused, not re-accounted.
+    body = _heat_frame("M104 S140", "M140 S80", "M190 S80 A", "M109 S260",
+                       "M6211 A1 L200 T0 Q260 R260 S260", "T0", "G1 E6 F131.773",
+                       "G180 S9", move, "M104 S0", "M84", material="PETG", nozzle=260.0, bed=80.0)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(body)
+    msg = bad.value.message
+    assert "G180 S9" in msg and "Nothing was sent" in msg and "withdraw" in msg
+    assert bad.value.hint and "last extrusion" in bad.value.hint
+
+
+def test_the_g180_table_is_closed_and_every_entry_names_the_body_it_was_read_against():
+    # the widening rule for the dispatcher: an entry is allowed only with the published body it was
+    # read against, the reason it cannot make an extrusion cold, and (for a body that can move the
+    # filament path) the ends_print flag that drops the accounting across it. G180 itself is on no
+    # command list — being on the dispatcher table is not being allow-listed by name.
+    assert set(up._G180_MACROS) == {7, 8, 9}
+    for number, macro in up._G180_MACROS.items():
+        assert macro.body.strip() and macro.reason.strip(), number
+        assert "BED_MESH" in macro.body or "PRINTER_UNLOAD_FILAMENT" in macro.body, number
+    assert up._G180_MACROS[9].ends_print and not up._G180_MACROS[7].ends_print
+    assert not up._G180_MACROS[8].ends_print
+    assert "G180" not in up._SAFE_CODE_COMMANDS and "G180" not in up._SAFE_WORD_COMMANDS
+    assert "G180" not in up._BLOCKED_COMMANDS  # now decided by number, not blocked by name
+    assert "G180" in up._TRACKED_CODE_SPELLINGS  # so G0180 / G180S7 name themselves when refused
+    assert "_G180_MACROS" in up._G180_HINT        # and the hint says where a number gets added
+    assert len(up._G180_HINT) <= up._REPLY_CAP    # whole, inside what a client will show
+    assert all(m.ends_print == (n == 9) for n, m in up._G180_MACROS.items())
+
+
+def test_the_2026_11_04_mount_file_with_g180_s7_s8_s9_uploads_under_the_policy():
+    # the file this workflow exists for: the real slice Nathan mounted on 2026-11-04, whole, with its
+    # three G180 lines (S7 flush-side, S8 after the wipe, S9 in the end block) and nothing weakened to
+    # get there. See _mount_slice_text for the file and its override; the macros are counted in the
+    # file itself so a stale or substituted path cannot let this test pass by accident.
+    text = _mount_slice_text()
+    assert text.count("\nG180 S7\n") == 1 and text.count("\nG180 S8\n") == 1
+    assert text.count("\nG180 S9\n") == 1
+    s = up.parse_gcode_text(text)
+    assert (s.material, s.bed_plate) == ("PETG", "high temp plate")
+    assert (s.nozzle_first_layer_temp, s.nozzle_temp) == (260.0, 260.0)
+    assert (s.bed_first_layer_temp, s.bed_temp) == (80.0, 80.0)
+    assert s.tool_index == 0
+    # the 140 °C flush hold stays a preheat, and the only verified extrusion temperature is 260 °C —
+    # the value a start compares against the loaded spool's range
+    assert s.nozzle_setpoints == (140.0, 260.0) and s.extrusion_nozzle_temps == (260.0,)
+
+
+
+@pytest.mark.parametrize("line", ["M0104 S260", "G001 X10", "M0190 S70", "M06211 T0 Q240",
+                                   "G1X1E6 F131", "M109S240S1"])
+def test_padded_and_welded_spellings_refuse_instead_of_bypassing_the_gates(line):
+    # Klipper accepts M0104 and G1X1E6; a parser that normalised them into the allow list would count a
+    # heater command as allowed without ever carrying its setpoint into the order check — the tracking
+    # is the only reason those commands are allowed. An unreadable spelling therefore refuses.
+    body = _heat_frame(*_PRE, line, "G1 E6 F131.773", "M104 S0", "M140 S0", nozzle=240.0)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(body)
+    assert "Nothing was sent" in bad.value.message
+
+
+@pytest.mark.parametrize("line, shape", [
+    ("G38.2 X100 F100", "is a code this parser does not read"),
+    ("M141 S60", "is a code this parser does not read"),
+    ("M82", "is a code this parser does not read"),
+    ("M0104 S260", "is a padded or welded spelling of M104"),
+    ("G_CODE_MACRO", "is a word-form name this parser does not read"),
+    ("SET_FAN_SPEED FAN=part_fan SPEED=1", "is a word-form name this parser does not read"),
+    ("WIPE_TOWER_PRIME", "is a word-form name this parser does not read"),
+])
+def test_a_refusal_names_what_the_unread_command_actually_is(line, shape):
+    # "unknown command" is not actionable; "a G/M code nobody read" and "a macro whose body this file
+    # never shows" are two different things to go and check, and the refusal says which one it met
+    err = up._command_policy(line.split()[0].upper(), line)
+    assert err is not None and shape in err.message, err and err.message
+
+
+@pytest.mark.parametrize("line", [
+    "G_CODE_MACRO", "SET_FAN_SPEED FAN=part_fan SPEED=1", "A_VERY_LONG_RANDOM_MACRO_NAME_THAT_KEEPS X1",
+    "G180", "G10 P1 R1", "G11", "G12 Z-1", "M0104 S260", "M82", "M141 S60",
+    "G38.2 X100 F100", "G4 U255", "M107 R200",
+])
+def test_every_command_refusal_reaches_the_model_whole(line):
+    # the server caps every string of a reply at 255 characters (server._CC2_STR_MAX), and the sentence
+    # a model most needs from a refusal is the promise that nothing was sent — so a refusal is written
+    # to fit inside that cap even with a command excerpt quoted in it, not cut down to a stub
+    err = up._command_policy(line.split()[0].upper(), line)
+    assert err is not None, line
+    assert len(err.message) <= up._REPLY_CAP, f"{len(err.message)}: {err.message}"
+    assert "Nothing was sent to the printer." in err.message
+    assert err.hint and len(err.hint) <= up._REPLY_CAP  # and the hint says how to widen the list
+
+
+def test_nothing_a_refusal_must_never_lose_sits_past_what_a_client_will_show():
+    # The cap belongs to the server and the parser cannot import it — the layering runs the other way —
+    # so this is where the two numbers are pinned together, and where a refusal's ordering is proven on
+    # the messages this module really raises: every one leads with the promise that nothing was sent, so
+    # a client showing only the first 255 characters still tells a model the upload stopped. A refusal
+    # longer than the cap keeps its diagnosis whole for anything that shows more, and its hint repeats
+    # the advice the truncated tail would have carried.
+    import orcaslicer_mcp.server as srv
+    assert up._REPLY_CAP == srv._CC2_STR_MAX
+    good = gcode_text()
+    refusals = [
+        good.replace("M109 S260", "G_CODE_MACRO", 1),                    # an unread macro
+        good.replace("M109 S260", "G3 X1 Y1 I1 J1", 1),                  # an unread code
+        good.replace("M109 S260", "G180 X1", 1),                         # a G180 with no S number
+        good.replace("M109 S260", "G180 S6", 1),                          # an unread G180 macro
+        good.replace("M109 S260", "G180 S9", 1),                          # an unload before an E move
+        good.replace("M109 S260", "M0104 S260", 1),                      # a welded spelling
+        good.replace("M104 S140", "M104", 1),                            # a heater with no setpoint
+        good.replace("M104 S140", "M104 S140 P1 Q2", 1),                 # a second temperature
+        good.replace("M140 S70", "M140 S70 S80", 1),                     # two setpoints at once
+        good.replace("M109 S260", "M109 S9999", 1),                      # an impossible temperature
+        good.replace("M106 S0", "SET_HEATER_TEMPERATURE HEATER=zero_chamber_bed TARGET=1", 1),
+        good.replace("G1 X127 Y-1.2 F20000", "G1 X127 Y-1.2 F=-", 1),    # an unreadable move
+        good.replace("T0\n", "", 1),                                     # no tool select at all
+        good.replace("; filament_type = PETG", "; filament_type =", 1),  # a setting gone empty
+        good.replace("; curr_bed_type = High Temp Plate",                 # a plate nobody knows
+                     "; curr_bed_type = A Plate Of Magic", 1),
+        gcode_text(temp_trail=True, mid_s0=True),                        # cooldown mid-file
+        gcode_text(material=None),                                       # a setting gone missing
+    ]
+    for text in refusals:
+        assert text != good          # each variant really did change the reference file
+        with pytest.raises(up.PrinterError) as caught:
+            up.parse_gcode_text(text)
+        e = caught.value
+        where = e.message.find("Nothing was sent to the printer.")
+        assert 0 <= where < srv._CC2_STR_MAX, f"promise at {where}: {e.message}"
+        assert len(e.hint or "") <= srv._CC2_STR_MAX, f"hint too long: {e.hint}"
+
+
+def test_the_allow_list_is_closed_and_every_entry_states_its_own_reason():
+    # a guard on the list itself: widening it must be a deliberate edit here, with the reason for the
+    # new entry written beside it in cc2_upload.py and a test that it cannot heat or extrude. G180 is
+    # not on this list at all — it is the CC2 firmware's macro dispatcher and is allowed one macro
+    # number at a time against the published [g180] body (see _G180_MACROS and its own tests).
+    assert set(up._SAFE_CODE_COMMANDS) == {
+        "G0", "G1", "G2", "G3", "G4", "G21", "G28", "G90", "G92", "M104", "M106", "M107", "M109",
+        "M140", "M190", "M204", "M6211", "M73", "M83", "M84"}
+    assert set(up._SAFE_WORD_COMMANDS) == {"BED_MESH_CALIBRATE", "SET_PRESSURE_ADVANCE",
+                                            "SET_PRINT_STATS_INFO", "SET_VELOCITY_LIMIT"}
+    assert {"G10", "G11", "G12"} <= set(up._BLOCKED_COMMANDS)
+    assert {"G180", "G10", "G11", "G12", "M82", "M141", "M600", "G38"}.isdisjoint(
+        up._SAFE_CODE_COMMANDS)
+    # and every entry states its own justification, so nobody joins the list on a blank argument
+    assert all(reason.strip() for reason in up._SAFE_CODE_COMMANDS.values())
+    assert all(reason.strip() for reason in up._SAFE_WORD_COMMANDS.values())
+    assert "unverified" in up._BLOCKED_COMMANDS["G12"]
+
+
+def test_the_two_entries_that_depend_on_their_parameters_name_those_parameters():
+    # a move is inert whatever its parameters (its E, if any, is an extrusion and is gated), but a
+    # dwell and a fan-off are inert because of what their documented parameters mean — so an entry
+    # that leans on its parameters has to write down the letters it leans on, they may never include
+    # an E, and they are read by the tokenizer that reads a move so a compact E cannot hide
+    assert set(up._PARAMETER_LETTERS) == {"G4", "M107"}
+    assert set(up._PARAMETER_LETTERS) <= set(up._SAFE_CODE_COMMANDS)
+    for head, letters in up._PARAMETER_LETTERS.items():
+        assert letters, head
+        assert "E" not in letters, head
+    assert up._command_policy("G4", "G4 P100", "P100") is None
+    assert up._command_policy("M107", "M107 S0", "S0") is None
+    for bad_line, bad_rest in (("G4 P100E6", "P100E6"), ("G4 U255", "U255"), ("M107 R200", "R200"),
+                               ("M107 E5", "E5")):
+        err = up._command_policy(bad_line.split()[0], bad_line, bad_rest)
+        assert err is not None, bad_line
+        assert "Nothing was sent" in err.message
+        assert len(err.message) <= up._REPLY_CAP and err.hint and len(err.hint) <= up._REPLY_CAP
+
+
+def test_clean_compact_heat_forms_are_normalised_and_parse():
+    # the fix must not refuse every welded form it can read cleanly: a valid start written in
+    # compact heater codes (M104S140 preheat, M109S240 wait, trailing M104S0/M140S0 cooldowns)
+    # parses to the same verified 240 °C extrusion — and the same setpoints — the spaced form gives
+    body = _heat_frame("M140 S60", "M190 S60 A", "M104S140", "M109S240",
+                       "M6211 A1 L200 T0 Q240 R240 S240", "T0",
+                       "G1 E6 F131.773", "M104S0", "M140S0", nozzle=240.0)
+    s = up.parse_gcode_text(body)
+    assert s.extrusion_nozzle_temps == (240.0,)
+    assert s.nozzle_setpoints == (140.0, 240.0)
+
+
+@pytest.mark.parametrize("line", ["M109S240R200", "M104S0T30", "M109S1.5R2"])
+def test_ambiguous_compact_heat_forms_are_refused_not_skipped(line):
+    # on the valid prefix, a welded code with a second packed parameter is the very ambiguity the
+    # spaced form is refused for (a second numbered parameter some dialects read as a different
+    # temperature); it must be refused, never silently skipped as an unknown command — the pre-fix
+    # parser skipped it and accepted the file
+    body = _heat_frame(*_PRE, line, "G1 X10", *_TAIL, nozzle=240.0)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(body)
+    assert "Nothing was sent" in bad.value.message
+
+
+def test_the_working_mount_preheat_wait_purge_flow_survives_the_compact_support():
+    # the actual mount file's expected order — a 140 °C non-extruding preheat, a wait up to the
+    # print temperature, then M6211 + a G1 E purge — parses unchanged, and comments on those very
+    # lines are stripped, not mistaken for commands, exactly as before the fix
+    mount = _heat_frame(
+        "M104 S140 ; warm the hot end for the flush", "M140 S60", "M190 S60 A",
+        "M109 S260 ; bring it up to print temperature",
+        "M6211 A1 L200 T0 Q260 R260 S260 ; prime the nozzle", "T0",
+        "G1 X127 Y-1.2 F20000 ; approach", "G1 E6 F131.773 ; purge", "M104 S0", "M140 S0",
+        nozzle=260.0)
+    s = up.parse_gcode_text(mount)
+    assert s.extrusion_nozzle_temps == (260.0,)
+    assert s.nozzle_setpoints == (140.0, 260.0)  # the 140 preheat stays visible, never printed at
+    assert s.material == "PLA" and s.tool_index == 0
+
+
+# ------------------------------------------- the purge's own parameters, and the tail of a compact
+# heater code — both read against the published CC2 firmware
+#
+# Every expectation in this section is pinned to Elegoo's own firmware source, not to a guess:
+# ``elegoo/extras/mmu.cpp::CMD_M6211`` (lines 3229-3383 of ElegooOfficial/CentauriCarbon2) is the
+# purge itself — the letters it reads, the ``limit_check`` clamp each one goes through, and the order
+# of the heater and tool commands it then runs; ``elegoo/common/utilities.cpp::regex_split`` with
+# ``elegoo/gcode.cpp::process_commands`` is how a line becomes parameters on this machine (letters are
+# cut from numbers, spaces carry no meaning, and a repeated letter simply overwrites the earlier one);
+# ``elegoo/gcode.cpp::GCodeCommand::get_double`` is what a value that will not convert does (the
+# conversion error is caught and the uninitialised double used anyway).
+
+_LEGIT_PURGE = "M6211 A1 L200 T0 Q260 R260 S260"   # exactly what all four real CC2 slices write
+
+
+def _purge_frame(purge: str, *, select: str = "T0", nozzle: float = 260.0):
+    """The mount file's own heater order — 140 preheat, bed, one ``M109`` wait at the print
+    temperature, the purge, the tool select, then extrusion and the end cooldowns — with this purge
+    line in it and nothing else changed, so a refusal is the purge line's own doing."""
+    cmds = ["M104 S140", "M140 S80", "M190 S80 A", "M109 S260", purge]
+    if select:
+        cmds.append(select)
+    cmds += ["G1 X127 Y-1.2 F20000", "G1 E6 F131.773", "M104 S0", "M140 S0"]
+    return _heat_frame(*cmds, material="PETG", nozzle=nozzle, bed=80.0)
+
+
+@pytest.mark.parametrize("purge, letter, value", [
+    ("M6211 A1 L200 T0 Q350 R350 S260", "Q", "350"),    # the review's reproduction, verbatim
+    ("M6211 A1 L200 T0 Q260 R350 S260", "R", "350"),
+    ("M6211 A1 L200 T0 Q260 R260 S350", "S", "350"),
+    ("M6211 A1 L200 T0 Q200 R260 S260", "Q", "200"),    # the clamp floor, still not the print temp
+    ("M6211 A1 L200 T0 Q260 R260 S240", "S", "240"),    # one degree off is still a different heat
+    ("m6211 a1 l200 t0 q350 r350 s260", "Q", "350"),    # and the fold changes nothing
+])
+def test_purge_setpoints_outside_the_verified_target_are_refused(purge, letter, value):
+    # CMD_M6211 commands Q first (``M109 S<Q>`` when A=1, a bare ``M104 S<Q>`` otherwise), then
+    # ``M104 S<R>`` with no wait at all and runs every flush extrusion of the purge at that target,
+    # then ``M109 S<S>`` before its final extrusion. So a purge writing 350 °C beside a file whose
+    # only verified wait is 260 °C extrudes at 350 while the receipt — the thing a start compares
+    # against the loaded spool's range — still says 260. The pre-fix parser read only S, and read
+    # this file as a purge at 260.
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(_purge_frame(purge))
+    assert letter in bad.value.message and value in bad.value.message
+    assert "Nothing was sent" in bad.value.message
+
+
+@pytest.mark.parametrize("purge, tool", [
+    ("M6211 A1 L200 T1 Q260 R260 S260", 1),    # the review's second reproduction, verbatim
+    ("m6211 a1 l200 t1 q260 r260 s260", 1),    # and the fold reaches the purge's parameters too
+    ("M6211 A1 L200 T3 Q260 R260 S260", 3),    # a third channel, inside the firmware's own 0..31
+])
+def test_a_purge_flushing_another_tools_filament_is_a_second_tool_and_refuses(purge, tool):
+    # ``T`` inside M6211 is not a note about the flush: the firmware runs
+    # ``CANVAS_SWITCH_FILAMENT T=<n>`` in the middle of the purge, which cuts, unloads and loads that
+    # tool's filament (mmu.cpp::CMD_canvas_switch_filament → feed_channel_request = get_T_channel(T)).
+    # A file selecting T0 whose purge switches T1 is a two-tool file, and this version serves one.
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(_purge_frame(purge))
+    msg = bad.value.message.lower()
+    assert f"tool {tool}" in msg and "nothing was sent" in msg
+
+
+def test_the_purges_tool_may_be_the_files_only_tool_while_a_frame_with_no_select_still_refuses():
+    # the refusal above is about a purge naming a tool the file never selects, not about the purge
+    # naming one at all: a file whose single tool is T1, flushed at T1, is a single-tool file.
+    s = up.parse_gcode_text(_purge_frame(_LEGIT_PURGE.replace("T0", "T1"), select="T1"))
+    assert s.tool_index == 1 and s.extrusion_nozzle_temps == (260.0,)
+    # and a purge is not a substitute for the file's own tool select: with no ``T<n>`` line the file
+    # still has no tool, exactly as before this reading of the purge.
+    without = _purge_frame(_LEGIT_PURGE, select="")
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(without)
+    assert "no tool at all" in bad.value.message
+
+
+@pytest.mark.parametrize("purge, letter", [
+    ("M6211 A1 L200 Q260 R260 S260", "T"),        # which filament to flush: the printer's config knows
+    ("M6211 A1 L200 T0 R260 S260", "Q"),          # and so does every one of these three temperatures
+    ("M6211 A1 L200 T0 Q260 S260", "R"),
+    ("M6211 A1 L200 T0 Q260 R260", "S"),
+    ("M6211 A1 L200 T0 Q260 R260 S260 S200", "S"),      # two S: the firmware keeps the last one
+    ("M6211 A1 L200 T0 Q260Q200 R260 S260", "Q"),        # the same two, packed with no space
+    ("M6211 A1 L200 T0 Q260 R260 S260 R260", "R"),       # identical twice is still two values
+    ("M6211 A1 L200 T0 Q150 R260 S260", "Q"),            # below the clamp: firmware runs 200
+    ("M6211 A1 L200 T0 Q400 R260 S260", "Q"),            # above it: firmware runs 350
+    ("M6211 A1 L200 T0 Q260 R260 S199.9", "S"),          # 0.1 below the clamp floor
+    ("M6211 A1 L200 T32 Q260 R260 S260", "T"),           # clamped to 31 — not the tool written
+    ("M6211 A1 L200 T-1 Q260 R260 S260", "T"),
+    ("M6211 A1 L200 T0.5 Q260 R260 S260", "T"),          # stoi truncates: the file says T0.5
+    ("M6211 A2 L200 T0 Q260 R260 S260", "A"),            # clamped 0..1: the wait at Q is the flag
+    ("M6211 A L200 T0 Q260 R260 S260", "A"),             # a bare flag: stoi reads an uninitialised int
+    ("M6211 A1 L200 T0 Q2o0 R260 S260", "Q"),            # not a number at all
+    ("M6211 A1 L200 T0 Q=260 R260 S260", "Q"),           # an = where a digit belongs
+    ("M6211 A1 L200 T0 Q260 R260 S260 Z5", "Z"),         # a fourteenth letter: CMD_M6211 reads thirteen
+    ("M6211 A1 L200 T0 Q260 R260 S260 E5", "E"),         # even an E, whose meaning nobody would guess
+])
+def test_a_purge_value_the_firmware_would_not_read_as_written_refuses(purge, letter):
+    # every one of these was accepted by the pre-fix parser, which looked only for one S parameter and
+    # ignored the rest of the line. Each letter's window is the firmware's own: ``limit_check``
+    # (mmu.cpp:3222) moves an out-of-window value inside the window silently, and an absent letter
+    # takes ``this-><name>``, the printer's stored flush config.
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(_purge_frame(purge))
+    assert letter in bad.value.message and "Nothing was sent" in bad.value.message
+
+
+def test_the_purges_non_heater_letters_are_read_and_change_nothing_about_the_receipt():
+    # the same source reads K L M N I J P C D on every purge — flush lengths, two feedrates, two fan
+    # speeds, one dwell and two retract lengths. They command no heater and select no tool (and the
+    # purge is already counted as one gated extrusion), so a full real flush line must parse exactly
+    # like the short one the slicer writes: the same receipt, byte for byte.
+    full = (_LEGIT_PURGE + " K30 M120 N120 I255 J0 P1000 C0.8 D0.8")
+    plain, filled = (up.parse_gcode_text(_purge_frame(p)) for p in (_LEGIT_PURGE, full))
+    assert plain == filled
+    assert filled.extrusion_nozzle_temps == (260.0,) and filled.nozzle_setpoints == (140.0, 260.0)
+    # the firmware's own parameter splitter cuts letters from numbers and ignores the spaces, so a
+    # packed run of flush parameters is the same command; it is refused only where the packing hides
+    # an ambiguity (two of one letter, above)
+    packed = up.parse_gcode_text(_purge_frame("M6211 A1L200T0Q260R260S260"))
+    assert packed == plain
+
+
+def test_a_welded_purge_head_is_still_refused_as_an_untrackable_spelling():
+    # the parameter packing above belongs to the parameters. A purge whose code itself is welded to
+    # its first parameter (``M6211A1``) is the spelling this parser refuses everywhere else, because
+    # the loop never sees an ``M6211`` head to track at all.
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(_purge_frame("M6211A1 L200 T0 Q260 R260 S260"))
+    assert "welded spelling of M6211" in bad.value.message
+
+
+@pytest.mark.parametrize("line, says", [
+    ("M109S260 S0", "exactly one S"),        # the review's reproduction, verbatim: 260 welded, 0 spaced
+    ("M109S260 S260", "exactly one S"),      # twice the same is still two setpoints
+    ("M104S140 S0", "exactly one S"),        # the other nozzle heater, same normaliser
+    ("M104S140 R200", "beside its S"),       # a second numbered parameter, spaced, was accepted
+    ("M140S80 S70", "exactly one S"),        # and the bed's two commands, same path
+    ("M190S80 S70", "exactly one S"),
+    ("m109s260 s0", "exactly one S"),        # the fold reaches the parameters, not just the code
+    ("M104S140 s200", "exactly one S"),
+])
+def test_a_compact_heater_code_keeps_every_parameter_written_after_it(line, says):
+    # ``M109S260 S0`` is one command with two S parameters, and the firmware reads it that way:
+    # regex_split cuts M/109/S/260/S/0 whatever the spacing, and the parameter map simply overwrites,
+    # so the machine would hold the LAST S — 0, off. The normaliser turned the line into ``M109 S260``
+    # and dropped the ``S0``, which is a setpoint read as nothing. It keeps the remainder now, and the
+    # ordinary spaced rule (one S parameter, no second numbered parameter) refuses both fields.
+    body = _heat_frame("M140 S60", "M190 S60 A", "M104 S140", line, "M109 S240", "T0",
+                       "M6211 A1 L200 T0 Q240 R240 S240", "G1 E6 F131.773", "M104 S0", "M140 S0",
+                       nozzle=240.0)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(body)
+    assert says in bad.value.message and "Nothing was sent" in bad.value.message
+
+
+def test_a_bare_flag_after_a_compact_setpoint_stays_a_flag_and_the_file_parses():
+    # the fix preserves the remainder; it does not refuse it. The reference file writes
+    # ``M190 S70 A``, and the compact spelling of that very line carries the same bare flag after the
+    # welded setpoint — a flag carries no number, sets no second temperature, and still parses to the
+    # same 260/80 mount receipt.
+    compact = _heat_frame("M140S80", "M190S80 A", "M104S140", "M109S260",
+                          _LEGIT_PURGE, "T0", "G1 X127 Y-1.2 F20000", "G1 E6 F131.773",
+                          "M104S0", "M140S0", material="PETG", nozzle=260.0, bed=80.0)
+    s2 = up.parse_gcode_text(compact)
+    assert s2.extrusion_nozzle_temps == (260.0,) and s2.bed_setpoints == (80.0,)
+
+
+def _mount_slice_text() -> str:
+    """The real 2026-11-04 CC2 slice this workflow exists for, or a skip: it is a machine-local file,
+    not a repo fixture (``ORCA_CC2_TEST_GCODE`` overrides the path). Tests that use it assert on the
+    file's own commands, so a substituted path cannot let them pass by accident."""
+    path = Path(os.environ.get(
+        "ORCA_CC2_TEST_GCODE",
+        "/home/killerherts/.orcaslicer-mcp/gcode/eva-chube-petg-260c-80c.gcode"))
+    if not path.is_file():
+        pytest.skip(f"{path} is only on the machine that mounted it")
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def test_the_real_mount_slice_with_each_review_reproduction_edited_in_still_refuses():
+    # the two P1 reproductions run against the real slice bytes, not a synthetic frame, beside the
+    # acceptance they must not disturb: the untouched file parses at PETG 260/80 with one verified
+    # extrusion temperature, and each one-line edit — the purge's Q/R moved, the purge's tool moved,
+    # the wait written compact with a second setpoint after it — stops the upload naming its own field
+    text = _mount_slice_text()
+    lines = text.split("\n")
+    assert up.parse_gcode_text(text).extrusion_nozzle_temps == (260.0,)
+    purge_at, wait_at = lines.index("M6211 A1 L200 T0 Q260 R260 S260"), lines.index("M109 S260")
+    for line, at, says in (("M6211 A1 L200 T0 Q350 R350 S260", purge_at, "Q"),
+                           ("M6211 A1 L200 T1 Q260 R260 S260", purge_at, "tool 1"),
+                           ("M6211 T0 S260 L200", purge_at, "no Q"),
+                           ("M109S260 S0", wait_at, "exactly one S"),
+                           ("M104S140 R200", lines.index("M104 S140"), "beside its S")):
+        mutated = "\n".join(lines[:at] + [line] + lines[at + 1:])
+        assert mutated != text
+        with pytest.raises(PrinterError) as bad:
+            up.parse_gcode_text(mutated)
+        assert says in bad.value.message, f"{line}: {bad.value.message}"
+
+
 # --------------------------------------------------------------------------- the wire, frame for frame
 
 
@@ -563,6 +1346,22 @@ async def test_names_that_are_not_one_plain_gcode_basename_stop_before_any_reque
         await up.upload_gcode(tr, src, bad_name, token=TOKEN, store=store,
                               http_factory=http.factory(), chunk_size=CHUNK)
     assert bad.value.details["reason"] == "destination_invalid"
+    assert tr.calls == 0 and http.puts == [] and http.base_urls == []
+
+
+async def test_one_command_off_the_list_stops_the_upload_before_any_request(tmp_path, store):
+    # the command list is an upload gate, not a lint: a file whose only fault is one macro line the
+    # parser cannot justify never reaches the receipt store, the per-printer lock, the printer's
+    # listing or a single chunk — the refusal happens while the file is still just bytes on disk.
+    src = tmp_path / "part.gcode"
+    src.write_text(gcode_text().replace("T0\n", "T0\nG_CODE_MACRO\n", 1), encoding="utf-8")
+    tr = FakeTransport([(DEST, 123)])
+    http = FakeHttp()
+    with pytest.raises(PrinterError) as bad:
+        await up.upload_gcode(tr, src, DEST, token=TOKEN, store=store,
+                              http_factory=http.factory(), chunk_size=CHUNK)
+    assert bad.value.details["reason"] == "gcode_unreadable"
+    assert "G_CODE_MACRO" in bad.value.message and "Nothing was sent" in bad.value.message
     assert tr.calls == 0 and http.puts == [] and http.base_urls == []
 
 
@@ -721,6 +1520,76 @@ async def test_a_source_that_grows_mid_upload_is_reported_as_changed(tmp_path, s
         await run(tr, src, store=store, http=http)
     assert bad.value.details["reason"] == "source_changed" and "grew" in bad.value.message
     assert store.load(SN, DEST) is None and http.closes == 1
+
+
+# The three send-phase tests above catch a file that moves while its bytes are going out. The
+# hole they cannot reach is a file that moves *earlier*: hashed as one version, parsed as another,
+# then reverted to the first before the send pass re-reads it. Same size, so the send hash equals
+# the initial hash and every downstream check is satisfied — yet the settings on the receipt came
+# from a version nobody sent. The binding fix hashes the exact bytes the parser consumed and
+# refuses unless they are the bytes hashed before parsing; these two tests pin that.
+BIND_PAD = 9000  # > the 8 KiB buffered-reader cache, so a rewrite between hash and parse is seen
+
+
+async def test_a_file_rewritten_after_hash_before_parse_refuses_even_at_the_same_size(
+        tmp_path, store, monkeypatch):
+    # Two honest single-tool files, same length, different real settings: A=PLA/240 hashed, B=
+    # PETG/260 parsed. The rewrite lands after the hash and (in the wild) reverts before the send;
+    # here the refusal happens at the binding check, before a byte leaves, so the revert is moot —
+    # the point is the parser's version cannot masquerade as the hashed/sent one.
+    src = write_gcode(tmp_path, material="PLA", nozzle=240.0, nozzle_first=240.0,
+                      bed=60.0, bed_first=60.0, pad_to=BIND_PAD)
+    body_a = src.read_bytes()
+    body_b = write_gcode(tmp_path, name="b.gcode", material="PETG", nozzle=260.0,
+                         nozzle_first=260.0, bed=70.0, bed_first=70.0, pad_to=BIND_PAD).read_bytes()
+    assert body_a != body_b and len(body_a) == len(body_b) > 8192
+    assert up.parse_gcode_text(body_b.decode()).material == "PETG"  # B is fully parseable
+    assert up.parse_gcode_text(body_a.decode()).nozzle_temp == 240.0  # A is a different file
+
+    real_hash = up._hash_source
+
+    def hash_then_flip(f, size):
+        digests = real_hash(f, size)  # hashes honest A
+        src.write_bytes(body_b)       # same-size rewrite to honest B before the parse re-reads
+        return digests
+
+    monkeypatch.setattr(up, "_hash_source", hash_then_flip)
+    tr = FakeTransport([("other.gcode", 1)], [(DEST, len(body_a))])
+    http = FakeHttp()
+    with pytest.raises(PrinterError) as bad:
+        await run(tr, src, store=store, http=http)
+    assert bad.value.details["reason"] == "source_changed"
+    assert "hashed and being parsed" in bad.value.message  # the binding check, not a send race
+    assert http.puts == [] and tr.calls == 0  # refused before the lock, listing and first chunk
+    assert http.base_urls == [] and http.closes == 0  # no HTTP session was ever built to close
+    assert store.load(SN, DEST) is None
+
+
+async def test_the_binding_hash_binds_the_sent_bytes_not_just_a_size(tmp_path, store):
+    # A same-size rewrite changes the content hash even though every size check stays green — the
+    # unit-level signature of the attack. It also shows why the send-side hash alone cannot catch
+    # it: if the file reverts before the send re-reads, sent_hash == initial_hash and the send is
+    # blind; only the parse-consumed hash diverges, which is exactly the comparison the fix adds.
+    import hashlib
+    a = gcode_text(material="PLA", nozzle=240.0, nozzle_first=240.0, bed=60.0,
+                   bed_first=60.0).encode()
+    a += b"\n" * (BIND_PAD - len(a))
+    b = gcode_text(material="PETG", nozzle=260.0, nozzle_first=260.0, bed=70.0,
+                   bed_first=70.0).encode()
+    b += b"\n" * (BIND_PAD - len(b))
+    assert len(a) == len(b) and a != b
+    src = tmp_path / "bind.gcode"
+    src.write_bytes(a)
+    with src.open("rb") as f:
+        _, initial = up._hash_source(f, len(a))            # hash of the bytes first seen (A)
+        src.write_bytes(b)                                  # same-size rewrite to B
+        stream = up._ParseStream(f, len(a))
+        settings = up.parse_gcode_settings(stream)          # parse reads B's bytes
+    assert stream.sha256_hex != initial                     # the parse-hash binding fires
+    assert (settings.material, settings.nozzle_temp) == ("PETG", 260.0)  # B's settings, not A's
+    revert_sent = hashlib.sha256(a).hexdigest()            # if it reverted to A before the send…
+    assert revert_sent == initial                          # …the send-hash check would PASS
+    assert stream.sha256_hex != initial                    # …only the parse-hash check catches it
 
 
 @pytest.mark.parametrize("bad_resp, needle", [

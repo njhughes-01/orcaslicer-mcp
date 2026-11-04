@@ -123,7 +123,7 @@ def file_entry(name=DEST, size=SIZE) -> dict:
 
 
 def listing_replies(*entries: dict, truncate=False) -> dict:
-    """A 1044 answer carrying ``entries``. ``truncate=True`` replays the observed capped reply
+    """A 1044 answer carrying ``entries``. ``truncate=True`` replays a simulated capped reply
     — 100 of a 112-file listing — whose paging walk repeats page one, which cc2_state must
     refuse as incomplete; the start may then never send anything."""
     if not truncate:
@@ -549,7 +549,7 @@ async def test_remote_size_must_equal_the_receipted_size(store):
 
 
 async def test_partial_listing_is_no_listing_and_no_start(store):
-    # the observed capped reply (100 of 112) whose paging repeats page one: the walk refuses,
+    # a simulated capped reply (100 of 112) whose paging repeats page one: the walk refuses,
     # and a file on an unproven listing can never be vouched for, so 1020 never goes out.
     save_receipt(store)
     tr = healthy({st.METHOD_FILES: listing_replies(truncate=True)})

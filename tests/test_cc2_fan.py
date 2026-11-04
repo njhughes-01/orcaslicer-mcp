@@ -1,0 +1,449 @@
+"""The CC2 fan candidate (method 1030) against scripted replies — internal, unregistered, and
+nothing here opens a socket. The transport is a fake that records every method and the timeout each
+request asked for, so "sent once, never resent" and "the preview sends only the read-only 1002" are
+recorded facts rather than claims.
+
+The 1002 frames carry the ``fans`` block exactly as both readers spell it (``fans.fan.speed``,
+``fans.aux_fan.speed``, ``fans.box_fan.speed``, plus the ``controller_fan``/``heater_fan`` blocks the
+integration's status mapping names), marked doc-derived: no CC2 has ever answered 1030 for this
+project, which is the whole reason the module is a candidate. What the tests pin down:
+
+* the argument bar — a whole percent 0..100 reads, and so does whole-number text; a 0-255 number
+  above 100 (127, 255), a float, a bool, a name and a fourth fan name do not;
+* the wire is Elegoo's own LAN control's arithmetic unreduced (50% -> 127.5), under the three field
+  names that client writes, with a fan left out of the request rather than zeroed, and the older
+  websocket ``TargetFanSpeed``/``ModelFan`` frame never appears on the wire;
+* the preview sends the read-only 1002 and nothing else, and shows the percent, the number it
+  becomes, the formula, and that the scale is unproven;
+* accepted / refused / ambiguous are kept apart, only an explicit integer error_code 0 is accepted,
+  a refusal keeps its code and earns no follow-up read, and a lost answer is never a refusal and
+  never earns a resend;
+* the read-back is honest about the unresolved unit: the printer's numbers are reported as they
+  arrived, no percentage is derived from them anywhere, ``changed`` compares raw against raw, an
+  absent fan block is unknown rather than zero, and every reply says
+  ``verified_on_this_printer: false``;
+* the candidate posture holds — no tool is registered, nothing in server.py, the README or either
+  manifest mentions it, and every authored string fits the direct tools' reply cap."""
+from __future__ import annotations
+
+import copy
+import json
+from collections import deque
+from pathlib import Path
+
+import pytest
+
+from orcaslicer_mcp.printer import cc2_control as job
+from orcaslicer_mcp.printer import cc2_fan as fan
+from orcaslicer_mcp.printer import cc2_state as st
+from orcaslicer_mcp.printer.cc2_transport import Cc2TimeoutError, PrinterError
+
+ROOT = Path(__file__).resolve().parents[1]
+
+HOST = "192.0.2.10"                  # documented TEST-NET, like the whole lane; never a live address
+SN = "CC2TESTSN0001"
+FAKE_TOKEN = "SIMULATED-NOT-A-CODE"  # a stand-in credential, proven never to ride any reply
+JOB = "benchy-petg-2026-11-04.gcode"
+
+# doc-derived for the fans block: the shape the official client reads (fans.<x>.speed) and the
+# integration's status mapping agree on, with raw 0-255-shaped numbers on purpose.
+BASE_1002 = {
+    "error_code": 0,
+    "machine_status": {"exception_status": [], "progress": 21, "status": 2, "sub_status": 2075,
+                       "sub_status_reason_code": 0},
+    "print_status": {"current_layer": 51, "filename": JOB, "print_duration": 573,
+                     "remaining_time_sec": 2096, "state": "printing", "total_duration": 2669,
+                     "uuid": "80baf1df-e748-4717-adf1-b9487f2c8f32"},
+    "extruder": {"filament_detect_enable": 1, "filament_detected": 1, "target": 260,
+                 "temperature": 259.6},
+    "heater_bed": {"target": 70, "temperature": 69.9},
+    "led": {"status": 1},
+    "gcode_move_inf": {"x": 88.148, "y": 139.946, "z": 1.6, "e": 138.87, "speed": 9019,
+                       "speed_mode": 1},
+    "fans": {"fan": {"speed": 0}, "aux_fan": {"speed": 0}, "box_fan": {"speed": 0},
+             "controller_fan": {"speed": 128}, "heater_fan": {"speed": 0}},
+}
+
+
+def frame_1002(*, fans=..., state="printing") -> dict:
+    """A 1002 as this firmware answers it, with the fans block set to whatever a test needs
+    (``None`` removes it entirely, ``{...}`` overrides one fan). ``...`` leaves the block alone."""
+    frame = copy.deepcopy(BASE_1002)
+    frame["print_status"]["state"] = state
+    if fans is None:
+        frame.pop("fans")
+    elif fans is not ...:
+        frame["fans"] = copy.deepcopy(fans)
+    return frame
+
+
+class FakeFanTransport:
+    """Stands in for the pinned session exactly as Cc2Transport behaves: records every request with
+    the timeout it was given, answers from a method -> script map (a deque shifts, last value sticks;
+    exceptions raise as given; an unscripted method answers {}) — and sends nothing twice on its own,
+    because the module under test is what must not ask twice."""
+
+    def __init__(self, replies=None, *, host=HOST, sn=SN):
+        self.host, self.sn = host, sn
+        self.replies = dict(replies or {})
+        self.requests: list[tuple[int, dict, float | None]] = []
+
+    async def request(self, method: int, params: dict | None = None, *, timeout_s=None) -> dict:
+        self.requests.append((method, copy.deepcopy(params or {}), timeout_s))
+        reply = self.replies.get(method, {})
+        if callable(reply):
+            reply = reply(params or {})
+        if isinstance(reply, deque):
+            reply = reply.popleft() if len(reply) > 1 else reply[0]
+        if isinstance(reply, BaseException):
+            raise reply
+        return copy.deepcopy(reply)
+
+    def methods(self) -> list[int]:
+        return [m for m, _, _ in self.requests]
+
+    def calls(self, method: int) -> list[tuple[int, dict, float | None]]:
+        return [r for r in self.requests if r[0] == method]
+
+
+def scripted(*, status=None, command=None) -> FakeFanTransport:
+    """The 1002 answers ``status`` (default: every commanded fan at 0) and 1030 answers ``command``
+    (default the documented explicit success) — every method recorded either way, so a send the tests
+    did not expect is still a recorded fact."""
+    command_reply = {"error_code": 0} if command is None else command
+    return FakeFanTransport({1002: frame_1002() if status is None else status,
+                             1030: command_reply})
+
+
+def timeout() -> PrinterError:
+    return Cc2TimeoutError("protocol_error", "simulated: the printer never answered",
+                           reason="timeout", ambiguous=True)
+
+
+# --------------------------------------------------------------------------- the argument bar
+
+
+@pytest.mark.parametrize("value,want", [(0, 0), (1, 1), (50, 50), (100, 100), ("50", 50),
+                                        (" 100 ", 100)])
+def test_a_whole_percent_reads_however_it_is_spelled(value, want):
+    assert fan.parse_percent(value, "model") == want
+
+
+@pytest.mark.parametrize("bad", [101, -1, 127, 255, 2.5, True, False, "fast", "50%", "", None],
+                         ids=["101", "minus", "a-255-scale-number", "wire-max", "float",
+                              "bool-true", "bool-false", "name", "percent-suffix", "empty",
+                              "missing"])
+def test_anything_that_is_not_a_whole_percent_refuses(bad):
+    # 127 and 255 are the mistake this bar exists for: those are the OTHER scale's numbers, and a
+    # module that accepted both scales would be guessing which one a caller meant
+    with pytest.raises(PrinterError) as caught:
+        fan.parse_percent(bad, "model")
+    assert caught.value.code == "protocol_error"
+    assert caught.value.details["reason"] == "fan_percent_range"
+    assert "Nothing was sent" in caught.value.message
+    assert "percent 0-100" in caught.value.hint
+
+
+@pytest.mark.parametrize("percent,want", [(0, 0), (20, 51), (100, 255), (10, 25.5), (50, 127.5),
+                                          (33, 33 * 255 / 100)])
+def test_the_wire_value_is_the_official_clients_arithmetic_unreduced(percent, want):
+    # Elegoo's LAN control sends `v/100*255` and rounds nothing, so 50% really does leave as 127.5;
+    # rounding here would put this project's fingerprint on a frame the official client does not write
+    assert fan.wire_value(percent) == want
+    assert isinstance(fan.wire_value(percent), int if float(want).is_integer() else float)
+
+
+def test_the_three_fields_are_the_ones_the_official_client_writes():
+    assert fan.FAN_FIELDS == {"model": "fan", "auxiliary": "aux_fan", "chamber": "box_fan"}
+
+
+def test_params_carry_the_wire_numbers_and_asked_percent_stays_beside_them():
+    values = {"model": 100, "auxiliary": 50, "chamber": 0}
+    assert fan.fan_params(values) == {"fan": 255, "aux_fan": 127.5, "box_fan": 0}
+    assert fan.asked_percent(values) == {"fan": 100, "aux_fan": 50, "box_fan": 0}
+
+
+def test_a_fan_left_out_is_left_alone_not_zeroed():
+    # the official client builds its params with `value !== void 0 && {field: value}`, so omission is
+    # the spelling of "do not touch this fan" and zero is a command to stop it
+    assert fan.fan_params({"auxiliary": 75, "model": None}) == {"aux_fan": 191.25}
+
+
+@pytest.mark.parametrize("values", [{}, {"model": None}, {"auxiliary": None}],
+                         ids=["empty", "all-none", "one-none"])
+def test_no_fan_at_all_refuses_before_anything_exists(values):
+    with pytest.raises(PrinterError) as caught:
+        fan.fan_params(values)
+    assert caught.value.details["reason"] == "fan_none"
+    assert "Nothing was sent" in caught.value.message
+
+
+@pytest.mark.parametrize("name", ["controller_fan", "heater_fan", "part_fan", "ModelFan", "box"])
+def test_a_fourth_fan_name_refuses_rather_than_becoming_an_invented_field(name):
+    # controller_fan and heater_fan are real names in the integration's status read and no source
+    # commands them, so even a real-looking key must not become a wire field
+    with pytest.raises(PrinterError) as caught:
+        fan.fan_params({name: 50})
+    assert caught.value.details["reason"] == "fan_name"
+    assert "controller_fan and heater_fan appear" in caught.value.hint
+
+
+def test_a_hand_rolled_frame_is_refused_by_the_second_lock():
+    for bad in [{"fan": 255.0 + 0.5j}, {"fan": True}, {"fan": 300}, {"ModelFan": 1}, {}, "x"]:
+        with pytest.raises((ValueError, TypeError)):
+            fan.checked_params(bad)
+    assert fan.checked_params({"fan": 127.5}) == {"fan": 127.5}
+
+
+# --------------------------------------------------------------------------- the preview
+
+
+async def test_the_preview_sends_the_read_only_status_and_nothing_else():
+    t = scripted()
+    out = await fan.read_preview(t, {"model": 100})
+    assert t.methods() == [1002]
+    assert t.calls(1030) == []
+    assert out["confirm_required"] is True and out["action"] == "fan"
+    assert out["how"] == job.PREVIEW_HOW
+
+
+async def test_the_preview_shows_the_percent_the_number_and_the_formula_side_by_side():
+    t = scripted()
+    preview = (await fan.read_preview(t, {"model": 50, "chamber": 0}))["preview"]
+    assert preview["will_send"] == {"method": 1030, "params": {"fan": 127.5, "box_fan": 0}}
+    assert preview["asked_percent"] == {"fan": 50, "box_fan": 0}
+    assert preview["wire_formula"] == fan.SCALE_NOW
+    assert "/ 100 * 255" in fan.SCALE_NOW
+    assert preview["waits_up_to_s"] == fan.SET_WAIT_S
+    assert preview["verified_on_this_printer"] is False
+    # the doubt has to be specific: which method, and the two scales that disagree about it
+    assert "1030" in preview["unverified"] and "0-255" in preview["unverified"]
+    assert "0-100" in preview["unverified"]
+
+
+async def test_the_preview_carries_the_printers_own_numbers_without_a_unit_claim():
+    t = scripted(status=frame_1002(fans={"fan": {"speed": 255}, "aux_fan": {"speed": 0},
+                                         "box_fan": {"speed": 0}}))
+    preview = (await fan.read_preview(t, {"model": 0}))["preview"]
+    assert preview["fans_now_raw"] == {"model": 255, "auxiliary": 0, "chamber": 0}
+    assert preview["readback_unit"] == fan.READBACK_UNIT
+    assert "No unit" in fan.READBACK_UNIT
+    assert not any("percent" in k for k in preview["fans_now_raw"])
+
+
+async def test_an_absent_fans_block_is_unknown_rather_than_zero():
+    t = scripted(status=frame_1002(fans=None))
+    preview = (await fan.read_preview(t, {"model": 10}))["preview"]
+    assert preview["fans_now_raw"] == {"model": None, "auxiliary": None, "chamber": None}
+
+
+async def test_a_status_read_that_fails_is_raised_not_papered_over():
+    t = FakeFanTransport({1002: st.Cc2DataError("protocol_error", "simulated: unreadable 1002")})
+    with pytest.raises(PrinterError):
+        await fan.read_preview(t, {"model": 10})
+    assert t.methods() == [1002]
+
+
+# --------------------------------------------------------------------------- the one command
+
+
+async def test_an_accepted_command_goes_once_and_takes_one_look():
+    t = scripted()
+    result = await fan.set_fan(t, {"model": 100, "auxiliary": 50})
+    assert t.methods() == [1030, 1002]
+    assert len(t.calls(1030)) == 1
+    assert t.calls(1030)[0][1] == {"fan": 255, "aux_fan": 127.5}
+    assert t.calls(1030)[0][2] == 10.0          # the longer of the two first-party waits
+    assert result.status is job.ControlStatus.ACCEPTED and result.accepted is True
+    assert result.sent == {"fan": 255, "aux_fan": 127.5}
+    assert result.asked == {"fan": 100, "aux_fan": 50}
+
+
+async def test_the_websocket_frames_the_same_bundle_still_carries_are_never_sent():
+    t = scripted()
+    await fan.set_fan(t, {"model": 100, "auxiliary": 10, "chamber": 100})
+    sent = t.calls(1030)[0][1]
+    assert set(sent) == {"fan", "aux_fan", "box_fan"}
+    assert "TargetFanSpeed" not in json.dumps(t.requests)
+    assert "ModelFan" not in json.dumps(t.requests)
+
+
+@pytest.mark.parametrize("code", [1003, 1010, 1])
+async def test_a_refusal_keeps_its_code_and_earns_no_follow_up_read(code):
+    t = scripted(command={"error_code": code})
+    result = await fan.set_fan(t, {"model": 100})
+    assert t.methods() == [1030]
+    assert result.status is job.ControlStatus.REFUSED and result.accepted is False
+    assert result.error_code == code
+    assert any(str(code) in n for n in result.notes)
+
+
+@pytest.mark.parametrize("reply", [{}, {"error_code": True}, {"error_code": "0"},
+                                   {"error_code": 0.0}],
+                         ids=["no-code", "bool", "text", "float"])
+async def test_an_answer_that_cannot_be_read_is_ambiguous_and_never_resent(reply):
+    t = scripted(command=reply)
+    result = await fan.set_fan(t, {"model": 100})
+    assert t.methods() == [1030]
+    assert result.status is job.ControlStatus.AMBIGUOUS and result.accepted is False
+    assert result.error_code is None
+
+
+async def test_a_lost_answer_is_ambiguous_one_look_and_no_resend():
+    t = FakeFanTransport({1030: timeout(), 1002: frame_1002()})
+    result = await fan.set_fan(t, {"model": 100})
+    assert t.methods() == [1030, 1002]
+    assert result.status is job.ControlStatus.AMBIGUOUS
+    assert any("within 10" in n or "did not answer" in n for n in result.notes)
+
+
+async def test_a_dead_session_reports_alone_and_sends_nothing_further():
+    t = FakeFanTransport({1030: PrinterError("protocol_error", "simulated: session ended")})
+    result = await fan.set_fan(t, {"model": 100})
+    assert t.methods() == [1030]
+    assert result.status is job.ControlStatus.AMBIGUOUS
+
+
+# --------------------------------------------------------------------------- the read-back
+
+
+async def test_the_printers_numbers_are_reported_exactly_as_they_arrived():
+    after = frame_1002(fans={"fan": {"speed": 255}, "aux_fan": {"speed": 7}, "box_fan": {"speed": 0}})
+    t = scripted(status=after)
+    result = await fan.set_fan(t, {"model": 100})
+    assert result.observed["raw"] == {"model": 255, "auxiliary": 7, "chamber": 0}
+
+
+async def test_no_percentage_is_ever_derived_from_the_printers_numbers():
+    after = frame_1002(fans={"fan": {"speed": 255}, "aux_fan": {"speed": 100},
+                             "box_fan": {"speed": 0}})
+    t = scripted(status=after)
+    reported = (await fan.set_fan(t, {"model": 100, "auxiliary": 100})).as_dict()
+    assert reported["observed_fan_raw"] == {"model": 255, "auxiliary": 100, "chamber": 0}
+    percent_keys = [k for k in reported if "percent" in k.lower()]
+    assert percent_keys == ["asked_percent"], percent_keys
+    assert reported["asked_percent"] == {"fan": 100, "aux_fan": 100}
+
+
+async def test_changed_compares_raw_against_raw_and_says_true_when_a_number_moved():
+    t = scripted()                                   # the "after" frame is all zeros
+    before = {"fans_now_raw": {"model": 0, "auxiliary": 128, "chamber": 0}}
+    result = await fan.set_fan(t, {"model": 100}, before=before)
+    assert result.observed["changed"] == {"model": False, "auxiliary": True, "chamber": False}
+
+
+async def test_without_a_before_reading_nothing_is_claimed_to_have_stayed_put():
+    t = scripted()
+    result = await fan.set_fan(t, {"model": 100})
+    assert result.observed["changed"] == {"model": None, "auxiliary": None, "chamber": None}
+    assert not any("still reports" in n for n in result.notes)
+
+
+async def test_an_accepted_command_that_moved_nothing_says_so_without_calling_it_a_failure():
+    t = scripted()                                   # 0 before, 0 after
+    result = await fan.set_fan(t, {"model": 100}, before={"fans_now_raw": {"model": 0}})
+    assert result.status is job.ControlStatus.ACCEPTED
+    note = [n for n in result.notes if "still reports" in n]
+    assert len(note) == 1 and "model" in note[0] and "raw-against-raw" in note[0]
+    assert "unproven" in " ".join(result.notes)
+
+
+async def test_a_status_that_names_none_of_these_fans_leaves_the_question_open():
+    t = scripted(status=frame_1002(fans=None))
+    result = await fan.set_fan(t, {"model": 100}, before={"fans_now_raw": {"model": 0}})
+    assert result.status is job.ControlStatus.ACCEPTED
+    assert result.observed["raw"] == {"model": None, "auxiliary": None, "chamber": None}
+    assert any("named none of these fans" in n for n in result.notes)
+
+
+async def test_a_follow_up_look_that_does_not_land_says_which_half_is_missing():
+    t = FakeFanTransport({1030: {"error_code": 0}, 1002: st.Cc2DataError("protocol_error",
+                                                                        "simulated: no 1002")})
+    result = await fan.set_fan(t, {"model": 100})
+    assert result.status is job.ControlStatus.ACCEPTED
+    assert result.observed is None
+    assert any("read-only status look" in n for n in result.notes)
+
+
+@pytest.mark.parametrize("speed,want", [(255, 255), (0, 0), (127.5, 127.5), (True, None),
+                                        ("128", None), (None, None)],
+                         ids=["int", "zero", "float", "bool", "text", "missing"])
+def test_one_fans_number_is_kept_if_it_is_a_number_and_is_no_reading_otherwise(speed, want):
+    assert fan._speed_or_none(speed) == want
+
+
+def test_a_fans_block_that_is_not_the_documented_shape_is_no_reading():
+    for raw in [{}, {"fans": []}, {"fans": {"fan": 5}}, {"fans": {"fan": {"speed": None}}}]:
+        machine = st.Cc2MachineStatus(machine_status=2, sub_status=2075,
+                                      print_state=st.PrintState.PRINTING, raw_print_state="printing",
+                                      raw=raw)
+        assert set(fan.fan_raws(machine)) == set(fan.FANS)
+        assert all(value is None for value in fan.fan_raws(machine).values())
+
+
+async def test_no_reply_carries_an_address_a_serial_or_a_credential():
+    for transport in (scripted(), scripted(command={"error_code": 1003}),
+                      FakeFanTransport({1030: timeout(), 1002: frame_1002()})):
+        reported = json.dumps((await fan.set_fan(transport, {"model": 100},
+                                                 before=None)).as_dict())
+        for banned in (HOST, SN, FAKE_TOKEN):
+            assert banned not in reported
+
+
+# --------------------------------------------------------------------------- the candidate posture
+
+
+def test_no_fan_tool_is_registered():
+    import orcaslicer_mcp.server as srv
+
+    names = set(srv.mcp._tool_manager._tools)
+    assert not [n for n in names if n.startswith("cc2_") and "fan" in n]
+    assert not [n for n in srv.CC2_TOOL_NAMES if "fan" in n.lower()]
+    assert not [n for n in srv._TOOL_ANNOTATIONS if n.startswith("cc2_") and "fan" in n]
+    assert not [n for n in srv._OPEN_WORLD_TOOLS if "fan" in str(n)]
+
+
+@pytest.mark.parametrize("relative", ["src/orcaslicer_mcp/server.py", "README.md",
+                                      "lhm.plugin.json", "mcpb/manifest.json",
+                                      "scripts/gen_lhm_tools.py"])
+def test_the_candidate_is_not_offered_as_a_supported_capability(relative):
+    text = (ROOT / relative).read_text(encoding="utf-8")
+    assert "cc2_fan" not in text
+    assert "cc2_set_fan" not in text
+    assert "fan control" not in text.lower()
+
+
+def test_the_module_is_importable_but_imports_nothing_from_the_server():
+    import inspect
+
+    source = Path(inspect.getsourcefile(fan)).read_text(encoding="utf-8")
+    assert "import server" not in source
+    assert "@mcp.tool" not in source
+    assert "open_transport" not in source      # the module never makes its own session
+
+
+def test_the_peripheral_module_still_refuses_to_send_1030():
+    # this candidate changes nothing about the module that holds the method back: two implementations
+    # of one disagreement is bad, but quietly widening a tested-and-documented refusal is worse
+    from orcaslicer_mcp.printer import cc2_peripherals as per
+
+    assert fan.METHOD_SET_FAN not in per._METHODS.values()
+
+
+def test_the_live_test_recipe_names_the_edits_a_real_one_requires():
+    server = (ROOT / "src/orcaslicer_mcp/server.py").read_text(encoding="utf-8")
+    for structure in ("CC2_TOOL_NAMES", "_TOOL_ANNOTATIONS", "_OPEN_WORLD_TOOLS", "@mcp.tool()"):
+        assert structure in server
+
+
+async def test_every_authored_string_fits_the_direct_tools_reply_cap():
+    texts = [fan.UNVERIFIED, fan.SCALE_NOW, fan.READBACK_UNIT, fan.CONTRADICT.format(
+        fan="model", value=0), fan.OBSERVE_UNKNOWN_NOTE, fan._AT_LEAST_ONE, job.PREVIEW_HOW]
+    texts += [n for n in (await fan.set_fan(scripted(), {"model": 100})).notes]
+    texts += [n for n in (await fan.set_fan(scripted(command={"error_code": 1003}),
+                                            {"model": 100})).notes]
+    texts += [n for n in (await fan.set_fan(FakeFanTransport({1030: timeout(),
+                                                              1002: frame_1002()}),
+                                            {"model": 100})).notes]
+    for note in texts:
+        assert len(note) <= job.NOTE_CAP, f"{note[:50]!r} is {len(note)} characters"

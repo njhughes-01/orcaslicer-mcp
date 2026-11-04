@@ -1,5 +1,7 @@
 # Direct Centauri Carbon 2 printing
 
+> Scope update: conflicting restrictions below are superseded by [revised-plan.md](revised-plan.md).
+
 ## Goal
 Let OrcaSlicer MCP inspect a CC2, upload a sliced file and start it directly, without Home Assistant. Nathan chooses the file and tray; the MCP verifies the printer's actual responses.
 
