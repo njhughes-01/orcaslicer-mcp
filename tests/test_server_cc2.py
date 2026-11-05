@@ -1784,6 +1784,8 @@ def test_sanitized_key_collisions_withhold_the_conflicting_mapping():
     assert srv._cc2_out({"abc_first": 1, "<redacted>_first": 2}, _code="abc") == {
         "error": "sanitization_key_collision"
     }
+    assert "collision" not in str(srv._cc2_out({"state": "idle", " state ": "printing"},
+                                                _code="collision"))
 
 
 def test_the_sanitizer_bounds_shapes_and_redacts_a_configured_code(monkeypatch, tmp_path):

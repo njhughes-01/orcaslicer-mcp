@@ -1771,7 +1771,7 @@ def _cc2_out(value, _depth: int = 0, _code: str | None = "unset"):
         for k, v in list(value.items())[:64]:
             key = _cc2_key(str(k), _depth + 1, _code)
             if key in out:
-                return {"error": "sanitization_key_collision"}
+                return {"error": _cc2_out("sanitization_key_collision", _depth + 1, _code)}
             out[key] = _cc2_out(v, _depth + 1, _code)
         return out
     if isinstance(value, (list, tuple, set, frozenset)) or isinstance(value, Iterable):
