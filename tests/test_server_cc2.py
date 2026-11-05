@@ -1777,6 +1777,15 @@ def test_redaction_precedes_truncation_and_handles_short_codes():
     assert "xyz" not in srv._cc2_out("prefix xyz suffix", _code="xyz")
 
 
+def test_sanitized_key_collisions_withhold_the_conflicting_mapping():
+    assert srv._cc2_out({"state": "idle", " state ": "printing"}, _code="abcdef") == {
+        "error": "sanitization_key_collision"
+    }
+    assert srv._cc2_out({"abc_first": 1, "<redacted>_first": 2}, _code="abc") == {
+        "error": "sanitization_key_collision"
+    }
+
+
 def test_the_sanitizer_bounds_shapes_and_redacts_a_configured_code(monkeypatch, tmp_path):
     code_file = tmp_path / "code"
     code_file.write_text(CODE)
