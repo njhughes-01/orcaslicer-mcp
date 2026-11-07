@@ -1,3 +1,5 @@
+> **Historical plan:** Superseded by the revised plan and the implemented branch. In particular, its former read/write gates and restricted tool list do not describe the current server. See [revised-plan.md](../../revised-plan.md) and the README for current behavior.
+
 # Direct CC2 print capability
 
 > Historical requirements: conflicting exposure and scope restrictions are superseded by ../../revised-plan.md. Revise these requirements as the expanded capability inventory is verified.

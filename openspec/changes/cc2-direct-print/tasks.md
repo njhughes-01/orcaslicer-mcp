@@ -1,3 +1,5 @@
+> **Historical plan:** Superseded by the revised plan and the implemented branch. In particular, its former read/write gates and restricted tool list do not describe the current server. See [revised-plan.md](./revised-plan.md) and the README for current behavior.
+
 # CC2 direct-print implementation tasks
 
 > Historical implementation record. Remaining work and conflicting restrictions are superseded by [revised-plan.md](revised-plan.md).

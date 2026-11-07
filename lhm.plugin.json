@@ -2,7 +2,7 @@
   "identifier": "maxellis-orcaslicer-mcp",
   "version": "0.1.19",
   "name": "OrcaSlicer MCP",
-  "description": "Work a running OrcaSlicer with AI: load models, arrange the plate, tune settings, slice, and understand the result through slice breakdowns, setting explanations, and physics checks. Talks to OrcaSlicer on localhost or a host you configure; the printer tools read your printer, and the direct Elegoo Centauri Carbon 2 tools can also control that printer once you configure its address. No cloud calls from this server.",
+  "description": "Nathan Hughes's independent fork of OrcaSlicer MCP by Max Ellis and its contributors. Work a running OrcaSlicer with AI: load models, arrange the plate, tune settings, slice, and understand the result through slice breakdowns, setting explanations, and physics checks. Talks to OrcaSlicer on localhost or a host you configure; the printer tools read your printer, and the direct Elegoo Centauri Carbon 2 tools can also control that printer once you configure its address. No cloud calls from this server. The uvx install below comes from PyPI, where the published package is upstream's build: it has none of this fork's CC2 tools, so use a source checkout of the fork for CC2 control.",
   "category": "developer",
   "tags": [
     "mcp",
@@ -13,11 +13,11 @@
     "model-context-protocol"
   ],
   "connectionType": "local",
-  "author": "maxellis",
+  "author": "njhughes-01",
   "github": {
-    "url": "https://github.com/MaxEllis/orcaslicer-mcp",
+    "url": "https://github.com/njhughes-01/orcaslicer-mcp",
     "language": "Python",
-    "license": "AGPL-3.0"
+    "license": "AGPL-3.0-only"
   },
   "artifacts": {
     "pypi": {
@@ -29,7 +29,7 @@
     {
       "installationMethod": "uvx",
       "isRecommended": true,
-      "description": "Run straight from PyPI with uv; no install step.",
+      "description": "Run the published orcaslicer-mcp from PyPI with uv; no install step. That package is upstream's build and contains none of this fork's Elegoo Centauri Carbon 2 tools: for cc2_* control install this fork from source (see the fork's README, Quickstart).",
       "connection": {
         "type": "stdio",
         "command": "uvx",
