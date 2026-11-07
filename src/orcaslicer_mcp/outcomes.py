@@ -128,11 +128,38 @@ def settings_summary(settings: dict | None) -> dict:
     return {k: settings[k] for k in SUMMARY_KEYS if settings and k in settings}
 
 
+def _size_part(size) -> str:
+    """A size as the fingerprint spells it. `float(v)` is deliberately not guarded: an unreadable
+    dimension raises here, and every caller wants that raised inside its own recording step rather
+    than a half-read part silently fingerprinted as if it were complete."""
+    return ",".join(f"{float(v):.1f}" for v in (size or []))
+
+
 def geometry_hash_for(objects: list[dict]) -> str:
+    """The fingerprint of a set of OBJECTS: one part per object, whatever the fork says an object's
+    `instances` count is. This is what rows written before the copies fix carry, so `recall_prints`
+    still passes it as a candidate (see `printed_geometry_hash`); new rows are written with the
+    printed form, which counts the copies the plate actually prints."""
     parts = []
     for o in objects or []:
-        size = o.get("size_mm") or []
-        parts.append(f"{o.get('name','')}:" + ",".join(f"{float(v):.1f}" for v in size))
+        parts.append(f"{o.get('name','')}:{_size_part(o.get('size_mm'))}")
+    return hashlib.sha1("|".join(sorted(parts)).encode()).hexdigest()[:16]
+
+
+def printed_geometry_hash(printed: list[dict]) -> str:
+    """The fingerprint of what a plate actually PRINTS: one part per printed copy, tagged with the
+    copy's own instance index, so a part laid down three times cannot share a fingerprint with a
+    single copy of it (or with the same part printed once here and twice on another plate).
+
+    `printed` items come from the fork's own per-plate membership - `{name, size_mm, instance}` - or,
+    on a build that lists no per-plate membership, from one object's `instances` count expanded to
+    its instance indices 0..n-1. Object ids are deliberately absent: they are per-session, so a
+    fingerprint carrying them could not recall the same model next week."""
+    parts = []
+    for p in printed or []:
+        inst = p.get("instance")
+        tag = inst if isinstance(inst, int) and not isinstance(inst, bool) and inst >= 0 else 0
+        parts.append(f"{p.get('name','')}:{_size_part(p.get('size_mm'))}#{tag}")
     return hashlib.sha1("|".join(sorted(parts)).encode()).hexdigest()[:16]
 
 
@@ -245,12 +272,22 @@ def last_job_end_time() -> float:
     return float(v or 0.0)
 
 
-def recall(model_name: str | None = None, geometry_hash: str | None = None, limit: int = 10) -> list[dict]:
+def recall(model_name: str | None = None, geometry_hash: str | None = None, limit: int = 10,
+           geometry_hashes: list[str] | None = None) -> list[dict]:
+    """Rows newest first. `geometry_hashes` matches any of several fingerprints, which is how
+    `recall_prints` looks with the current printed form AND the objects form older rows were written
+    with; one of them matching is enough, and neither is allowed to stand in for a plate read."""
     if not is_available():
         return []
     where, args = [], []
+    hashes = [h for h in (geometry_hashes or []) if h]
     if geometry_hash:
-        where.append("geometry_hash = ?"); args.append(geometry_hash)
+        hashes.append(geometry_hash)
+    if len(hashes) == 1:
+        where.append("geometry_hash = ?"); args.append(hashes[0])
+    elif len(hashes) > 1:
+        where.append("geometry_hash IN (" + ",".join("?" * len(hashes)) + ")")
+        args.extend(hashes)
     if model_name:
         where.append("model_name LIKE ?"); args.append(f"%{model_name}%")
     clause = (" WHERE " + " OR ".join(where)) if where else ""

@@ -41,6 +41,9 @@ def listing_tools() -> list[dict]:
     from orcaslicer_mcp import server
 
     tools = asyncio.run(server.mcp.list_tools())
+    # Every tool the live server declares, in the server's own order. The direct CC2 tools are
+    # declared the way every other tool is — a printer address decides whether they can reach a
+    # printer, never whether a client is told they exist — so they belong in the listing too.
     return [{"name": t.name, "description": summarize(t.description or "")} for t in tools]
 
 

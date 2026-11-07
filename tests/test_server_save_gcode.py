@@ -1,3 +1,5 @@
+import time
+
 import httpx, pytest, respx
 import orcaslicer_mcp.server as srv
 from orcaslicer_mcp import outcomes as oc
@@ -13,6 +15,9 @@ SLICE = {"state": "done", "percent": 100, "stats": {"estimated_time_seconds": 12
 def _routes(slice_resp=None):
     respx.get(f"{B}/api/v1/gcode").mock(return_value=httpx.Response(200, content=b"G28\nG1 X1\n"))
     respx.get(f"{B}/api/v1/objects").mock(return_value=httpx.Response(200, json=OBJS))
+    # No plate API: a fork before v2.4.2-mcp.13. Every test below that does not replace this route
+    # saves and records exactly as it always did, attributed to the project (see test_save_gcode_older_build).
+    respx.get(f"{B}/api/v1/plates").mock(return_value=httpx.Response(404, json={"error": "not_found"}))
     respx.get(url__regex=rf"{B}/api/v1/config.*").mock(return_value=httpx.Response(200, json=CFG))
     respx.get(f"{B}/api/v1/slice/status").mock(return_value=slice_resp or httpx.Response(200, json=SLICE))
     respx.get(f"{B}/api/v1/status").mock(return_value=httpx.Response(200, json=STATUS))
@@ -34,7 +39,7 @@ async def test_save_gcode_writes_file_and_records_slice(monkeypatch, tmp_path):
     row = oc.recall(model_name="cube")[0]
     assert row["gcode_filename"] == "cube_test.gcode"
     assert row["settings_summary"] == {"layer_height": "0.5", "fan_max_speed": "60"}
-    assert row["geometry_hash"] == oc.geometry_hash_for(OBJS["objects"])
+    assert row["geometry_hash"] == oc.printed_geometry_hash(_copies(("cube", [20, 20, 20], 0)))
 
 
 @respx.mock
@@ -265,3 +270,332 @@ async def test_save_gcode_never_overwrites_existing_file(monkeypatch, tmp_path):
     gdir = tmp_path / "gcode"
     assert (gdir / "dup.gcode").read_bytes() == b"G28\nG1 X1\n"
     assert (gdir / "dup-2.gcode").read_bytes() == b"G28\nG1 X2\n"
+
+
+# --- Which plate the saved slice belongs to (fork v2.4.2-mcp.13 plate API) --------------------
+# get_gcode always answers for the CURRENT plate while /api/v1/objects lists the whole PROJECT.
+# Taking objs[0] and hashing every object attributed another plate's part, and the settings that
+# produced it, to a file holding one plate's toolpaths: the fault these tests pin shut.
+
+def _plate_reply(current: int, count: int = 2, names=("Plate 1", "Plate 2"), members=None):
+    """A `/api/v1/plates` reply in the shape the fork actually answers: each plate entry carries its
+    own `objects` list, naming every copy it holds as {id, instance} - the same pair
+    move_object_to_plate takes as arguments. The old fixtures here left that list empty on every plate
+    while relying on each object's own `plate`, which is only the plate of that object's first
+    instance: that is how a multi-plate bug stayed invisible. `members` overrides the default layout
+    (plate i holds object i+1, one copy), which is what CUBE / BRACKET below describe.
+    Pass `members={}` to a plate's entry to leave that plate silent about its copies."""
+    if members is None:
+        members = {i: [(i + 1, 0)] for i in range(count)}
+    return {"count": count, "current": current, "max": 36, "can_add": True, "can_delete": True,
+            "plates": [{"index": i, "name": names[i], "current": i == current, "empty": not members[i],
+                        "origin": [0, 0, 0], "bbox_min": [0, 0, 0], "bbox_max": [256, 256, 256],
+                        "objects": [{"id": oid, "instance": inst} for oid, inst in members[i]]}
+                       for i in range(count)]}
+
+
+def _silent_plates(current: int, count: int = 2):
+    """A plate reply that names the plates but keeps their copies to itself: no `objects` key on the
+    entries at all. Used for the cases where membership genuinely is not on the wire."""
+    return {"count": count, "current": current,
+            "plates": [{"index": i, "name": f"Plate {i + 1}", "current": i == current}
+                       for i in range(count)]}
+
+
+def _copies(*specs):
+    """The printed-copy list a fingerprint is made of, spelled short: (name, size_mm, instance)."""
+    return [{"name": n, "size_mm": s, "instance": i} for n, s, i in specs]
+
+
+CUBE = {"id": 1, "index": 0, "name": "cube.stl", "plate": 0, "instances": 1, "size_mm": [20, 20, 20]}
+BRACKET = {"id": 2, "index": 1, "name": "bracket.stl", "plate": 1, "instances": 1,
+           "size_mm": [30, 10, 5]}
+TWO_PLATES = {"count": 2, "objects": [dict(CUBE), dict(BRACKET)]}
+
+
+def _two_plates(current: int = 1):
+    """cube.stl on plate 0, bracket.stl on plate 1, and `current` is the plate that gets sliced."""
+    respx.get(f"{B}/api/v1/objects").mock(return_value=httpx.Response(200, json=TWO_PLATES))
+    respx.get(f"{B}/api/v1/plates").mock(return_value=httpx.Response(200, json=_plate_reply(current)))
+
+
+@respx.mock
+async def test_save_gcode_records_the_current_plate_not_the_whole_project(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    _two_plates(current=1)
+    out = await srv.save_gcode("bracket.gcode")
+
+    row = oc.get(out["outcome_row_id"])
+    assert out["outcome_recorded"] is True and out["model_name"] == "bracket.stl"
+    assert out["plate"] == 1 and out["plate_attribution"] == "plate"
+    assert "attribution_warning" not in out
+    assert row["model_name"] == "bracket.stl"
+    assert row["geometry_hash"] == oc.printed_geometry_hash(_copies(("bracket.stl", [30, 10, 5], 0)))
+    # the whole-project fingerprint is the bug: it says "cube.stl and bracket.stl", one plate's
+    # slice must never carry it
+    assert row["geometry_hash"] != oc.printed_geometry_hash(
+        _copies(("cube.stl", [20, 20, 20], 0), ("bracket.stl", [30, 10, 5], 0)))
+
+
+@respx.mock
+async def test_save_gcode_default_filename_comes_from_the_current_plate(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    _two_plates(current=1)
+    out = await srv.save_gcode()
+    assert out["filename"].startswith("bracket.stl_")
+
+
+@respx.mock
+async def test_save_gcode_the_plate_that_is_current_decides_what_the_row_says(monkeypatch, tmp_path):
+    # One project, one object list, two saves with a different plate current: the rows cannot share
+    # a fingerprint or a name, or a print of one plate recalls the other plate's settings.
+    _env(monkeypatch, tmp_path)
+    _two_plates(current=0)
+    row0 = oc.get((await srv.save_gcode("plate0.gcode"))["outcome_row_id"])
+    _two_plates(current=1)
+    row1 = oc.get((await srv.save_gcode("plate1.gcode"))["outcome_row_id"])
+
+    assert (row0["model_name"], row1["model_name"]) == ("cube.stl", "bracket.stl")
+    assert row0["geometry_hash"] == oc.printed_geometry_hash(_copies(("cube.stl", [20, 20, 20], 0)))
+    assert row1["geometry_hash"] == oc.printed_geometry_hash(_copies(("bracket.stl", [30, 10, 5], 0)))
+    assert row0["geometry_hash"] != row1["geometry_hash"]
+
+
+@respx.mock
+async def test_save_gcode_leaves_out_an_object_parked_off_every_plate(monkeypatch, tmp_path):
+    # plate -1 in the object list is the fork's answer for an object an earlier delete_plate left
+    # beside the bed. On the wire it simply is not on any plate's list, and a plate's own list is what
+    # decides what that plate prints, so it belongs to no slice.
+    _env(monkeypatch, tmp_path)
+    parked = {"id": 3, "index": 2, "name": "parked.stl", "plate": -1, "instances": 1,
+              "size_mm": [10, 10, 10]}
+    objs = {"count": 3, "objects": [dict(BRACKET), dict(CUBE, id=4, plate=1), dict(parked)]}
+    respx.get(f"{B}/api/v1/objects").mock(return_value=httpx.Response(200, json=objs))
+    respx.get(f"{B}/api/v1/plates").mock(return_value=httpx.Response(200, json=_plate_reply(
+        1, members={0: [(1, 0)], 1: [(2, 0), (4, 0)]})))
+
+    out = await srv.save_gcode("two-on-one.gcode")
+
+    assert out["model_name"] == "bracket.stl" and out["plate"] == 1
+    assert out["printed_copies"] == 2
+    row = oc.get(out["outcome_row_id"])
+    assert row["geometry_hash"] == oc.printed_geometry_hash(
+        _copies(("bracket.stl", [30, 10, 5], 0), ("cube.stl", [20, 20, 20], 0)))
+    # borrowing the parked object's identity, or leaving it out of the count of what the plate prints,
+    # are both the same fault in the other direction
+    assert row["geometry_hash"] != oc.printed_geometry_hash(
+        _copies(("bracket.stl", [30, 10, 5], 0), ("cube.stl", [20, 20, 20], 0),
+                ("parked.stl", [10, 10, 10], 0)))
+
+
+@respx.mock
+async def test_save_gcode_a_plate_that_lists_its_copies_is_attributed_by_that_list(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    respx.get(f"{B}/api/v1/plates").mock(return_value=httpx.Response(200, json=_plate_reply(0, count=1)))
+
+    out = await srv.save_gcode("listed.gcode")
+
+    assert out["plate"] == 0 and out["plate_attribution"] == "plate" and out["model_name"] == "cube"
+    assert out["printed_copies"] == 1
+    assert oc.get(out["outcome_row_id"])["geometry_hash"] == oc.printed_geometry_hash(
+        _copies(("cube", [20, 20, 20], 0)))
+    assert "attribution_warning" not in out
+
+
+@respx.mock
+async def test_save_gcode_a_single_plate_project_that_lists_nothing_still_takes_every_copy(monkeypatch,
+                                                                                           tmp_path):
+    # A fork that reports one plate and keeps its copies to itself: with one plate every copy of every
+    # object is on it, so the whole list is that plate's list, as it was before the plate API.
+    _env(monkeypatch, tmp_path)
+    respx.get(f"{B}/api/v1/plates").mock(return_value=httpx.Response(200, json=_silent_plates(0, count=1)))
+
+    out = await srv.save_gcode("one-plate.gcode")
+
+    assert out["plate"] == 0 and out["plate_attribution"] == "single-plate" and out["model_name"] == "cube"
+    assert out["printed_copies"] == 1
+    assert oc.get(out["outcome_row_id"])["geometry_hash"] == oc.printed_geometry_hash(
+        _copies(("cube", [20, 20, 20], 0)))
+    assert "attribution_warning" not in out
+
+
+@respx.mock
+async def test_save_gcode_older_build_without_the_plate_api_keeps_working(monkeypatch, tmp_path):
+    # _routes() answers /api/v1/plates with 404: a fork before v2.4.2-mcp.13 shows nothing about
+    # plates, so the project is all there is to go on. Saving must not break or lose the row over it.
+    _env(monkeypatch, tmp_path)
+    route = respx.get(f"{B}/api/v1/plates").mock(return_value=httpx.Response(404, json={"error": "not_found"}))
+    out = await srv.save_gcode("old-build.gcode")
+
+    assert (tmp_path / "gcode" / "old-build.gcode").exists()
+    assert out["outcome_recorded"] is True and out["model_name"] == "cube"
+    assert out["plate"] is None and out["plate_attribution"] == "project"
+    assert out["printed_copies"] == 1
+    assert "attribution_warning" not in out
+    assert oc.get(out["outcome_row_id"])["geometry_hash"] == oc.printed_geometry_hash(
+        _copies(("cube", [20, 20, 20], 0))
+    )
+    # the legacy build still pays for exactly one plate probe: there is no plate to switch to
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_save_gcode_a_404_answered_with_a_page_is_still_a_missing_route(monkeypatch, tmp_path):
+    # An old build answering an unknown path with a page and no JSON body at all: the route's absence
+    # is the one thing a 404 can be evidence of, and it is read as such whatever the body looks like.
+    _env(monkeypatch, tmp_path)
+    respx.get(f"{B}/api/v1/plates").mock(return_value=httpx.Response(404, content=b"<html>404</html>"))
+
+    out = await srv.save_gcode("old-page.gcode")
+
+    assert out["plate_attribution"] == "project" and out["model_name"] == "cube"
+    assert "attribution_warning" not in out
+
+
+@respx.mock
+async def test_save_gcode_a_plates_reply_that_is_not_json_at_all_still_saves(monkeypatch, tmp_path):
+    # 200 with an HTML body: something answered, and it was not the plate API. That is NOT a legacy
+    # build - only a 404 of the route itself can say that - so the save goes on and the row claims no
+    # project-wide identity, because a modern multi-plate fork whose reply was mangled would otherwise
+    # get every plate's objects fingerprinted onto this one plate's file.
+    _env(monkeypatch, tmp_path)
+    respx.get(f"{B}/api/v1/plates").mock(return_value=httpx.Response(200, content=b"<html>nope</html>"))
+
+    out = await srv.save_gcode("html-reply.gcode")
+
+    assert out["outcome_recorded"] is True and out["plate_attribution"] == "unknown"
+    assert out["model_name"] is None and oc.get(out["outcome_row_id"])["geometry_hash"] is None
+    assert "not JSON" in out["attribution_warning"]
+    assert (tmp_path / "gcode" / "html-reply.gcode").read_bytes() == b"G28\nG1 X1\n"
+
+
+@respx.mock
+async def test_save_gcode_several_plates_without_membership_records_nothing_false(monkeypatch, tmp_path):
+    # Two plates and objects that do not say which one they are on: some of them may be on the plate
+    # just sliced and some not. The row keeps what is true of it and drops what would be a guess.
+    _env(monkeypatch, tmp_path)
+    respx.get(f"{B}/api/v1/plates").mock(return_value=httpx.Response(200, json=_silent_plates(1)))
+
+    out = await srv.save_gcode("nameless-objects.gcode")
+
+    row = oc.get(out["outcome_row_id"])
+    assert (tmp_path / "gcode" / "nameless-objects.gcode").read_bytes() == b"G28\nG1 X1\n"
+    assert out["outcome_recorded"] is True and out["plate_attribution"] == "unknown"
+    assert out["model_name"] is None and row["model_name"] is None and row["geometry_hash"] is None
+    assert row["settings_summary"] == {"layer_height": "0.5", "fan_max_speed": "60"}
+    # the plate named itself the same both times, so the estimates read in between may stay: only a
+    # window whose plate moved (or could not be pinned) loses them
+    assert row["est_time_s"] == 1234.0 and row["est_filament_g"] == 5.6
+    assert row["printer_id"] == "Test Printer"
+    assert "several plates" in out["attribution_warning"]
+    # a default filename still says where the file came from, because the slicer did name the plate
+    # (the plate's space is sanitised to "_" like every other character in a filename)
+    named = await srv.save_gcode()
+    assert named["filename"].startswith("Plate_2_")
+
+
+@respx.mock
+async def test_save_gcode_a_plate_switched_mid_read_records_nothing_false(monkeypatch, tmp_path):
+    # The user clicks another plate between the G-code being taken and the objects being read: which
+    # plate the bytes came from is no longer knowable, so nothing gets attributed to either.
+    _env(monkeypatch, tmp_path)
+    respx.get(f"{B}/api/v1/objects").mock(return_value=httpx.Response(200, json=TWO_PLATES))
+    route = respx.get(f"{B}/api/v1/plates").mock(side_effect=[
+        httpx.Response(200, json=_plate_reply(0)), httpx.Response(200, json=_plate_reply(1))])
+
+    out = await srv.save_gcode("switched.gcode")
+
+    assert route.call_count == 2, "the plate must be re-read once a second plate exists to switch to"
+    row = oc.get(out["outcome_row_id"])
+    assert out["plate_attribution"] == "unknown" and out["model_name"] is None
+    assert row["model_name"] is None and row["geometry_hash"] is None
+    # and the estimates go the same way as the identity: they are the current plate's numbers, read
+    # inside a window whose plate is in doubt, so they belong to no row
+    assert row["est_time_s"] is None and row["est_filament_g"] is None
+    assert "changed while" in out["attribution_warning"]
+    assert "estimates are left out" in out["attribution_warning"]
+    assert (tmp_path / "gcode" / "switched.gcode").exists()
+
+
+@respx.mock
+async def test_save_gcode_a_plate_reply_that_names_no_current_plate_records_nothing_false(monkeypatch,
+                                                                                            tmp_path):
+    # 200 with no `current`, no `plates` list and no `count` (a malformed or partial reply): we know
+    # nothing, so we attribute nothing, and the save still lands.
+    _env(monkeypatch, tmp_path)
+    respx.get(f"{B}/api/v1/plates").mock(return_value=httpx.Response(200, json={"detail": "nonsense"}))
+
+    out = await srv.save_gcode("malformed.gcode")
+
+    assert out["outcome_recorded"] is True and out["plate_attribution"] == "unknown"
+    assert out["model_name"] is None and oc.get(out["outcome_row_id"])["geometry_hash"] is None
+    assert "does not say which plate is current" in out["attribution_warning"]
+
+
+@respx.mock
+async def test_save_gcode_a_one_plate_project_reads_the_plate_list_twice(monkeypatch, tmp_path):
+    # The closing read used to be skipped on a one-plate project, on the theory that there is no other
+    # plate to click. The index is not the only thing that can stay put while the plate changes: a copy
+    # duplicated onto the bed, deleted from it, or moved off it changes what that plate's G-code prints
+    # with the index exactly where it was, and across two reads is the only place that can be seen. The
+    # second round trip is what buys the membership check, so an ordinary save pays for it.
+    _env(monkeypatch, tmp_path)
+    route = respx.get(f"{B}/api/v1/plates").mock(return_value=httpx.Response(200, json=_plate_reply(0, count=1)))
+
+    out = await srv.save_gcode("twice.gcode")
+
+    assert route.call_count == 2, "the closing read is what proves the copies did not change"
+    assert out["plate"] == 0 and out["plate_attribution"] == "plate" and out["model_name"] == "cube"
+    assert "attribution_warning" not in out
+
+
+@respx.mock
+async def test_save_gcode_an_empty_current_plate_is_named_by_the_plate(monkeypatch, tmp_path):
+    # A plate with no objects on it is a fact about the plate, not an unknown: the row says which
+    # plate it was rather than borrowing another plate's object.
+    _env(monkeypatch, tmp_path)
+    respx.get(f"{B}/api/v1/objects").mock(return_value=httpx.Response(200, json={"count": 1,
+                                                                                 "objects": [dict(CUBE)]}))
+    respx.get(f"{B}/api/v1/plates").mock(return_value=httpx.Response(200, json=_plate_reply(
+        1, members={0: [(1, 0)], 1: []})))
+
+    out = await srv.save_gcode("empty-plate.gcode")
+
+    assert out["model_name"] == "Plate 2" and out["plate"] == 1 and out["plate_attribution"] == "plate"
+    assert oc.get(out["outcome_row_id"])["model_name"] == "Plate 2"
+    assert "attribution_warning" not in out
+
+
+@respx.mock
+async def test_save_gcode_names_the_row_by_the_plate_when_the_plate_has_no_name(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    respx.get(f"{B}/api/v1/objects").mock(return_value=httpx.Response(200, json={"count": 0, "objects": []}))
+    reply = _plate_reply(1, members={0: [], 1: []})
+    for plate in reply["plates"]:
+        plate["name"] = ""
+    respx.get(f"{B}/api/v1/plates").mock(return_value=httpx.Response(200, json=reply))
+
+    out = await srv.save_gcode()
+
+    assert out["model_name"] == "plate" and out["plate"] == 1
+    assert out["filename"].startswith("plate_")
+
+
+@respx.mock
+async def test_save_gcode_a_row_without_attribution_still_joins_to_its_print(monkeypatch, tmp_path):
+    # The warning promises the finished print still finds its row by filename, so that has to be true
+    # of a row carrying neither a model name nor a fingerprint.
+    _env(monkeypatch, tmp_path)
+    respx.get(f"{B}/api/v1/plates").mock(return_value=httpx.Response(200, json=_silent_plates(1)))
+    out = await srv.save_gcode("joinable.gcode")
+    row_id = out["outcome_row_id"]
+
+    joined = oc.record_outcome({"job_id": "77", "filename": "joinable.gcode", "status": "completed",
+                                "start_time": time.time() + 1, "end_time": time.time() + 61,
+                                "total_duration": 600})
+
+    assert joined == row_id
+    row = oc.get(row_id)
+    assert row["result"] == "success" and row["duration_s"] == 600
+    assert row["model_name"] is None and row["geometry_hash"] is None
+    assert out["attribution_warning"].endswith("select_plate and save again.")
