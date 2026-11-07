@@ -23,9 +23,12 @@ empty or null address is reported as the printer's own silence, never as the
 rather than as a condition, never asked twice, and never asked after a timeout or a dead session. A 1001
 that refuses leaves the 1042 answer standing with a note.
 
-**And the posture.** The last section fails the moment this candidate is exposed before a real 1042 has
-ever been captured: no camera tool is registered, no camera name is in the CC2 roster, and neither
-``server.py``, ``README.md`` nor the manifests mention it. Every reply says ``verified_on_this_printer:
+**And the posture.** The camera is exposed — as ``cc2_camera_snapshot``, one bounded fetch of the stream
+(see tests/test_cc2_snapshot.py) — and this candidate still is not: no tool reaches ``read_camera``, so
+nothing on this server sends the printer's camera-address method, and neither ``server.py``, ``README.md``
+nor the manifests name it or its number. That separation is the whole point of the last section, and it
+fails the moment a future edit wires the 1042 read into a tool or advertises it in prose while its reply
+shape and its possible toggle remain unestablished. Every reply here still says ``verified_on_this_printer:
 false``, because no CC2 has answered 1042 for this project, and because on this firmware a bare 1042 has
 never been proven free of side effects on the stream."""
 from __future__ import annotations
@@ -524,23 +527,33 @@ async def test_a_reply_is_json_safe_and_its_refusals_are_short_enough_to_survive
 # --------------------------------------------------------------------------- the candidate posture
 
 
-def test_no_camera_tool_is_registered():
-    # the module is an internal candidate until a real 1042 has been captured on Nathan's firmware —
-    # and until the toggle question is settled, an exposed camera tool could switch a stream by asking
+def test_the_candidate_is_still_not_a_tool_and_the_stream_tool_never_reaches_it():
+    """The camera is exposed now, and this candidate is not. ``cc2_camera_snapshot`` fetches the stream and
+    is a tool; nothing on this server imports ``cc2_camera`` or calls ``read_camera``, so no client of this
+    server can send the printer's camera-address method, and no reply on this server can repeat an address
+    the printer advertised but this project has never seen. That is the separation the 1042 evidence
+    requires: a picture is not evidence about the method, and until it is, the method stays unwired."""
     import orcaslicer_mcp.server as srv
 
     names = set(srv.mcp._tool_manager._tools)
-    assert not [n for n in names if n.startswith("cc2_") and "camera" in n]
-    assert not [n for n in srv.CC2_TOOL_NAMES if "camera" in n.lower()]
-    assert not [n for n in srv._TOOL_ANNOTATIONS if n.startswith("cc2_") and "camera" in n]
+    camera_tools = sorted(n for n in names if n.startswith("cc2_") and "camera" in n)
+    assert camera_tools == ["cc2_camera_snapshot"]
+    assert [n for n in srv.CC2_TOOL_NAMES if "camera" in n.lower()] == ["cc2_camera_snapshot"]
+    server = (ROOT / "src/orcaslicer_mcp/server.py").read_text(encoding="utf-8")
+    for unwired in ("read_camera", "camera_params", "Cc2LivingVideo", "METHOD_LIVING_VIDEO_URL",
+                    "from .printer import cc2_camera", "_cc2_camera "):
+        assert unwired not in server, unwired
 
 
 @pytest.mark.parametrize("relative", ["src/orcaslicer_mcp/server.py", "README.md",
                                       "lhm.plugin.json", "mcpb/manifest.json",
                                       "scripts/gen_lhm_tools.py"])
 def test_the_candidate_is_not_offered_as_a_supported_capability(relative):
+    """What must stay out of everything a client or a person reads: the candidate's names and its method
+    number. The stream tool is a different thing and is named freely; it never mentions or uses this one."""
     text = (ROOT / relative).read_text(encoding="utf-8")
-    for name in ("cc2_camera", "cc2_camera_url", "living_video", "1042"):
+    for name in ("cc2_camera_url", "cc2_living_video", "living_video", "LIVING_VIDEO", "1042",
+                 "getLivingVideoUrl"):
         assert name not in text, f"{relative} promises {name}"
 
 

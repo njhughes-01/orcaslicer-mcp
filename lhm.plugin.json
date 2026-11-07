@@ -111,7 +111,7 @@
     },
     {
       "name": "list_objects",
-      "description": "List objects in the project: id (stable), name, size_mm, transform (offset/rotation/scale) and, on fork v2.4.2-mcp.13 and later, the 0-based plate each one sits on (-1 when it is off every plate)."
+      "description": "List objects in the project: id (stable), name, size_mm, transform (offset/rotation/scale), how many copies the object holds (`instances`) and, on fork v2.4.2-mcp.13 and later, the 0-based plate each one sits on (-1 when it is off every plate)."
     },
     {
       "name": "set_object_config",
@@ -139,7 +139,7 @@
     },
     {
       "name": "list_plates",
-      "description": "List the plates in the project: each one's 0-based index, name, whether it is the current plate (the one slice, get_gcode, render_plate and get_job_status act on), lock state, build volume and the objects it holds."
+      "description": "List the plates in the project: each one's 0-based index, name, whether it is the current plate (the one slice, get_gcode, render_plate and get_job_status act on), lock state, build volume and the copies it holds, each as {id, instance}, that is the object's id and which copy of it, the same pair move_object_to_plate takes."
     },
     {
       "name": "get_printer_slots",
@@ -259,7 +259,7 @@
     },
     {
       "name": "save_gcode",
-      "description": "Save the last successful slice's G-code and record the slice (model, a fingerprint of the objects' names and sizes, full settings snapshot, and OrcaSlicer's time and filament estimates) in the local outcome store under that filename."
+      "description": "Save the last successful slice's G-code and record the slice (model, a fingerprint of the copies that plate prints, each object's name and size once per copy, the full settings snapshot, and OrcaSlicer's time and filament estimates) in the local outcome store under that filename."
     },
     {
       "name": "recall_prints",
@@ -310,6 +310,10 @@
       "description": "The print history the configured CC2 printer keeps for itself, read from the printer (method 1036, asked exactly once with no parameters at all)."
     },
     {
+      "name": "cc2_camera_snapshot",
+      "description": "One picture from the configured CC2 printer's own camera, returned as an MCP image block with its metadata beside it as text: a summary line naming its size, its type and where it came from, carrying the single-viewer warning with it, and the sanitised metadata the adapter built as JSON."
+    },
+    {
       "name": "cc2_upload_gcode",
       "description": "Upload one sliced G-code file directly to the configured CC2 printer under a NEW name, in 1 MiB chunks, and verify it on the printer's complete listing before writing the private receipt that cc2_start_print requires."
     },
@@ -343,7 +347,7 @@
     },
     {
       "name": "cc2_set_auto_refill",
-      "description": "Turn the configured CC2 printer's CANVAS auto-refill switch on or off with one boolean, and read this before calling it: no CC2 has ever answered this command on this project, so every reply says it is unverified."
+      "description": "Turn the configured CC2 printer's CANVAS auto-refill switch on or off with one boolean, and read this before calling it: the setting was changed and restored on one CC2, but automatic refill during a print remains unverified."
     }
   ],
   "prompts": [

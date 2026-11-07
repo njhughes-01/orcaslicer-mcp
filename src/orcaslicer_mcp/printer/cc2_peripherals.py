@@ -91,24 +91,32 @@ SPEED_MODES: dict[int, tuple[str, int]] = {
 }
 
 # Bounded by the direct tools' reply cap in server.py, like the job controls' notes (NOTE_CAP).
+# Both tails say the same thing about the look's timing, because it is the same look: it is taken
+# straight after the command, and nothing observed on any CC2 says how soon the status reflects one,
+# so a disagreement can be the status not having caught up rather than the command not having landed.
 _ACCEPT_TAILS = {
     "light": ("The observed light is one separate read-only look (led.status above zero reads as "
-              "on) and is never part of acceptance. The protocol documents binary on/off; some "
-              "firmware reports a 0-255 brightness there."),
-    "speed": ("The observed mode is one separate read-only look and is never part of acceptance. "
-              "Mode is discrete: 0 Silent/50%, 1 Balanced/100%, 2 Sport/150%, 3 Ludicrous/200%."),
+              "on), never part of acceptance. Taken straight after the command it can report the "
+              "printer as it was; cc2_status asks again. Some firmware reports 0-255 brightness "
+              "there."),
+    "speed": ("The observed mode is one separate read-only look, never part of acceptance. Taken "
+              "straight after the command it can report the printer as it was; cc2_status asks "
+              "again. Mode is discrete: 0 Silent/50%, 1 Balanced/100%, 2 Sport/150%, "
+              "3 Ludicrous/200%."),
 }
 
 # Said only when the read afterwards actually contradicts what was asked for: acceptance is what the
 # printer answered the command, the observation is what its status says after it, and neither one
-# overwrites the other. It is never an offer to send again.
+# overwrites the other. It is never an offer to send again. It says what the disagreement can mean —
+# including that the status had not caught up, which is unmeasured on this printer and is not the
+# same claim as the command having failed.
 _CONTRADICT = {
-    "light": ("Note the disagreement: the printer accepted the light command and its own status "
-              "read afterwards reports the light {word}. Accepted and observed are reported "
-              "separately and neither overwrites the other; cc2_status reads it again on demand."),
+    "light": ("Note the disagreement: the printer accepted the light command and its own status read "
+              "afterwards reports the light {word}. The two stay separate facts, and this look is "
+              "immediate, so it can be the status lagging: cc2_status reads it again."),
     "speed": ("Note the disagreement: the printer accepted mode {asked} and its own status read "
-              "afterwards reports mode {seen}. Accepted and observed are reported separately and "
-              "neither overwrites the other; cc2_status reads it again on demand."),
+              "afterwards reports mode {seen}. The two stay separate facts, and this look is "
+              "immediate, so it can be the status lagging: cc2_status reads it again."),
 }
 
 

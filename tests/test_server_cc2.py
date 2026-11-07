@@ -1,5 +1,5 @@
-"""The fifteen direct CC2 tools exactly as the server wires them, against scripted fakes: the
-adapters, the reply sanitiser, and what happens before a printer is ever configured. The fifteen are
+"""The sixteen direct CC2 tools exactly as the server wires them, against scripted fakes: the
+adapters, the reply sanitiser, and what happens before a printer is ever configured. The sixteen are
 declared the way every other tool on this server is, so the default posture is proven first: with no
 ORCA_CC2_URL set — the fixture clears it, every credential variable and every receipt store for the
 whole module — each tool answers not_configured with printer_contacted=false, and NOTHING touches the
@@ -58,8 +58,22 @@ had to be cut for size is reported as cut rather than as the whole history, a re
 shape refuses instead of being read as a LAN answer, and a time-lapse link carrying a login never
 leaves the reply.
 
+Fourteen of the sixteen tools share the process's one registered session (printer/cc2_pool.py), because
+the printer's own broker takes about four clients and reaps a departed one slowly: proven here at the
+layer the calls arrive at — a run of four ordinary calls registers once, two calls at the same moment
+wait for one open instead of each registering, a session the transport reported dead is closed and
+replaced by the very next call, moving the configured address between calls opens a fresh session and
+gives the abandoned one back, an upload after another call still authenticates with the credential
+that session was met with, a cancelled call gives its hold back and leaves the session usable by the
+next, and the server's own exit closes it (including the exit where stdio failed). The pool's own
+corner cases — the idle window, a configuration change while a call is in flight, a double release —
+are tests/test_cc2_pool.py, and the real-client proof that one registration answers two requests is
+the loopback test in tests/test_cc2_transport_mqtt.py. The sixteenth, `cc2_camera_snapshot`, borrows no
+session by design: its picture is one bounded HTTP GET of the printer's own camera stream, so it spends
+none of the printer's client slots — what it shares with the transport is the configuration and the
+address pinning, and its own guards and refusal paths are tests/test_cc2_snapshot.py.
 Discovery is proven last, in fresh interpreters whose environment the test builds from PATH, HOME and
-the variables it names: all fifteen direct tools are listed with no printer config at all, the list is
+the variables it names: all sixteen direct tools are listed with no printer config at all, the list is
 identical when a printer address is configured, the server's other tools come back identical in
 every one of them, and in a child that raises the moment any socket, name lookup, MQTT link or HTTP
 request is attempted, every direct tool still answers not_configured. No live printer, no Home
@@ -75,6 +89,7 @@ import contextlib
 import copy
 import http.client
 import httpx
+import inspect
 import json
 import os
 import re
@@ -167,15 +182,17 @@ def no_network(monkeypatch):
 def no_open(monkeypatch):
     """The transport seam itself, counted on the way through to the real one. Counting (rather than
     tripping) is what lets one fixture prove both halves of the unconfigured story: a parameter
-    refusal never reaches the seam at all (`no_open == []`), while a not_configured refusal does
-    reach it and is refused there, on the config check, with every socket guard still counting zero.
-    A test that stands a scripted printer in place replaces this wrapper — see `open_fake`."""
+    refusal never reaches the seam at all (`no_open == []`), and since the shared-session pool reads
+    the configuration itself a `not_configured` refusal stops *there*, one step before the seam, so
+    it too answers `no_open == []` — no session was borrowed and none was opened, which is the
+    stronger claim. A test that stands a scripted printer in place replaces this wrapper — see
+    `open_fake`."""
     opens: list = []
     real = srv._cc2_open_transport
 
-    async def counted():
+    async def counted(config):
         opens.append("open")
-        return await real()
+        return await real(config)
 
     monkeypatch.setattr(srv, "_cc2_open_transport", counted)
     return opens
@@ -302,6 +319,11 @@ class ScriptedTransport:
         reply = self.replies.get(method, {})
         if callable(reply):
             reply = reply(params or {})
+        if inspect.isawaitable(reply):
+            # A script may be a coroutine function as well as a plain one: that is how a test holds a
+            # reply open (a request still in flight when a caller is cancelled, or an open that two
+            # calls arrive at together). Unawaited it is a coroutine, and a coroutine is not an answer.
+            reply = await reply
         if isinstance(reply, deque):
             reply = reply.popleft() if len(reply) > 1 else reply[0]
         if isinstance(reply, BaseException):
@@ -367,10 +389,21 @@ class FakeHttp:
 
 def open_fake(monkeypatch, transport, *, password: str = TOKEN):
     """Stand a scripted fake session in place of the live one, counting how often the tools
-    reach the seam. `no_open` stays the guard for 'refused before any session'."""
-    opens: list = []
+    reach the seam. `no_open` stays the guard for 'refused before any session'.
 
-    async def fake_open():
+    The pool is emptied first, because it is the process's one session: a test that hands the seam a
+    second scripted printer means *that* printer to be the one the next call talks to, and a session
+    borrowed from an earlier test would silently be what it got instead. `opens` counts registrations
+    on the seam, which is how the reuse tests below say 'one session, four calls'."""
+    opens: list = []
+    srv._CC2_POOL.forget()
+    # A scripted session stands in for a *configured* printer, and the pool reads the configuration
+    # itself now, one step before the seam: without an address the tools would stop at their own
+    # config check and never reach this fake at all. The address is TEST-NET, and the module's
+    # `no_network` guards stay counting zero because the seam is patched before anything could use it.
+    monkeypatch.setenv(srv._cc2_transport.ENV_URL, HOST)
+
+    async def fake_open(config):
         opens.append("open")
         return transport, password
     monkeypatch.setattr(srv, "_cc2_open_transport", fake_open)
@@ -458,6 +491,7 @@ ALL_TOOLS = (
     lambda: srv.cc2_file_detail(filename=DEST),
     lambda: srv.cc2_file_thumbnail(filename=DEST),
     lambda: srv.cc2_print_history(),
+    lambda: srv.cc2_camera_snapshot(),
     lambda: srv.cc2_upload_gcode(path="/nowhere/x.gcode", destination="x.gcode"),
     lambda: srv.cc2_start_print(filename=DEST, tool_to_tray={"0": "3"}, bed_clear=True),
     lambda: srv.cc2_pause_print(),
@@ -476,7 +510,7 @@ ALL_TOOLS = (
 
 
 async def test_with_no_printer_address_every_tool_refuses_with_zero_network(no_network, no_open):
-    # the whole default posture in one place: fifteen tools a client can see and call, no printer
+    # the whole default posture in one place: sixteen tools a client can see and call, no printer
     # configured, and an honest refusal whose every field is plain JSON and whose every promise holds
     for call in ALL_TOOLS:
         out = await call()
@@ -489,19 +523,21 @@ async def test_with_no_printer_address_every_tool_refuses_with_zero_network(no_n
         assert len(out["message"]) <= srv._CC2_STR_MAX and len(out["hint"]) <= srv._CC2_STR_MAX, out
         json.dumps(out)
     assert no_network["calls"] == []                 # no socket, no lookup, no MQTT link: zero hits
-    assert len(no_open) == len(ALL_TOOLS)            # each call reached the seam and stopped there
+    assert no_open == []          # the pool's own config check refuses before the seam is reached
 
 
 async def test_an_unconfigured_tool_refuses_at_the_config_check_before_opening(monkeypatch,
                                                                               no_network, no_open):
     # stronger than 'no socket': the transport's own open is forbidden, so a tool that got as far as
-    # trying to open a session — even one that would then have failed at discovery — fails this test
+    # trying to open a session — even one that would then have failed at discovery — fails this test.
+    # The shared-session pool reads the configuration itself, one step before the seam, so the seam
+    # is not reached at all: nothing was borrowed and nothing was opened.
     async def forbidden(*args, **kwargs):
         raise AssertionError("an unconfigured tool must not try to open a transport")
     monkeypatch.setattr(srv._cc2_transport, "open_transport", forbidden)
     for call in ALL_TOOLS:
         assert (await call())["error"] == "not_configured"
-    assert no_network["calls"] == [] and len(no_open) == len(ALL_TOOLS)
+    assert no_network["calls"] == [] and no_open == []
 
 
 @pytest.mark.parametrize("url, why", [
@@ -520,7 +556,13 @@ async def test_an_address_that_cannot_be_the_printer_refuses_before_any_socket(u
     assert out["error"] == "not_configured", (why, out)
     assert out["printer_contacted"] is False, (why, out)
     assert "SECRETCODE" not in json.dumps(out), out
-    assert no_network["calls"] == [] and no_open == ["open"], why
+    # Where each refusal happens is worth naming rather than averaged out: a login, a port or a blank
+    # address is a configuration fault, so the pool's own config check stops it one step before the
+    # seam (`no_open == []`). A public address is not a config fault — it is this adapter's address
+    # policy, which lives inside the open, so the seam is reached and refused there. Either way the
+    # socket guards above stay at zero: a literal address needs no lookup and no packet.
+    reached_the_seam = why == "a public address"
+    assert no_network["calls"] == [] and (no_open == ["open"]) is reached_the_seam, why
 
 
 async def test_a_configured_code_stays_out_of_an_unconfigured_refusal(monkeypatch, tmp_path,
@@ -547,20 +589,24 @@ async def test_reads_and_writes_are_one_configured_printer_without_a_switch(monk
     transport = open_fake(monkeypatch, healthy_status())
     assert (await srv.cc2_status())["machine"]["state_word"] == "idle"
     assert (await srv.cc2_list_files())["complete"] is True
-    assert transport.opens == ["open", "open"]
+    assert transport.opens == ["open"]   # two reads, one registration: the session is shared
 
     started = await srv.cc2_start_print(filename="never-uploaded.gcode", tool_to_tray={"0": "3"},
                                         bed_clear=True)
     assert started["error"] == "protocol_error" and started["reason"] == "receipt_missing"
     assert (await srv.cc2_stop_print())["confirm_required"] is True
-    assert len(transport.opens) == 4
+    # four configured calls, still one session and one registration. This is the shape that used to
+    # cost a slot apiece, which on a broker that takes about four clients is how an idle, healthy
+    # printer came to refuse the fourth ordinary call with 'too many clients'.
+    assert len(transport.opens) == 1
+    assert srv._CC2_POOL.holds == 0
     assert transport.methods().count(srv._cc2_control.METHOD_STOP) == 0
 
 
 async def test_an_unconfigured_write_never_enters_its_own_adapter(no_open, monkeypatch):
     # the writes are listed now, so what stops them has to be their own checks rather than a switch:
-    # with no printer configured the session itself refuses, so the adapter — and with it the receipt
-    # lookup and the credential it would have carried — is never entered at all
+    # with no printer configured the pool's own config check refuses before the seam, so the adapter —
+    # and with it the receipt lookup and the credential it would have carried — is never entered at all
     def forbidden(*args, **kwargs):
         raise AssertionError("an unconfigured write must not reach its adapter")
     monkeypatch.setattr(srv._cc2_start, "start_print", forbidden)
@@ -569,7 +615,7 @@ async def test_an_unconfigured_write_never_enters_its_own_adapter(no_open, monke
                                        destination=DEST))["error"] == "not_configured"
     assert (await srv.cc2_start_print(filename=DEST, tool_to_tray={"0": "3"},
                                       bed_clear=True))["error"] == "not_configured"
-    assert len(no_open) == 2
+    assert no_open == []
 
 
 # --------------------------------------------------------------------------- 3. validation before any session
@@ -614,7 +660,10 @@ async def test_status_reports_parsed_state_and_never_a_raw_reply(monkeypatch):
     assert "sub_status_reason_code" not in dumped  # raw envelope noise never rides along
     assert "bed_mesh" not in dumped
     assert transport.methods() == [srv._cc2_state.METHOD_STATUS, srv._cc2_state.METHOD_CANVAS]
-    assert transport.closed is True  # closed on the success path too
+    # what a tool call owes the shared session now that it does not own it: the hold came back, and
+    # nothing is left counting it. It is *not* closed — closing per call is the behaviour that ate
+    # the printer's four MQTT slots — and when it does close is what tests/test_cc2_pool.py proves.
+    assert srv._CC2_POOL.holds == 0
 
 
 async def test_status_reports_uncertainty_without_guessing(monkeypatch):
@@ -824,7 +873,7 @@ async def test_printer_info_reports_the_answer_and_names_the_silence(monkeypatch
     assert out["attachments"]["camera_connected"] is True
     assert transport.methods() == [1001]
     assert transport.params_for(1001) == {}                    # the paramless request, as documented
-    assert transport.closed is True
+    assert srv._CC2_POOL.holds == 0                            # the hold came back
     dumped = json.dumps(out)
     assert HOST not in dumped and ATTRS_1001["mac"] not in dumped   # no address, no MAC carried on
     assert "raw" not in dumped                                   # and never the reply as it arrived
@@ -901,7 +950,7 @@ async def test_file_thumbnail_sends_file_name_and_returns_the_picture_whole(monk
     assert base64.b64decode(content.data) == THUMB_BYTES        # whole, byte for byte, nothing cut
     assert isinstance(caption, TextContent) and caption.type == "text"
     assert DEST in caption.text and "png" in caption.text and str(len(THUMB_BYTES)) in caption.text
-    assert transport.closed is True
+    assert srv._CC2_POOL.holds == 0                            # the hold came back
 
 
 async def test_an_image_bigger_than_one_reply_may_carry_is_refused_with_its_size_named(monkeypatch):
@@ -955,7 +1004,7 @@ async def test_an_information_reply_that_never_arrives_is_reported_once_and_neve
     assert out["error"] == "protocol_error" and out["reason"] == "timeout", out
     assert out["ambiguous"] is True                      # the transport's own word, kept
     assert transport.methods().count(method) == 1
-    assert transport.closed is True
+    assert srv._CC2_POOL.holds == 0                            # the hold came back, even on a timeout
 
 
 async def test_the_information_reads_never_send_a_method_a_control_owns(monkeypatch):
@@ -981,7 +1030,7 @@ async def test_print_history_is_asked_with_no_parameters_at_all(monkeypatch):
     out = await srv.cc2_print_history()
     assert transport.methods() == [1036]
     assert transport.params_for(1036) == {}      # the parameterless request, as the app sends it
-    assert transport.closed is True
+    assert srv._CC2_POOL.holds == 0              # the hold came back
     assert [e["task_name"] for e in out["entries"]] == [DEST, "cat-plate.gcode"]
     assert out["entries"][0]["task_status"] == 1 and out["entries"][0]["task_status_label"] == "complete"
     assert out["entries"][1]["task_status"] == 2 and out["entries"][1]["task_status_label"] == "cancel"
@@ -1722,7 +1771,8 @@ async def test_bed_clear_false_never_lets_a_start_command_leave(monkeypatch, wit
     out = await srv.cc2_start_print(filename=DEST, tool_to_tray={"0": "3"}, bed_clear=False)
     assert out["error"] == "protocol_error" and out["reason"] == "bed_not_clear"
     assert srv._cc2_start.METHOD_START not in transport.methods()
-    # only reads happened before the refusal, and the session still closed
+    # only reads happened before the refusal, and the hold came back all the same
+    assert srv._CC2_POOL.holds == 0
     assert set(transport.methods()) <= {srv._cc2_state.METHOD_STATUS,
                                         srv._cc2_state.METHOD_CANVAS,
                                         srv._cc2_state.METHOD_FILES}
@@ -1751,14 +1801,19 @@ async def test_a_lost_start_answer_is_ambiguous_and_never_resent(monkeypatch, wi
 
 # --------------------------------------------------------------------------- 7. failures are structured and sanitised
 
-async def test_a_session_failure_is_a_structured_refusal_and_closes_anyway(monkeypatch):
-    async def refuse():
+async def test_a_session_failure_is_a_structured_refusal_and_leaves_nothing_pooled(monkeypatch):
+    # an open that fails is reported as itself, and the pool keeps nothing: what never opened cannot
+    # be borrowed by the next call, and the next call pays its own honest open.
+    monkeypatch.setenv("ORCA_CC2_URL", HOST)
+
+    async def refuse(*args, **kwargs):
         raise srv.PrinterError("not_reachable",
                                "simulated: the printer did not answer discovery")
     monkeypatch.setattr(srv, "_cc2_open_transport", refuse)
     out = await srv.cc2_status()
     assert out == {"error": "not_reachable",
                    "message": "simulated: the printer did not answer discovery"}
+    assert srv._CC2_POOL.open is False and srv._CC2_POOL.holds == 0
 
 
 async def test_adapter_errors_come_back_sanitised(monkeypatch, tmp_path, receipts_dir):
@@ -1917,6 +1972,161 @@ def test_the_source_writes_no_reply_key_the_exemption_list_does_not_name():
     assert all(re.fullmatch(r"_?[a-z][a-z0-9_]+", k) for k in srv._CC2_REPLY_KEYS)
 
 
+# ------------------------------------ one shared session across calls (the printer's four MQTT slots)
+
+async def test_a_sequence_of_tool_calls_shares_one_registered_session(monkeypatch):
+    """The regression, at the layer Nathan's calls arrive at. Four ordinary calls used to mean four
+    registrations, and a broker that takes about four clients refused the fourth — `too_many_clients`
+    from a printer that was idle and healthy, which then refused for a while. One session now answers
+    all four, each call gives its hold back, and the session is left open for the next."""
+    transport = open_fake(monkeypatch, healthy_status())
+    assert (await srv.cc2_status())["machine"]["state_word"] == "idle"
+    assert (await srv.cc2_list_files())["complete"] is True
+    assert (await srv.cc2_set_light(on=True))["confirm_required"] is True
+    assert (await srv.cc2_stop_print())["confirm_required"] is True
+
+    assert transport.opens == ["open"]                     # four calls, one registration
+    assert srv._CC2_POOL.holds == 0                        # and every call gave its hold back
+    assert transport.closed is False                       # still the printer's client, ready for more
+    assert transport.methods().count(srv._cc2_state.METHOD_FILES) == 1   # nothing was asked twice
+
+
+async def test_two_calls_at_the_same_moment_wait_for_one_open_rather_than_registering_twice(monkeypatch):
+    """Two calls arriving together must not each register: the roster is the scarce thing, and one
+    process being two clients is exactly what filled it. The second caller waits for the open that is
+    already in flight and is answered by the session it opens."""
+    transport = open_fake(monkeypatch, healthy_status())
+    gate = asyncio.Event()
+    in_flight: list = []
+
+    async def slow_open(config):
+        in_flight.append("open")
+        await gate.wait()                 # the open stands where a real discovery + register would
+        return transport, TOKEN
+    monkeypatch.setattr(srv, "_cc2_open_transport", slow_open)
+
+    first = asyncio.create_task(srv.cc2_status())
+    second = asyncio.create_task(srv.cc2_list_files())
+    await asyncio.sleep(0.02)
+    assert in_flight == ["open"]          # one open, and the other caller is waiting rather than registering
+    gate.set()
+    a, b = await asyncio.gather(first, second)
+    assert a["machine"]["state_word"] == "idle" and b["complete"] is True
+    assert in_flight == ["open"] and srv._CC2_POOL.holds == 0
+
+
+async def test_a_session_that_died_between_calls_is_dropped_and_the_next_call_gets_a_fresh_one(monkeypatch):
+    """A session the transport reported dead cannot serve the next read, and the caller is not made to
+    pay for it or to notice: the dead one is closed and this same call is answered by a new session.
+    Nothing was resent on the way — the command that was in flight when it died was reported by the
+    reply that reported the death, and this call is a command of its own."""
+    dead = open_fake(monkeypatch, healthy_status())
+    assert (await srv.cc2_status())["machine"]["state_word"] == "idle"
+    dead.last_error = srv.PrinterError("not_reachable",
+                                       "simulated: the MQTT session with the printer was dropped",
+                                       reason="lost", ambiguous=True)
+
+    fresh = healthy_status()
+    fresh_opens: list = []
+
+    async def open_fresh(config):
+        fresh_opens.append("open")
+        return fresh, TOKEN
+    monkeypatch.setattr(srv, "_cc2_open_transport", open_fresh)
+
+    out = await srv.cc2_status()
+    assert out["machine"]["state_word"] == "idle"
+    assert fresh_opens == ["open"]        # the fresh session was opened by this call, once
+    assert fresh.methods().count(srv._cc2_state.METHOD_STATUS) >= 1
+    assert dead.closed is True            # and the dead one left the printer's roster
+    assert srv._CC2_POOL.holds == 0
+
+
+async def test_moving_the_configured_address_between_calls_opens_a_fresh_session(monkeypatch):
+    """The configuration is re-read on every borrow, so re-pointing the server cannot leave a tool
+    talking to the printer it was configured for before."""
+    transport = open_fake(monkeypatch, healthy_status())
+    assert (await srv.cc2_status())["machine"]["state_word"] == "idle"
+    monkeypatch.setenv(srv._cc2_transport.ENV_URL, "192.0.2.99")   # a different printer, same policy
+    assert (await srv.cc2_status())["machine"]["state_word"] == "idle"
+    assert transport.opens == ["open", "open"]
+    assert transport.closed is True        # the abandoned session was given back, not kept
+
+
+async def test_a_later_upload_still_carries_the_credential_the_session_was_met_with(
+        monkeypatch, tmp_path, receipts_dir, gcode_file):
+    """Pooling must not break the credential handoff the upload depends on: the upload is the second
+    call on a session another call opened, and it still authenticates with the password *that* session
+    was met with — into a header only, and never out in the reply."""
+    size = gcode_file.stat().st_size
+    listing = Listing([[], [file_entry(size=size)]])   # collision check clean, verify agrees
+    transport = open_fake(monkeypatch, healthy_status(method_1044=listing))
+    http = FakeHttp()
+    monkeypatch.setattr(srv, "_cc2_upload_http_factory", http.factory)
+
+    await srv.cc2_status()                              # a different call opens the session first
+    out = await srv.cc2_upload_gcode(path=str(gcode_file), destination=DEST)
+
+    assert out["uploaded"] == DEST
+    assert transport.opens == ["open"]                  # one session for both calls
+    assert http.puts[0]["headers"]["X-Token"] == TOKEN   # the session's own password, into a header only
+    assert TOKEN not in json.dumps(out)
+
+
+async def test_a_cancelled_tool_call_gives_the_session_back_and_leaves_it_usable(monkeypatch):
+    """A call cancelled by its client is an ordinary ending, not a leak: the hold comes back, the
+    healthy session is not closed by a caller that left, and the next call is answered by it without a
+    new registration."""
+    gate = asyncio.Event()
+
+    async def never_answers(params):      # a request still in flight when the client goes away
+        await gate.wait()
+        return IDLE_1002
+    transport = open_fake(monkeypatch, healthy_status(method_1002=never_answers))
+    task = asyncio.create_task(srv.cc2_status())
+    await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert srv._CC2_POOL.holds == 0 and transport.closed is False
+
+    gate.set()
+    transport.replies[srv._cc2_state.METHOD_STATUS] = IDLE_1002
+    assert (await srv.cc2_status())["machine"]["state_word"] == "idle"
+    assert transport.opens == ["open"]     # the next call shared the session the cancelled one left
+
+
+async def test_the_server_stopping_gives_the_printer_its_slot_back(monkeypatch):
+    """The CC2 session lives on the server's own loop, so the server's own exit is where it closes: a
+    client left behind across the exit is one the printer has to time out on its own clock."""
+    transport = open_fake(monkeypatch, healthy_status())
+    assert (await srv.cc2_status())["machine"]["state_word"] == "idle"
+    served: list = []
+
+    async def fake_run_stdio(lowlevel_server):
+        served.append(lowlevel_server)
+    monkeypatch.setattr(srv, "run_stdio", fake_run_stdio)
+
+    await srv._serve_stdio_then_close()
+    assert served == [srv.mcp._lowlevel_server]
+    assert transport.closed is True and srv._CC2_POOL.open is False and srv._CC2_POOL.holds == 0
+
+
+async def test_a_session_closes_when_the_server_stops_because_stdio_failed(monkeypatch):
+    """The close is a finally, so a server that stopped because its transport died still hands the
+    slot back — and the failure stays the story, which is what the caller reads."""
+    transport = open_fake(monkeypatch, healthy_status())
+    assert (await srv.cc2_status())["machine"]["state_word"] == "idle"
+
+    async def failing_run_stdio(lowlevel_server):
+        raise RuntimeError("simulated: stdio closed")
+    monkeypatch.setattr(srv, "run_stdio", failing_run_stdio)
+
+    with pytest.raises(RuntimeError):
+        await srv._serve_stdio_then_close()
+    assert transport.closed is True
+
+
 # --------------------------------------------------------------------------- 8. schema and annotation completeness
 
 def test_json_schema_is_mcp_compatible_and_documented():
@@ -1989,13 +2199,13 @@ def test_json_schema_is_mcp_compatible_and_documented():
     assert "Second-call only" in refill["properties"]["confirm"]["description"]
 
 
-def test_annotations_classify_the_fifteen_cc2_tools():
+def test_annotations_classify_the_sixteen_cc2_tools():
     tools = srv.mcp._tool_manager._tools
-    # the whole tool list is the annotation table: fifteen direct tools and everything that predates
+    # the whole tool list is the annotation table: sixteen direct tools and everything that predates
     # them, each with its title and hints, nothing registered that the table does not speak for
     assert set(srv._TOOL_ANNOTATIONS) == set(tools)
     for name in ("cc2_status", "cc2_list_files", "cc2_printer_info", "cc2_file_detail",
-                 "cc2_file_thumbnail", "cc2_print_history"):
+                 "cc2_file_thumbnail", "cc2_print_history", "cc2_camera_snapshot"):
         ann = tools[name].annotations
         assert ann.read_only_hint is True and ann.destructive_hint is None
         assert ann.open_world_hint is True and ann.idempotent_hint is None
@@ -2016,7 +2226,7 @@ def test_annotations_classify_the_fifteen_cc2_tools():
 # interpreter. Each child gets a hand-built environment — PATH, HOME and exactly the variables the
 # test names — so it is proven by construction that no credential, printer address or receipt store
 # was present for it to read, let alone echo. What the new posture has to buy is exactly this: the
-# twelve direct tools are listed by default, a printer address changes nothing about that list, and
+# sixteen direct tools are listed by default, a printer address changes nothing about that list, and
 # the server's other tools come back identical in every case.
 
 BASELINE_TOOLS = frozenset(srv.mcp._tool_manager._tools) - CC2_NAMES
@@ -2033,6 +2243,7 @@ PROBE_CALLS = [
     ("cc2_file_detail", "cc2_file_detail", {"filename": DEST}),
     ("cc2_file_thumbnail", "cc2_file_thumbnail", {"filename": DEST}),
     ("cc2_print_history", "cc2_print_history", {}),
+    ("cc2_camera_snapshot", "cc2_camera_snapshot", {}),
     ("cc2_upload_gcode", "cc2_upload_gcode", {"path": "/nowhere/x.gcode", "destination": DEST}),
     ("cc2_start_print", "cc2_start_print", {"filename": DEST, "tool_to_tray": {"0": "3"},
                                             "bed_clear": True}),
@@ -2115,9 +2326,9 @@ def child(argv: str, env_overrides: dict[str, str], *, home: str | None = None,
     return done.stderr
 
 
-def test_all_fifteen_direct_tools_are_listed_with_no_printer_config(tmp_path):
+def test_all_sixteen_direct_tools_are_listed_with_no_printer_config(tmp_path):
     # the posture Nathan asked for: no read/write switch, no hidden tools. A client pointed at a
-    # server with no printer configured is still shown all fifteen — in an empty HOME, with no
+    # server with no printer configured is still shown all sixteen — in an empty HOME, with no
     # credential anywhere in the child's environment — and every other tool is untouched by it
     names = set(json.loads(child(LIST_TOOLS, {}, home=str(tmp_path))))
     assert CC2_NAMES == frozenset(srv.CC2_TOOL_NAMES)
@@ -2132,7 +2343,7 @@ def test_a_configured_address_changes_nothing_about_what_is_listed(tmp_path):
     assert configured == plain == BASELINE_TOOLS | CC2_NAMES
 
 
-def test_a_child_that_forbids_the_network_lists_all_fifteen_and_refuses_all_fifteen(tmp_path):
+def test_a_child_that_forbids_the_network_lists_all_sixteen_and_refuses_all_sixteen(tmp_path):
     # discovery needs nothing, and a call with nothing configured answers honestly instead of
     # reaching out: the guards in the child raise on the first socket, name lookup, MQTT link or
     # HTTP request, so this test passing IS the zero-network proof
@@ -2162,6 +2373,6 @@ def test_the_probe_child_is_armed_and_fails_when_a_tool_reaches_the_network(tmp_
 
 def test_this_module_leaves_the_direct_tools_listed_as_it_found_them():
     # a hygiene check on the module itself, last by file order: the tests above patch, fake and
-    # restore freely, and this is where a leak would surface. The fifteen are declared at import, so
-    # what a later module must see is exactly those fifteen plus everything that predates them
+    # restore freely, and this is where a leak would surface. The sixteen are declared at import, so
+    # what a later module must see is exactly those sixteen plus everything that predates them
     assert frozenset(srv.mcp._tool_manager._tools) == BASELINE_TOOLS | CC2_NAMES

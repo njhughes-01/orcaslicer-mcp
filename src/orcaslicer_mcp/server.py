@@ -16,7 +16,8 @@ from pydantic import Field
 from mcp.types import TextContent, ToolAnnotations
 from .config import load_config
 from .client import OrcaClient
-from .errors import ApiError, Validation, NotFound, Conflict, ConfigError
+from .errors import (ApiError, Validation, NotFound, Conflict, ConfigError, UiTimeout, NotReachable,
+                     Unauthorized)
 from .models import summarize_slice
 from . import settings_schema
 from . import placement
@@ -43,6 +44,8 @@ from .printer import cc2_control as _cc2_control
 from .printer import cc2_history as _cc2_history
 from .printer import cc2_info as _cc2_info
 from .printer import cc2_peripherals as _cc2_peripherals
+from .printer import cc2_pool as _cc2_pool
+from .printer import cc2_snapshot as _cc2_snapshot
 from .printer import cc2_start as _cc2_start
 from .printer import cc2_state as _cc2_state
 from .printer import cc2_temperature as _cc2_temperature
@@ -465,9 +468,12 @@ def _slots_err(e: ApiError) -> dict:
 
 @mcp.tool()
 async def list_objects() -> dict:
-    """List objects in the project: id (stable), name, size_mm, transform (offset/rotation/scale)
-    and, on fork v2.4.2-mcp.13 and later, the 0-based plate each one sits on (-1 when it is off
-    every plate)."""
+    """List objects in the project: id (stable), name, size_mm, transform (offset/rotation/scale),
+    how many copies the object holds (`instances`) and, on fork v2.4.2-mcp.13 and later, the 0-based
+    plate each one sits on (-1 when it is off every plate). That `plate` says where the object's FIRST
+    instance sits: for an object whose copies are spread over more than one plate it says nothing about
+    the other copies, so what a plate actually prints is in `list_plates`, whose per-plate `objects`
+    carry each copy as {id, instance}."""
     try:
         async with _client() as c:
             return await c.get_objects()
@@ -557,11 +563,13 @@ async def auto_orient() -> dict:
 async def list_plates() -> dict:
     """List the plates in the project: each one's 0-based index, name, whether it is the
     current plate (the one slice, get_gcode, render_plate and get_job_status act on), lock
-    state, build volume and the objects it holds. Also says how many plates the build allows
-    (max) and whether one can be added or deleted right now. Read-only.
+    state, build volume and the copies it holds, each as {id, instance}, that is the object's id and
+    which copy of it, the same pair move_object_to_plate takes. That per-plate list, not an object's own
+    `plate` (which names only its first instance), is what says what a plate prints. Also says how many
+    plates the build allows (max) and whether one can be added or deleted right now. Read-only.
 
-    Plate numbers shown in the OrcaSlicer window are 1-based; every tool here takes the
-    0-based index from this list. Needs fork v2.4.2-mcp.13 or later."""
+    Plate numbers shown in the OrcaSlicer window are 1-based; every tool here takes the 0-based index
+    from this list. Needs fork v2.4.2-mcp.13 or later."""
     try:
         async with _client() as c:
             return await c.get_plates()
@@ -1297,20 +1305,411 @@ def _gcode_base_dir() -> Path:
     return Path.home() / ".orcaslicer-mcp"
 
 
+# --- Which plate the saved slice belongs to -------------------------------------------------------
+# get_gcode, slice_status and the settings snapshot answer for the CURRENT plate, while /api/v1/objects
+# lists every object in the PROJECT. Membership therefore does not come from the object list: an
+# object's own `plate` (fork v2.4.2-mcp.13) names only where that object's FIRST instance sits, so an
+# object with three copies laid out over two plates reports one plate for all three, and it says -1 for
+# an object a delete_plate left parked beside the bed. What a plate actually prints is in the /plates
+# reply instead, where each plate carries its own `objects`: [{"id": ..., "instance": ...}, ...] - the
+# object id and which copy of it, exactly the pair move_object_to_plate takes as arguments. Recording a
+# different plate's part, and the settings that produced it, against one plate's G-code is the one thing
+# the outcome store exists to get wrong, so membership is read from the plate's own list of copies, and
+# wherever that cannot be established the row keeps only what is true of it.
+
+_ATTR_PLATE = "plate"            # the sliced plate named the copies it prints, from its own list
+_ATTR_SINGLE = "single-plate"    # one-plate project: every copy of every object sits on that plate
+_ATTR_PROJECT = "project"        # pre-v2.4.2-mcp.13 fork: no plate route, so the project is all we see
+_ATTR_UNKNOWN = "unknown"        # anything else: attribute nothing, and say which case it was
+
+_READ = "read"            # the plate route answered something a plate can be read out of
+_LEGACY = "legacy"        # the route itself is absent: a fork before v2.4.2-mcp.13
+_UNCERTAIN = "uncertain"  # it answered, but not with anything a plate can be read out of
+
+
+class _Plates:
+    """What one GET /api/v1/plates tells us, in a shape that cannot be confused between the three.
+
+    `_READ`      `current`, `count`, `names` (index -> its name) and `by_plate` (index -> the copies
+                 that plate reports for itself, or None when that plate's entry has no `objects` key at
+                 all). A `_READ` reply can still be silent about a plate's copies, and silence is a fact
+                 about the reply, not a fault in it: the caller still reports the plate it was given and
+                 attributes nothing to it.
+    `_LEGACY`    the endpoint itself is absent, which a clean 404 of the route is the only evidence of.
+                 This is the one state that makes "the project is the plate" true: such a build has one
+                 plate, lists no objects against any of them, and shows nothing else.
+    `_UNCERTAIN` it answered, but not in a way to build on - it did not answer in time, it could not be
+                 reached, it refused (401/422), it answered 404 for a resource rather than for the
+                 route, the body was not JSON (a build answering an unknown path with a page), the JSON
+                 was not an object, or the object contradicts itself. Never collapsed into `_LEGACY`:
+                 "this build has no plate API" is the claim that licenses attributing a whole project to
+                 one plate's file, and a build that has the route and stumbled on it has not earned it.
+    """
+
+    __slots__ = ("state", "current", "count", "names", "by_plate", "reason")
+
+    def __init__(self, state: str, current: int | None = None, count: int | None = None,
+                 names: dict | None = None, by_plate: dict | None = None, reason: str | None = None):
+        self.state = state
+        self.current = current
+        self.count = count
+        self.names = names or {}
+        self.by_plate = by_plate or {}
+        self.reason = reason
+
+
+class _Copies:
+    """One plate's own membership list as reported: `pairs` the {(id, instance)} copies it names, `ids`
+    every object id it names (a member listed without an `instance` still names the object), and
+    `unnumbered` for whether any member was listed that way - which is enough to know an object sits
+    here when it has one copy, and not enough to count them when it has more."""
+
+    __slots__ = ("pairs", "ids", "unnumbered")
+
+    def __init__(self):
+        self.pairs: set[tuple[int, int]] = set()
+        self.ids: set[int] = set()
+        self.unnumbered = False
+
+
+def _plain_int(value) -> int | None:
+    """A whole number as the slicer reports it, or None for anything that is not one: a string, a
+    float, a boolean (bool is an int subclass in Python, and True is not the number 1 here), or an
+    absent key. A negative number stays a number: it is the slicer reporting something it measured, and
+    a caller that cannot use it says so rather than reading it as absent."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _read_reason(e: Exception) -> str:
+    """Why a plate read could not be had, in our own words. The exception's own sentence is never
+    quoted: it can carry the slicer's address, and this is a diagnostic label, not a transcript."""
+    if isinstance(e, UiTimeout):
+        return "the slicer did not answer the plate list in time"
+    if isinstance(e, NotReachable):
+        return "the slicer could not be reached for the plate list"
+    if isinstance(e, Unauthorized):
+        return "the slicer refused the plate list as unauthorised"
+    if isinstance(e, Validation):
+        return "the slicer refused the plate list as invalid"
+    if isinstance(e, NotFound):
+        return "the plate list answered 404 for a resource, not for a missing route"
+    return "the slicer answered the plate list with an error"
+
+
+async def _plate_read(c) -> _Plates:
+    """Ask the slicer for its plates once and say what the answer was worth (see `_Plates`). The one
+    thing this must not do is call a failure a legacy build: a modern multi-plate fork whose plate read
+    timed out looks exactly like a pre-v2.4.2-mcp.13 fork to a caller that only asks 'did it work?'."""
+    try:
+        reply = await c.get_plates()
+    except NotFound as e:
+        if e.route_missing:
+            return _Plates(_LEGACY)
+        return _Plates(_UNCERTAIN, reason=_read_reason(e))
+    except ApiError as e:
+        return _Plates(_UNCERTAIN, reason=_read_reason(e))
+    except ValueError:
+        # Not JSON at all: a build answering an unknown path with an HTML page, a truncated body, or a
+        # proxy's error document. None of those is evidence about which routes this build has.
+        return _Plates(_UNCERTAIN, reason="the plate reply was not JSON at all")
+    return _parse_plates(reply)
+
+
+def _plate_copies(entry: dict, problems: list) -> _Copies | None:
+    """One plate entry's own `objects` list as the copies it prints, or None when the entry has no such
+    key: that plate stays silent, which is not the same thing as a plate that lists nothing."""
+    if "objects" not in entry:
+        return None
+    listed = entry.get("objects")
+    if not isinstance(listed, list):
+        problems.append("a plate's `objects` is not a list")
+        return None
+    copies = _Copies()
+    for member in listed:
+        if not isinstance(member, dict):
+            problems.append("a plate member that is not an object")
+            continue
+        oid = _plain_int(member.get("id"))
+        if oid is None or oid < 0:
+            problems.append("a plate member with no usable object id")
+            continue
+        copies.ids.add(oid)
+        if "instance" not in member:
+            copies.unnumbered = True
+            continue
+        inst = _plain_int(member.get("instance"))
+        if inst is None or inst < 0:
+            problems.append("a plate member with no usable instance index")
+            continue
+        copies.pairs.add((oid, inst))
+    return copies
+
+
+def _parse_plates(reply) -> _Plates:
+    """Read a plate reply into a `_Plates`, failing closed on anything it says that contradicts the rest
+    of what it says: a `count` that does not match the list published with it, a `current` outside that
+    list or disagreeing with the entry flagged current:true, a plate listed twice, two plates flagged
+    current, or one copy of one object printed on two plates at once. Each of those says the reply as a
+    whole cannot be trusted, which is why a `count` of 3 beside a one-entry list is read as neither
+    'three plates' nor 'one plate' but as nothing."""
+    if not isinstance(reply, dict):
+        return _Plates(_UNCERTAIN, reason="the plate reply was not an object")
+    problems: list[str] = []
+    listed = reply.get("plates")
+    if listed is not None and not isinstance(listed, list):
+        problems.append("its `plates` is not a list")
+        listed = None
+    by_plate: dict[int, _Copies | None] = {}
+    names: dict[int, str] = {}
+    flagged: list[int] = []
+    where: dict[tuple[int, int], int] = {}
+    for entry in (listed or []):
+        if not isinstance(entry, dict):
+            problems.append("a plate entry that is not an object")
+            continue
+        idx = _plain_int(entry.get("index"))
+        if idx is None or idx < 0:
+            problems.append("a plate entry with no usable index")
+            continue
+        if idx in by_plate:
+            problems.append(f"plate {idx} listed twice")
+        if entry.get("current") is True:
+            flagged.append(idx)
+        name = entry.get("name")
+        if isinstance(name, str) and name.strip():
+            names[idx] = name.strip()
+        by_plate[idx] = _plate_copies(entry, problems)
+        if by_plate[idx] is not None:
+            for pair in by_plate[idx].pairs:
+                if pair in where:
+                    problems.append(f"one copy is listed on plate {where[pair]} and on plate {idx}")
+                where[pair] = idx
+    count = _plain_int(reply.get("count"))
+    if count is not None and count < 0:
+        problems.append("a `count` below zero")
+        count = None
+    if count is None and listed is not None:
+        count = len(listed)
+    if count is not None and listed is not None and count != len(listed):
+        n = len(listed)
+        problems.append(f"its `count` of {count} does not match the {n} plate{'s' if n != 1 else ''} "
+                        "it lists")
+    cur = _plain_int(reply.get("current"))
+    if cur is not None and cur < 0:
+        problems.append("a `current` below zero")
+        cur = None
+    if flagged:
+        if len(flagged) > 1:
+            problems.append("more than one plate flagged current:true")
+        elif cur is None:
+            cur = flagged[0]
+        elif cur not in flagged:
+            problems.append(f"`current` of {cur} disagrees with the plate the list flags as current")
+    if cur is not None and count is not None and cur >= count:
+        problems.append(f"`current` plate {cur} is outside its own count of {count}")
+    if cur is not None and listed is not None and cur not in by_plate:
+        problems.append(f"`current` plate {cur} is not in the plate list")
+    if problems:
+        return _Plates(_UNCERTAIN, reason="the plate reply contradicts itself: " + "; ".join(problems))
+    return _Plates(_READ, current=cur, count=count, names=names, by_plate=by_plate)
+
+
+def _plate_name(plates: _Plates, index: int | None) -> str | None:
+    """A plate's own name ("Plate 2" in the window), or None when it has none or the reply never named
+    it. Lets a slice we cannot attribute to an object still say which plate it came from."""
+    if index is None:
+        return None
+    return plates.names.get(index)
+
+
+def _instance_count(obj: dict) -> int:
+    """How many copies the slicer says this one object holds, and 1 when it does not say: one copy is
+    the smallest claim here that can be wrong, and it is what a build reporting no count means."""
+    n = _plain_int(obj.get("instances"))
+    return n if n is not None and n >= 1 else 1
+
+
+def _printed_item(obj: dict, instance: int) -> dict:
+    """One printed copy, in the form the fingerprint is made from and no wider: the object's name, its
+    size, and which copy it is. The object id is left out on purpose - ids are assigned per session, so
+    a fingerprint that carried them could not recall the same model next week."""
+    name = obj.get("name")
+    return {"name": name if isinstance(name, str) else "", "size_mm": obj.get("size_mm") or [],
+            "instance": instance}
+
+
+def _expand_copies(objs: list) -> list[dict]:
+    """Objects as a printed list when no per-plate membership is going to arrive (a one-plate project,
+    or a fork with no plate route at all): every copy of every object, from the object's own count."""
+    printed: list[dict] = []
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        printed.extend(_printed_item(obj, i) for i in range(_instance_count(obj)))
+    return printed
+
+
+def _unknown(plates: _Plates, reason: str, stats_ok: bool) -> dict:
+    """Nothing attributed, and the sentence saying why. `stats_ok` says whether the estimates read
+    between the two plate reads may still be this plate's (see `_plate_attribution`)."""
+    cur = plates.current
+    return {"objects": [], "printed": [], "plate": cur, "plate_name": _plate_name(plates, cur),
+            "attribution": _ATTR_UNKNOWN, "reason": reason, "stats_ok": stats_ok}
+
+
+def _plate_membership(plates: _Plates, index: int | None):
+    """What one read says a plate holds, as a value two reads of it can be compared on, or None when that
+    read does not say. The comparison is the membership itself - the `{id, instance}` copies, plus the
+    object ids a member named without an instance, plus whether any member came unnumbered - because the
+    plate index alone cannot close the window: a copy added, deleted or moved to another plate leaves the
+    current index exactly where it was while changing what that plate's G-code prints."""
+    if index is None:
+        return None
+    copies = plates.by_plate.get(index)
+    if copies is None:
+        return None
+    return (frozenset(copies.pairs), frozenset(copies.ids), copies.unnumbered)
+
+
+def _plate_attribution(objs: list, before: _Plates, after: _Plates) -> dict:
+    """Which copies the plate that was sliced actually prints, and how sure we are of that.
+
+    `before` is the plate read taken BEFORE the G-code and `after` the one taken after the LAST read
+    whose answer goes into the row - the objects, the settings and the estimates are each the current
+    plate's - so a plate the user clicks anywhere inside that window shows up as a changed index and the
+    bytes in hand can no longer be paired with an object list or an estimate. A plate that stays current
+    is not therefore the same plate: what it holds may have changed inside that window too, so the
+    closing read's membership for that index is compared pair for pair, and a read that never named what
+    the plate held cannot confirm it either. Silence is judged the same way twice: a plate that stayed
+    silent in both reads is a build that does not publish membership, which is a fact about the reply the
+    caller still reports, while a plate that named its copies at the start and kept them to itself at the
+    end has changed what its reply says about it, and the last chance to confirm the membership is gone -
+    that fails closed with its estimates, like any other change. When a fork has no plate
+    route at all both reads are `_LEGACY`: the project is all such a build shows, so those keep the
+    behaviour they always had, labelled as what they are rather than passed off as a plate read.
+
+    An object's own `plate` field is never consulted, so nothing here depends on which instance that
+    field happens to describe: it is not the tie-breaker when the plate list and the object list
+    disagree, because that disagreement is the known shape of the field rather than a fault to judge.
+
+    Returns {objects, printed, plate, plate_name, attribution, reason, stats_ok}; `objects` and
+    `printed` are empty when nothing can be attributed, `printed` is what the fingerprint is made from,
+    `objects` the same subset as the slicer reported it (the candidate for matching rows written before
+    copies were counted), and `reason` is a sentence naming why only for "unknown".
+    """
+    if before.state == _LEGACY and after.state == _LEGACY:
+        return {"objects": objs, "printed": _expand_copies(objs), "plate": None, "plate_name": None,
+                "attribution": _ATTR_PROJECT, "reason": None, "stats_ok": True}
+    if _UNCERTAIN in (before.state, after.state):
+        bad = after if after.state == _UNCERTAIN else before
+        return _unknown(after, bad.reason or "the plate list could not be read", stats_ok=False)
+    if before.count != after.count:
+        return _unknown(after, "the number of plates changed while the slice information was being read",
+                        stats_ok=False)
+    cur = after.current
+    if cur is None:
+        return _unknown(after, "the slicer's plate list does not say which plate is current",
+                        stats_ok=False)
+    if before.current != cur:
+        # Either the plate moved under us, or the read that was meant to bracket the window never named
+        # a plate at all, which cannot be told apart from a plate that did move. Neither lets this file
+        # be paired with a plate, and neither says its estimates all came from the same one.
+        reason = ("the current plate changed while the slice, its objects, its settings and its "
+                  "estimates were being read" if before.current is not None else
+                  "the plate that was current when the reads began was never named, so this slice "
+                  "cannot be confirmed as the current plate's")
+        return _unknown(after, reason, stats_ok=False)
+    # The index being unchanged is only half the promise. The copies sitting on that index may have
+    # changed while the G-code, the objects, the settings and the estimates were read - a duplicate, a
+    # delete, a move to or from another plate, or the closing reply simply ceasing to say what the plate
+    # holds after the opening one said it - and a row built then would fingerprint a scene that was never
+    # sliced and carry estimates measured on a different one, so it keeps neither.
+    was = _plate_membership(before, cur)
+    now = _plate_membership(after, cur)
+    if now is None:
+        # The opening read named the plate's copies and the closing one went silent about them. Silence
+        # from a plate that has never spoken is a fact about the build, and both reads agree on it, so it
+        # is the caller's to report; silence arriving where there was an answer is a change in what the
+        # reply says about the plate, and the last chance to confirm the membership is gone. The row may
+        # not keep an identity it can no longer prove, and the estimates were read into the same window,
+        # so they go with it.
+        if was is not None:
+            return _unknown(after, "the plate just sliced stopped saying which copies it holds between "
+                                   "the reads that bracket the job, so the copies named at the start "
+                                   "cannot be confirmed as the ones that were sliced", stats_ok=False)
+    elif was != now:
+        reason = ("the copies the plate holds changed while the slice, its objects, its settings and its "
+                  "estimates were being read" if was is not None else
+                  "the plate just sliced did not say which copies it held when the reads began, so the "
+                  "copies it names at the end cannot be confirmed as the ones that were sliced")
+        return _unknown(after, reason, stats_ok=False)
+    known = {"plate": cur, "plate_name": _plate_name(after, cur)}
+    copies = after.by_plate.get(cur)
+    if copies is None:
+        if after.count == 1:
+            # Reached only when neither read named the plate's copies (a plate that named them at the
+            # start and went silent at the end already failed closed above), so this is the build that
+            # reports plates without saying what sits on them. With one plate every copy of every object
+            # is on it, so the whole list still is that plate's list.
+            return {"objects": objs, "printed": _expand_copies(objs), **known,
+                    "attribution": _ATTR_SINGLE, "reason": None, "stats_ok": True}
+        return _unknown(after, "the slicer lists several plates but the plate just sliced does not say "
+                               "which objects, or which copies of them, sit on it", stats_ok=True)
+    by_id: dict[int, dict] = {}
+    for obj in objs:
+        oid = None if not isinstance(obj, dict) else _plain_int(obj.get("id"))
+        if oid is None:
+            return _unknown(after, "the object list contains an entry with no usable id, so the copies "
+                                   "the plate lists cannot be matched to it", stats_ok=True)
+        by_id[oid] = obj
+    missing = copies.ids - set(by_id)
+    if missing:
+        n = len(missing)
+        return _unknown(after, f"the plate just sliced names {n} object{'s' if n != 1 else ''} the "
+                               "object list does not report, so what it prints cannot be identified",
+                        stats_ok=True)
+    if copies.unnumbered and any(_instance_count(by_id[i]) > 1 for i in copies.ids):
+        return _unknown(after, "the plate lists its objects without saying which copy each one is, and "
+                               "at least one of them has more than one", stats_ok=True)
+    printed = [_printed_item(by_id[oid], inst) for oid, inst in sorted(copies.pairs)]
+    numbered = {oid for oid, _ in copies.pairs}
+    printed.extend(_printed_item(by_id[oid], 0) for oid in sorted(copies.ids - numbered))
+    return {"objects": [by_id[oid] for oid in sorted(copies.ids)], "printed": printed, **known,
+            "attribution": _ATTR_PLATE, "reason": None, "stats_ok": True}
+
+
 @mcp.tool()
 async def save_gcode(filename: str | None = None) -> dict:
     """Save the last successful slice's G-code and record the slice (model, a fingerprint of the
-    objects' names and sizes, full settings snapshot, and OrcaSlicer's time and filament estimates)
-    in the local outcome store under that filename. When that file is printed, list_print_history (or klipper-mcp's recorder) matches the
+    copies that plate prints, each object's name and size once per copy, the full settings snapshot,
+    and OrcaSlicer's time and filament estimates) in the local outcome store under that filename.
+    When that file is printed, list_print_history (or klipper-mcp's recorder) matches the
     finished job by filename, so the real result joins back to these settings. Returns the saved
     path; hand it to klipper-mcp's start_print. Default filename: <object>_<timestamp>.gcode. Never
     overwrites an existing file: a name collision gets a -2, -3, ... suffix. Writes into a gcode
     folder under PRINT_OUTCOMES_DIR if set, else under the shared print-outcomes folder
     (~/projects/_shared/print-outcomes) if it already exists, else under ~/.orcaslicer-mcp; the folder
     is created if missing. If the store write fails, the file is still saved and outcome_recorded is
-    False."""
+    False.
+
+    On a project with several plates the record covers the copies the sliced plate lists for itself,
+    each one named by its object id and instance index the way `list_plates` reports them, not every
+    object in the project, because the G-code is only ever that one plate's: the plate's index comes
+    back as `plate` and how the objects were chosen as `plate_attribution`. When which copies sit on the
+    sliced plate cannot be established (the slicer reports several plates without saying what the sliced
+    one holds, names no current plate, contradicts itself about its own plate list, cannot be reached
+    for it, or the plate was switched or the copies it holds changed between the reads that bracket the
+    whole job), the file saves and
+    the row keeps its settings and printer, but with no model name, no fingerprint, and no time or
+    filament estimate, and the reply says so in `attribution_warning` rather than making them up. A fork
+    older than v2.4.2-mcp.13 says nothing about plates at all, and only a genuine missing plate route
+    says that, not a plate read that timed out, so there nothing changed: `plate_attribution` is
+    "project" and the record covers every object as it always did."""
     try:
         async with _client() as c:
+            plates_before = await _plate_read(c)
             data = await c.get_gcode()
             objs = (await c.get_objects()).get("objects") or []
             cfg = await c.get_config(None)
@@ -1324,12 +1723,27 @@ async def save_gcode(filename: str | None = None) -> dict:
                 printer_name = ((await c.get_status()).get("presets") or {}).get("printer")
             except ApiError:
                 pass
+            # The second read closes the window, and it has to come after the LAST read whose answer
+            # goes into the row: the settings snapshot and the estimates are the current plate's too, so
+            # a plate clicked during them would otherwise land on this row unnoticed. It is not only
+            # about a plate being clicked - on a one-plate project a copy duplicated onto the bed, deleted
+            # or moved off it changes what that plate's G-code prints while the index, the only thing such
+            # a project can compare, stays exactly where it was. So the closing read is paid for whenever
+            # the opening read named a plate that could have changed under us, which a fork with no plate
+            # route, or a window already known to be untrustworthy, never leaves us with.
+            plates_after = (plates_before if plates_before.state in (_LEGACY, _UNCERTAIN)
+                            else await _plate_read(c))
     except Conflict:
         return {"error": "not_sliced"}
     except ApiError as e:
         return _m4a_err(e)
-    model_name = objs[0]["name"] if objs else "plate"
-    fname = _safe_gcode_name(filename or f"{model_name}_{datetime.datetime.now():%Y%m%d-%H%M%S}")
+    attr = _plate_attribution(objs, plates_before, plates_after)
+    printed = attr["printed"]
+    attributed = attr["attribution"] != _ATTR_UNKNOWN
+    # The label names the file; only a plate we actually identified may name the row.
+    label = (printed[0]["name"] if printed else None) or attr["plate_name"] or "plate"
+    model_name = label if attributed else None
+    fname = _safe_gcode_name(filename or f"{label}_{datetime.datetime.now():%Y%m%d-%H%M%S}")
     out_dir = _gcode_base_dir() / "gcode"
     out_dir.mkdir(parents=True, exist_ok=True)
     path, fname = _unique_gcode_path(out_dir, fname)
@@ -1341,15 +1755,33 @@ async def save_gcode(filename: str | None = None) -> dict:
     outcome_error = None
     try:
         row_id = _outcomes.record_slice(
-            fname, model_name, _outcomes.geometry_hash_for(objs), cfg,
+            fname, model_name,
+            _outcomes.printed_geometry_hash(printed) if attributed else None, cfg,
             printer_id=_ptarget.printer_id(printer_name),
-            est_time_s=stats.get("estimated_time_seconds"), est_filament_g=stats.get("filament_used_g"))
+            est_time_s=stats.get("estimated_time_seconds") if attr["stats_ok"] else None,
+            est_filament_g=stats.get("filament_used_g") if attr["stats_ok"] else None)
     except Exception as e:  # noqa: BLE001 - whatever goes wrong while recording, the saved file stays
         outcome_error = str(e) or type(e).__name__
     result = {"path": str(path), "filename": fname, "bytes": len(data), "model_name": model_name,
+              "plate": attr["plate"], "plate_attribution": attr["attribution"],
+              "printed_copies": len(printed) if attributed else None,
               "outcome_recorded": row_id is not None, "outcome_row_id": row_id}
     if outcome_error is not None:
         result["outcome_error"] = outcome_error
+    if not attributed:
+        # The estimates are per-plate by construction, so a window that cannot be trusted cannot have
+        # produced them; the settings snapshot stays, because it is the slicer's own active project
+        # config, and the warning is where its uncertainty belongs.
+        stats_note = ("" if attr["stats_ok"] else
+                      "The slicer's time and filament estimates are left out as well, because they were "
+                      "read while it was not known which plate was current and may be another plate's; "
+                      "the settings snapshot is what the slicer held when it was read, which under the "
+                      "same uncertainty may belong to the plate that was current then. ")
+        result["attribution_warning"] = (
+            "The file is saved and the row recorded, but with no model name and no fingerprint: "
+            f"{attr['reason']}. {stats_note}The G-code file itself is unaffected, and the row still "
+            "joins to its finished print by filename; only a recall by model cannot find it. If another "
+            "plate should have been current, select_plate and save again.")
     return result
 
 
@@ -1372,6 +1804,36 @@ def _recall_summary(rows: list[dict], subject: str) -> str:
     return f"{head}: {parts}{tail}"
 
 
+def _copies_spelled(printed: list[dict]) -> str:
+    """How many copies of each part a plate prints, spelled for a person: "3 copies of brick.stl", or,
+    when the plate holds several parts, "2 copies of brick.stl, 1 copy of peg.stl". A part the slicer
+    never named still gets named as unnamed, so the sentence cannot go silently vague."""
+    counts: dict[str, int] = {}
+    for item in printed:
+        name = item.get("name") or "an unnamed part"
+        counts[name] = counts.get(name, 0) + 1
+    return ", ".join(f"{n} cop{'y' if n == 1 else 'ies'} of {name}" for name, n in counts.items())
+
+
+def _legacy_fingerprint_note(printed: list[dict]) -> str:
+    """The disclosure that goes with a row found through the pre-copies fingerprint: it is a match on the
+    part, and the copies are not on the wire in that form, so it is no proof of the same print."""
+    return ("These rows were recorded before copies were counted, on a fingerprint that names each part "
+            f"once and so cannot tell one copy of it from several, while this plate prints "
+            f"{_copies_spelled(printed)}. They match on the part, not on what was printed: treat their "
+            "settings and outcomes as the history of this part at an unknown number of copies, never as "
+            "the record of a print of exactly these copies.")
+
+
+def _copy_count_note(printed: list[dict]) -> str:
+    """Why an answer that is not a fingerprint match on the current copies cannot be this plate's
+    history: name matching cannot count copies either, and recency says nothing about the part at all."""
+    return (f"No recorded print carries the fingerprint of what this plate prints ({_copies_spelled(printed)}). "
+            "The rows below are matched by part name or by recency alone, and neither can say how many "
+            "copies were printed: a row for one copy of a part is not the history of a print of several of "
+            "them, so do not tell the user these are how this plate's prints have gone.")
+
+
 @mcp.tool()
 async def recall_prints(model_name: str | None = None, limit: int = 5) -> dict:
     """How did past prints of THIS model actually turn out? Matches the current plate by geometry
@@ -1386,30 +1848,77 @@ async def recall_prints(model_name: str | None = None, limit: int = 5) -> dict:
     results. Read-only. Returns available=false and nothing else when no
     outcome store exists yet.
     If neither geometry nor name matches, it returns the most recent prints of ANY model with
-    matched_by='recent'; never attribute those to the current model."""
+    matched_by='recent'; never attribute those to the current model.
+
+    The geometry match is on the fingerprint save_gcode wrote, the printed copies of the current plate,
+    each object's name and size once per copy.
+
+    On a project with several plates 'this model' means the copies the current plate lists for itself,
+    the same list save_gcode fingerprints, so a plate holding three copies never matches the row of a
+    print that had one. When the slicer does not say what the current plate holds, or cannot be reached
+    for the plate list, no fingerprint match is attempted at all: a different plate's part would be a
+    worse answer than the recent prints it falls back to. `plate` and `plate_attribution` say what it
+    looked with, and when it could not, `attribution_note` says why the answer is only "recent".
+
+    Rows written before copies were counted carry the older fingerprint, which names each part once and so
+    cannot tell one copy of it from three: those rows are still found, and a match on one comes with a
+    `legacy_fingerprint_note` saying the copy count is not established. When nothing on record prints the
+    copies this plate prints, `copy_count_note` says so and the answer is NOT this plate's history. Past
+    prints of a part are then searched by name only when you passed `model_name` yourself - a name cannot
+    count copies, so the tool never reaches for the current plate's own part name to call somebody else's
+    print this model's history."""
     if not _outcomes.is_available():
         return {"available": False, "matched_by": None, "prints": [], "summary": "no outcome store"}
-    objs: list[dict] = []
+    attr = {"objects": [], "printed": [], "plate": None, "plate_name": None,
+            "attribution": _ATTR_UNKNOWN, "reason": "the slicer did not answer, so no plate is known",
+            "stats_ok": False}
     try:
         async with _client() as c:
+            before = await _plate_read(c)
             objs = (await c.get_objects()).get("objects") or []
+            # Bracketed like save_gcode brackets its writes: the fingerprint is only this plate's if the
+            # plate, and the copies it names, are still the same after the objects were read - which a
+            # one-plate project has to re-read to find out, because its index cannot say either way.
+            after = (before if before.state in (_LEGACY, _UNCERTAIN) else await _plate_read(c))
+            attr = _plate_attribution(objs, before, after)
     except ApiError:
         pass
+    honesty = {"plate": attr["plate"], "plate_attribution": attr["attribution"]}
+    if attr["attribution"] == _ATTR_UNKNOWN:
+        honesty["attribution_note"] = (
+            f"No fingerprint match was attempted: {attr['reason']}. These are recent prints of any "
+            "model, and they are not this plate's history unless one of them names the same part.")
     limit = max(1, min(limit, 50))
-    if objs:
-        h = _outcomes.geometry_hash_for(objs)
-        rows = _outcomes.recall(geometry_hash=h, limit=limit)
+    # Match on the copies the current plate prints: that is what save_gcode fingerprints, so matching
+    # on the whole project, or on the objects without their copies, would never line up on a multi-plate
+    # project. The objects form older rows carry is looked for separately and second, because it cannot
+    # say how many copies were printed: a row found that way is disclosed, not handed over as this plate's
+    # history. Nothing else may stand in for a match either, so once both forms come up empty the name
+    # search runs only on a name the caller typed, never on this plate's own part name.
+    printed = attr["printed"] if attr["attribution"] != _ATTR_UNKNOWN else []
+    if printed:
+        subject = printed[0]["name"] or attr["plate_name"] or "this plate"
+        current = _outcomes.printed_geometry_hash(printed)
+        rows = _outcomes.recall(geometry_hashes=[current], limit=limit)
         if rows:
             return {"available": True, "matched_by": "geometry", "prints": rows,
-                    "summary": _recall_summary(rows, objs[0]["name"])}
-        model_name = model_name or objs[0]["name"]
+                    "summary": _recall_summary(rows, subject), **honesty}
+        pre_fix = _outcomes.geometry_hash_for(attr["objects"])
+        if pre_fix != current:
+            rows = _outcomes.recall(geometry_hashes=[pre_fix], limit=limit)
+            if rows:
+                return {"available": True, "matched_by": "geometry", "prints": rows,
+                        "summary": _recall_summary(rows, subject),
+                        "legacy_fingerprint_note": _legacy_fingerprint_note(printed), **honesty}
+        honesty["copy_count_note"] = _copy_count_note(printed)
     if model_name:
         rows = _outcomes.recall(model_name=model_name, limit=limit)
         if rows:
             return {"available": True, "matched_by": "name", "prints": rows,
-                    "summary": _recall_summary(rows, model_name)}
+                    "summary": _recall_summary(rows, model_name), **honesty}
     rows = _outcomes.recall(limit=limit)
-    return {"available": True, "matched_by": "recent", "prints": rows, "summary": _recall_summary(rows, "recent")}
+    return {"available": True, "matched_by": "recent", "prints": rows,
+            "summary": _recall_summary(rows, "recent"), **honesty}
 
 
 @mcp.tool()
@@ -1576,15 +2085,17 @@ async def check_printer_match() -> dict:
 
 
 # --- Direct Elegoo Centauri Carbon 2 printing (configured, never switched on) ----------------
-# Fifteen tools — the reads cc2_status, cc2_list_files, cc2_printer_info, cc2_file_detail,
-# cc2_file_thumbnail and cc2_print_history, then cc2_upload_gcode, cc2_start_print, the job
+# Sixteen tools — the reads cc2_status, cc2_list_files, cc2_printer_info, cc2_file_detail,
+# cc2_file_thumbnail, cc2_print_history and cc2_camera_snapshot, then cc2_upload_gcode,
+# cc2_start_print, the job
 # controls cc2_pause_print, cc2_resume_print and cc2_stop_print, then the peripheral controls
 # cc2_set_light, cc2_set_print_speed and cc2_set_temperature, and the CANVAS switch
 # cc2_set_auto_refill — speak to the
-# printer directly (LAN discovery, MQTT, HTTP upload, one start command, one control command) through
+# printer directly (LAN discovery, MQTT, HTTP upload, one HTTP camera stream, one start command, one
+# control command) through
 # the printer/cc2_* adapters, with no OrcaSlicer and no Home Assistant in the path.
 #
-# They are declared the way every other tool on this server is: a client sees all fifteen in
+# They are declared the way every other tool on this server is: a client sees all sixteen in
 # tools/list whether or not a printer has been configured. What makes them safe is not hiding them.
 # With no address set (ORCA_CC2_URL empty) every one of them refuses in-process and says so —
 # not_configured, with printer_contacted=false — before any address is resolved and before any
@@ -1593,6 +2104,25 @@ async def check_printer_match() -> dict:
 # them able to reach anything, exactly as ORCA_PRINTER_URL is for the Klipper printer tools. Nothing
 # here asks a second time: the config IS the opt-in, and a not_configured refusal is the honest
 # answer until it exists.
+#
+# One session, not one per call. The printer's own MQTT broker takes about four clients and reaps a
+# departed one on its own clock, so when every tool call registered, used and closed its own session
+# the fourth ordinary call in a row met "too many clients" (reason=client_limit) from an idle,
+# healthy printer. So fourteen of the sixteen tools borrow the process's one registered session through
+# printer/cc2_pool.py: opens are serialised so two simultaneous calls cannot register twice, while
+# requests on an established session run concurrently because the transport matches every answer to
+# the request id it stamped. A session that reports itself dead, or that the configuration left
+# behind (address or access code, re-read on every borrow), is retired and the NEXT call opens
+# afresh — which repeats no command, because the pool sends nothing and an unanswered command stays
+# as ambiguous as the reply that reported it said. With nobody holding it, the session is closed
+# after cc2_pool.IDLE_CLOSE_S so a printer left alone gets its slot back; and the server's shutdown
+# closes it too. Two server processes are still two clients — nothing is shared across processes.
+# cc2_camera_snapshot is the one exception, and a deliberate one: a camera picture is one HTTP GET of the
+# printer's own stream, so it needs no MQTT session, registers no client, spends none of the printer's
+# four slots, and still works when the roster is full. What it reuses from the transport is its
+# configuration and its address pinning, never its session — which is why this file now speaks of HTTP in
+# two voices: the upload writes to the printer over one port, the camera picture is fetched from another,
+# and neither sends a protocol command.
 #
 # These are the server's only printer WRITEs, and MCP tool annotations are advisory metadata, a hint
 # to a client, never an access control: the nine writes carry readOnlyHint=false and
@@ -1605,9 +2135,9 @@ async def check_printer_match() -> dict:
 # built field by field from the adapters' parsed, fail-closed state, and everything passes through
 # _cc2_out(): strings capped, control characters stripped, non-JSON-safe numbers turned to None.
 
-# The fifteen direct tools, in declaration order: the six reads first (the live state, the file
-# inventory, what the printer is, what one of its files is, what that file looks like, and what it has
-# printed before), then the
+# The sixteen direct tools, in declaration order: the seven reads first (the live state, the file
+# inventory, what the printer is, what one of its files is, what that file looks like, what it has
+# printed before, and what its camera sees), then the
 # upload and the start, then the three job controls, then the three peripheral controls, then the
 # CANVAS auto-refill switch. Each is
 # registered by its own @mcp.tool() below, and tests assert that
@@ -1615,7 +2145,7 @@ async def check_printer_match() -> dict:
 # a test instead of quietly shrinking what a client is shown.
 CC2_TOOL_NAMES: tuple[str, ...] = (
     "cc2_status", "cc2_list_files", "cc2_printer_info", "cc2_file_detail", "cc2_file_thumbnail",
-    "cc2_print_history",
+    "cc2_print_history", "cc2_camera_snapshot",
     "cc2_upload_gcode", "cc2_start_print",
     "cc2_pause_print", "cc2_resume_print", "cc2_stop_print",
     "cc2_set_light", "cc2_set_print_speed", "cc2_set_temperature", "cc2_set_auto_refill",
@@ -1696,6 +2226,21 @@ _CC2_REPLY_KEYS = frozenset({
     "would_refuse", "xyz_size",
 })
 
+# The camera snapshot's reply names, declared as their own addition rather than woven into the sorted
+# block above: the rule is identical (a name this source contains is a name this server wrote, so the
+# credential pass must not rewrite it), and keeping them together is what makes the whole surface of
+# cc2_camera_snapshot answerable in one search. Nothing here is exempted that the block above would not
+# have exempted — they are the same kind of string, and the two completeness tests in tests/
+# test_server_cc2.py (the one-letter-code walk and the source scan) cover them exactly as they cover the
+# rest, because both read this name, not the literal it came from.
+_CC2_REPLY_KEYS = _CC2_REPLY_KEYS | frozenset({
+    "bytes_consumed", "bytes_skipped_before_frame", "camera_method_sent", "command_sent",
+    "content_type", "elapsed_s", "frame_complete", "http_status", "minimum_bytes",
+    "mqtt_session_used", "printer_advertised_url", "printer_contacted", "read_window_s",
+    "requests_sent", "stream_host", "stream_path", "stream_port", "stream_query",
+    "stream_url", "stream_url_source",
+})
+
 _CC2_STR_MAX = 255           # retain exact printer filenames (up to 255 characters)
 _CC2_LIST_MAX = 200          # per-printer lists (trays, colours, tools) inside one reply
 # The most files one cc2_list_files reply may carry, and it is held equal to the sanitiser's own
@@ -1716,6 +2261,13 @@ _CC2_MACHINE_WORDS = {
 def _cc2_upload_http_factory():
     """The seam tests use to stand a fake chunk sender in place of httpx."""
     return _cc2_upload.Cc2UploadHttp
+
+
+def _cc2_snapshot_http_factory():
+    """The seam tests use to stand a scripted camera stream in place of httpx. Looked up at call time
+    rather than bound at import, so a test standing a fake here is believed by the tool too. What comes
+    back is called with the pinned URL and nothing else: no header, no auth, no proxy, no redirect."""
+    return _cc2_snapshot.Cc2StreamHttp
 
 
 def _cc2_configured_code() -> str | None:
@@ -1787,8 +2339,9 @@ def _cc2_err(e: PrinterError) -> dict:
 
 
 class _Cc2Session:
-    """One tool call's session: the open transport once it exists, the password it was met with,
-    and the sanitised refusal when opening failed. Closed by _cc2_session on every path."""
+    """One tool call's borrow of the shared session: the open transport once it exists, the password
+    it was met with, and the sanitised refusal when there was no session to borrow. Given back by
+    _cc2_session on every path — not closed, because another call may be using it; see _CC2_POOL."""
     __slots__ = ("error", "password", "transport")
 
     def __init__(self) -> None:
@@ -1797,33 +2350,49 @@ class _Cc2Session:
         self.error: dict | None = None
 
 
-async def _cc2_open_transport():
-    """Open one registered CC2 session; return ``(transport, password)``, the very credential the
-    MQTT handshake was met with, so an upload in the same session reuses the credential
-    discovery chose instead of re-guessing it. The password is captured by decorating the
-    production link with the transport's own factory — the address is still resolved and pinned
-    once inside open_transport, and nothing here opens a second lookup. This is also the single
-    seam tests use to stand a scripted fake session in place of a live printer. Never print or
-    return the password; it lives only in the returned object's headers from here on."""
+async def _cc2_open_transport(config: _cc2_transport.Cc2Config):
+    """Open one **fresh** registered CC2 session; return ``(transport, password)``, the very credential
+    the MQTT handshake was met with, so an upload in the same session reuses the credential discovery
+    chose instead of re-guessing it. The password is captured by decorating the production link with
+    the transport's own factory — the address is still resolved and pinned once inside open_transport,
+    and nothing here opens a second lookup. This is also the single seam tests use to stand a scripted
+    fake session in place of a live printer, and the pool's seam too: reuse lives in _CC2_POOL, so what
+    reaches here really is a new registration. Never print or return the password; it lives only in the
+    returned object's headers and in the pool's memory from here on."""
     seen: dict = {}
 
     def record(host, password, client_id):
         seen["password"] = password
         return _cc2_transport._aiomqtt_link(host, password, client_id)
 
-    transport = await _cc2_transport.open_transport(_cc2_transport.load_config(),
-                                                    link_factory=record)
+    transport = await _cc2_transport.open_transport(config, link_factory=record)
     return transport, seen.get("password")
+
+
+# The process's one CC2 session. Every CC2 tool call borrows it, because the printer's broker takes
+# about four clients and hands a slot back slowly: registering per call meant the fourth ordinary call
+# in a row was refused by an idle printer, and each refused call paid another registration to clean up.
+# The config is re-read on every borrow, so an address or code that moved between calls ends the
+# session instead of being talked through. Two MCP server processes still mean two sessions — see the
+# module's own note on what is not shared. The lambda is not decoration: it keeps the seam looked up
+# in this module at call time, so a test standing a scripted printer in `_cc2_open_transport` is
+# believed by the pool too instead of being bypassed by a reference bound at import.
+_CC2_POOL = _cc2_pool.Cc2SessionPool(_cc2_transport.load_config,
+                                     lambda config: _cc2_open_transport(config))
 
 
 @asynccontextmanager
 async def _cc2_session():
-    """Open one registered CC2 session, run the tool body, close it on every path. When opening
-    fails the session carries the sanitised refusal in .error, and no command was ever sent."""
+    """Borrow the shared CC2 session, run the tool body, give it back on every path. When there is no
+    session to borrow and none could be opened the session carries the sanitised refusal in .error, and
+    no command was ever sent. Giving a session back is not closing it: what closes is the pool, when a
+    session reports itself dead, when the configuration changes, when it has been idle past
+    _cc2_pool.IDLE_CLOSE_S with nobody holding it, or when the server shuts down."""
     sess = _Cc2Session()
+    handle: _cc2_pool.PooledSession | None = None
     try:
         try:
-            sess.transport, sess.password = await _cc2_open_transport()
+            handle = await _CC2_POOL.acquire()
         except PrinterError as e:
             sess.error = _cc2_err(e)
             if sess.error.get("error") == "not_configured":
@@ -1832,11 +2401,13 @@ async def _cc2_session():
                 # before any socket was opened. Every other failure in this module could only ever
                 # mean a network attempt, so this is the field that says it did not happen.
                 sess.error["printer_contacted"] = False
+        else:
+            sess.transport, sess.password = handle.transport, handle.password
         yield sess
     finally:
-        if sess.transport is not None:
+        if handle is not None:
             with contextlib.suppress(Exception):  # cleanup never masks the failure it followed
-                await sess.transport.close()
+                await handle.release()
 
 
 def _cc2_tray_word(tray) -> str:
@@ -2270,6 +2841,90 @@ async def cc2_print_history() -> dict:
 
 
 @mcp.tool()
+async def cc2_camera_snapshot():
+    """One picture from the configured CC2 printer's own camera, returned as an MCP image block with its
+    metadata beside it as text: a summary line naming its size, its type and where it came from, carrying
+    the single-viewer warning with it, and the sanitised metadata the adapter built as JSON. Exactly one
+    bounded HTTP GET of the stream at the configured printer's address, and the first complete JPEG frame
+    found in it. It sends the printer no command of any kind and opens no MQTT session, so a picture neither
+    starts nor stops anything, and takes none of the printer's limited client slots.
+
+    The address is **composed here, never advertised by the printer**, and that choice is deliberate. The
+    printer's own camera-address method is still a candidate rather than a tool: no reply of it has ever
+    been captured from this firmware, and the community sources describe it as a *toggle*, so asking it
+    could switch a stream on or off and nobody has settled which. Nothing on this path ever asks it
+    anything, never sends an enable flag, and every reply says that a picture from the stream proves a
+    stream answered and says nothing at all about that method in either direction. What is used instead is
+    the address the protocol manual, the Home Assistant integration and this printer's owner agree on: the
+    configured host (ORCA_CC2_URL, never hardcoded here) plus the camera's port and stream query. That host
+    goes through the transport's own resolve-and-pin step and this module's own guard, so it must be an IP
+    literal and a private LAN or loopback one — the same refusal that gates MQTT, with no resolver left
+    standing between the policy decision and the socket, no proxy honoured from the environment, and no
+    redirect followed (a 3xx is a refusal naming its status, not a hop somewhere unjudged).
+
+    Because a stream is a reply that never ends, the fetch is bounded in four places and none of them is
+    quiet: one request, never a second one after a timeout or a failure; a 10 second window measured from
+    the moment the request starts, enforced hard enough that a stream trickling one byte a second cannot
+    outrun it; at most 8 MiB consumed while hunting for a frame, counted **before** a chunk is appended or
+    accepted so a frame that only becomes reachable past that ceiling is refused with the ceiling named
+    rather than kept; and the kept frame capped at 2 MiB, the
+    same ceiling one image reply carries elsewhere on this server, refused with its size named and **never
+    truncated to fit** — half a JPEG is a corrupt picture, not a small one. Under 128 bytes between its
+    own start and end markers a frame is a marker pair rather than a picture and is refused as that.
+
+    What is skipped is as deliberate as what is kept. The first bytes off a live stream are usually the
+    tail of a frame the camera began before this server connected, and that tail is discarded rather than
+    reported as a truncated picture, so a snapshot here is always a whole frame or an honest refusal. The
+    hunt walks the frame's own segments instead of grabbing at the first end-of-image bytes it sees,
+    because an EXIF block can carry a nested thumbnail that ends with a marker of its own, and a naive
+    search would cut the real frame in half inside that block and hand the halves over as if they were
+    fine. The walk does not stop at the first scan either: a multi-scan (progressive) frame carries its
+    later tables and scans between its start and its end, and any of those segments' payloads can hold
+    end-of-image bytes of their own, so the hunt honours each segment's declared length and stops only at
+    the frame's own end marker. A marker that cannot legally appear where a scan's data should still be
+    running is a refused candidate, never a frame with a hole in it. The type comes from the bytes' own
+    signature, as it does for `cc2_file_thumbnail`.
+
+    Two things a picture is not. The protocol manual describes this camera stream as usually allowing a
+    **single viewer**, so opening it can be refused or can displace whoever was already watching — which
+    is said in the reply instead of being found out by asking twice. And this is the room the camera
+    sees, not the print: nothing here decodes, inspects or vouches for what is drawn in it, and it is not
+    a way to watch a bed. With no printer address configured (ORCA_CC2_URL) it reports `not_configured`
+    with `printer_contacted: false` and contacts nothing at all.
+
+    For what the printer says about itself use `cc2_status`; for its files `cc2_list_files`; for what a
+    file looks like to the printer's own app `cc2_file_thumbnail`."""
+    try:
+        shot = await _cc2_snapshot.capture_snapshot(http_factory=_cc2_snapshot_http_factory())
+    except PrinterError as e:      # no stream, a refusal, no frame: each says which, none was retried
+        out = _cc2_err(e)
+        if out.get("error") == "not_configured":
+            # Same fact the session helper states for every other CC2 tool, and just as true here: this
+            # refusal was made in this process from the configuration, before any address was resolved and
+            # before any socket was opened.
+            out["printer_contacted"] = False
+        return out
+    # The image goes to the client as an image, and the metadata the adapter built goes with it: the first
+    # text block is the line a person or a client that renders nothing reads (its size, its type, where it
+    # came from, and the single-viewer warning stated rather than discovered), and the second is the whole
+    # sanitised metadata as JSON, so nothing the adapter vouched for is quietly dropped on the way out. All
+    # three blocks are what an MCP client actually receives. shot.kind is read from the bytes' own signature
+    # by this adapter, so the image type is a fact about the bytes and not a label applied to them.
+    meta = _cc2_out(shot.as_dict())
+    warnings = [w for w in (meta.get("warnings") or []) if isinstance(w, str) and w]
+    lead_warning = warnings[0] if warnings else (
+        "no warning was carried by this reply: the adapter's own warnings list came back empty")
+    summary = (f"{meta.get('bytes')} bytes of {meta.get('image_kind')} from the CC2 camera at "
+               f"{meta.get('stream_host')}: the first complete frame of its stream, read once and "
+               f"released. No printer command was sent and no camera-address method was asked. "
+               f"WARNING: {lead_warning}")
+    return [Image(data=shot.data, format=shot.kind),
+            TextContent(type="text", text=summary),
+            TextContent(type="text", text="cc2_camera_snapshot metadata (JSON): "
+                                          + json.dumps(meta, sort_keys=True))]
+
+
+@mcp.tool()
 async def cc2_upload_gcode(
     path: Annotated[str, Field(description=(
         "Absolute path of the local sliced G-code file to upload, on the machine running this "
@@ -2409,8 +3064,8 @@ async def _cc2_control_tool(tool: str, action: str, confirm: bool) -> dict:
 
     Two-phase like the maintainer's Klipper MCP companion, and enforced here rather than hoped for
     in the client because a client can run with permission prompts off: a call that is not exactly
-    confirm=True opens a session, sends exactly one read-only 1002, and hands back the
-    confirm_required preview — no control method ever leaves the wire on a preview path, which the
+    confirm=True borrows the shared CC2 session and sends exactly one read-only 1002, and
+    hands back the confirm_required preview — no control method ever leaves the wire on a preview path, which the
     tests prove by watching the scripted wire. A confirmed call sends the one control method, once,
     through the adapter — which never resends an unanswered command — and reports its honest result.
     The confirmation is a decision-for-a-human device, not an access control: it exists so the call
@@ -2512,8 +3167,9 @@ async def _cc2_peripheral_tool(setting: str, params: dict, confirm: bool) -> dic
     Like every direct tool it can only reach a printer once one is configured; with no address set
     the session seam refuses in-process, before any method of any kind is sent.
 
-    A call that is not exactly ``confirm=True`` opens a session, sends exactly one read-only 1002,
-    and hands back the ``confirm_required`` preview carrying this call's own exact params — so what
+    A call that is not exactly ``confirm=True`` borrows the shared CC2 session and sends exactly one
+    read-only 1002, and hands back the ``confirm_required`` preview carrying this call's own exact
+    params — so what
     a confirmed call would do is on the record before anything is changed, and no control method
     ever leaves the wire on a preview path (the tests watch the recorded wire for exactly that). A
     confirmed call sends the one command once through the adapter, which never resends an unanswered
@@ -2562,10 +3218,12 @@ async def cc2_set_light(
     (the printer answered with an explicit error_code 0), refused (an explicit code kept) and
     ambiguous (no answer, an unreadable one, or a dropped session) are kept apart; a timeout is never
     called a refusal and the command is never resent. After an accepted or unanswered command one
-    read-only look reports what the printer says its light is doing now, apart from acceptance — and
-    if that look contradicts the command the printer accepted, a note says so plainly without
-    doubting the answer. Nothing is pre-checked: whether the light should be on is a human judgement,
-    and the printer refuses what it will not do with its own code."""
+    read-only look reports what the printer says its light is doing now, apart from acceptance — the
+    look is taken straight after the command, so what it can show is a status that has not caught up
+    rather than a light that stayed off, and cc2_status is the way to ask again. If that look
+    contradicts the command the printer accepted, a note says so plainly without doubting the answer.
+    Nothing is pre-checked: whether the light should be on is a human judgement, and the printer
+    refuses what it will not do with its own code."""
     try:
         want = _cc2_peripherals.parse_light(on)
     except PrinterError as e:
@@ -2605,10 +3263,12 @@ async def cc2_set_print_speed(
     error_code 0 — the printer did not refuse), refused (its code kept) and ambiguous (no answer, an
     unreadable one, or a dropped session) are kept apart, and a lost answer is never a reason to
     send again. After an accepted or unanswered command one read-only look reports the mode the
-    printer now reports, kept apart from acceptance; a number outside the documented four is
-    reported as that number with no name invented for it, and a disagreement between the accepted
-    command and the look after it is said out loud. Changing the mode mid-print changes how the rest
-    of the print runs — that is what the preview is for."""
+    printer now reports, kept apart from acceptance; the look is taken straight after the command, so
+    what it can show is a status that has not caught up rather than a mode that did not take, and
+    cc2_status is the way to ask again. A number outside the documented four is reported as that
+    number with no name invented for it, and a disagreement between the accepted command and the look
+    after it is said out loud. Changing the mode mid-print changes how the rest of the print runs —
+    that is what the preview is for."""
     try:
         want = _cc2_peripherals.parse_mode(mode)
     except PrinterError as e:
@@ -2621,8 +3281,9 @@ async def _cc2_temperature_tool(field: str, params: dict, confirm: bool) -> dict
     controls run. Like every direct tool it can only reach a printer once one is configured; with no
     address set the session seam refuses in-process, before any method of any kind is sent.
 
-    A call that is not exactly ``confirm=True`` opens a session, sends exactly one read-only 1002,
-    and hands back the ``confirm_required`` preview carrying this call's own exact params and the
+    A call that is not exactly ``confirm=True`` borrows the shared CC2 session and sends exactly one
+    read-only 1002, and hands back the ``confirm_required`` preview carrying this call's own exact
+    params and the
     ceiling it enforced — so what a confirmed call would do, and the bound that number was checked
     against, are both on the record before anything is changed, and no control method ever leaves the
     wire on a preview path (the tests watch the recorded wire for exactly that). A confirmed call
@@ -2709,8 +3370,8 @@ async def _cc2_auto_refill_tool(params: dict, confirm: bool) -> dict:
     Like every direct tool it can only reach a printer once one is configured; with no address set the
     session seam refuses in-process, before any method of any kind is sent.
 
-    A call that is not exactly ``confirm=True`` opens a session, sends exactly one read-only 2005
-    CANVAS read, and hands back the ``confirm_required`` preview carrying this call's own exact params
+    A call that is not exactly ``confirm=True`` borrows the shared CC2 session and sends exactly one
+    read-only 2005 CANVAS read, and hands back the ``confirm_required`` preview carrying this call's own exact params
     and the candidate label, so what a confirmed call would do is on the record before anything is
     changed and no command ever leaves the wire on a preview path (the tests watch the recorded wire
     for exactly that). A confirmed call sends the one 2004 command once through the adapter, which
@@ -2746,8 +3407,8 @@ async def cc2_set_auto_refill(
         "when nothing authorizes it, read them the preview first then."))] = False,
 ) -> dict:
     """Turn the configured CC2 printer's CANVAS auto-refill switch on or off with one boolean, and
-    read this before calling it: no CC2 has ever answered this command on this project, so every
-    reply says it is unverified. The shape is Elegoo's own, method 2004 carrying the one field
+    read this before calling it: the setting was changed and restored on one CC2, but automatic
+    refill during a print remains unverified. The shape is Elegoo's own, method 2004 carrying the one field
     auto_refill that the printer's own LAN web client sends and that the printer answers back in its
     CANVAS info, and that field is all this tool ever sends, so a call changes the switch and nothing
     else: not which tray is active, not a spool's filament info, no slot map. The older integration
@@ -2775,8 +3436,8 @@ async def cc2_set_auto_refill(
     printer says the flag is now, kept apart from acceptance, and a look that contradicts the command
     the printer accepted is said out loud without earning a second command.
 
-    What has not been established is the whole reason for the label: no CC2 has ever answered 2004 for
-    anyone on this project and no print has ever shown the flag doing its job, so every reply carries
+    What has not been established is whether the flag performs automatic refill during a print,
+    so every reply carries
     verified_on_this_printer false beside the sentence saying why. A refusal from this tool is worth
     recording for that reason: it is evidence about this firmware, not a broken printer."""
     try:
@@ -2876,6 +3537,14 @@ _TOOL_ANNOTATIONS: dict[str, tuple[str, bool, bool]] = {
     # captured from this firmware — a read can be a candidate for live verification, which is exactly
     # why 1037 (task detail) and 1038 (history delete) are absent instead of guessed at.
     "cc2_print_history": ("Read CC2 print history", True, False),
+    # The seventh CC2 read is a read of the printer's own camera stream: one bounded HTTP GET, no
+    # command, nothing written on the printer or on disk, and no MQTT session involved. It is the one CC2
+    # tool whose reply is an image rather than a table of facts, and it is a read because the printer keeps
+    # nothing of it. What it can cost somebody else is the stream's single viewer slot, which the reply
+    # warns about in words instead of hiding in a hint — annotations are advice, never a control. No
+    # idempotency hint: a second picture is harmless to the printer, and this server still never promises
+    # that a second request lands the same way.
+    "cc2_camera_snapshot": ("Take one picture from the CC2 camera", True, False),
     "cc2_upload_gcode": ("Upload G-code to the CC2 printer", False, False),
     "cc2_start_print": ("Start a print on the CC2 printer", False, False),
     "cc2_pause_print": ("Pause the CC2 print", False, False),
@@ -2910,7 +3579,7 @@ _TOOL_ANNOTATIONS: dict[str, tuple[str, bool, bool]] = {
 _OPEN_WORLD_TOOLS = frozenset({"get_printer_status", "wait_for_printer", "list_print_history",
                                "check_printer_match", "cc2_status", "cc2_list_files",
                                "cc2_printer_info", "cc2_file_detail", "cc2_file_thumbnail",
-                               "cc2_print_history",
+                               "cc2_print_history", "cc2_camera_snapshot",
                                "cc2_upload_gcode", "cc2_start_print", "cc2_pause_print",
                                "cc2_resume_print", "cc2_stop_print", "cc2_set_light",
                                "cc2_set_print_speed", "cc2_set_temperature",
@@ -2962,7 +3631,18 @@ def main() -> None:
     for w in allow_override_warnings():
         print(w, file=sys.stderr)  # stdout carries the MCP protocol; stderr reaches the client log
     import anyio
-    anyio.run(run_stdio, mcp._lowlevel_server)
+    anyio.run(_serve_stdio_then_close)
+
+
+async def _serve_stdio_then_close() -> None:
+    """Serve stdio, then hand the printer its MQTT slot back. The CC2 session lives on this loop, so
+    this is the only place its close can be awaited: a session left open across the exit is a client
+    the printer has to time out on its own, which is the slow part of the slot problem this server is
+    otherwise careful about. Never lets a teardown failure hide the reason the server stopped."""
+    try:
+        await run_stdio(mcp._lowlevel_server)
+    finally:
+        await _cc2_pool.close_pools([_CC2_POOL])
 
 
 if __name__ == "__main__":

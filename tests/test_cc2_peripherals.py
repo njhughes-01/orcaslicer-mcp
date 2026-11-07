@@ -493,6 +493,32 @@ async def test_every_note_of_every_outcome_fits_the_reply_cap():
     assert seen_any
 
 
+async def test_the_read_back_says_it_is_immediate_and_so_can_lag():
+    """The look after a peripheral command is taken straight after it, and nothing measured on any CC2
+    says how soon this printer's status reflects a command. So neither an accepted reply nor a
+    disagreement may be readable as a matched pair: each says how soon the look was taken and what
+    that can mean, and each still fits the cap the reply carries it through. Saying 'immediate' is the
+    honest version of a caveat nobody has data for — it describes this server's own timing, which is
+    the one thing here that is known."""
+    accepted = [await per.set_peripheral(scripted(status=frame_1002(led=1)), "light",
+                                         per.light_params(True)),
+                await per.set_peripheral(scripted(status=frame_1002(mode=3)), "speed", {"mode": 3})]
+    disagreeing = [await per.set_peripheral(scripted(status=frame_1002(led=0)), "light",
+                                            per.light_params(True)),
+                   await per.set_peripheral(scripted(status=frame_1002(mode=0)), "speed", {"mode": 3})]
+
+    for result in accepted:
+        assert result.status is per.job.ControlStatus.ACCEPTED, result.status
+        assert any("straight after the command" in n and "can report the printer as it was" in n
+                   for n in result.notes), result.notes
+    for result in disagreeing:
+        contra = [n for n in result.notes if "Note the disagreement" in n]
+        assert len(contra) == 1, result.notes
+        assert "immediate" in contra[0] and "lagging" in contra[0], contra[0]
+    for result in accepted + disagreeing:
+        assert all(len(n) <= job.NOTE_CAP for n in result.notes), result.notes
+
+
 async def test_no_address_no_token_rides_any_reply():
     tr = scripted(status=frame_1002())
     texts = []

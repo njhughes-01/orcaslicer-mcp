@@ -4,11 +4,14 @@ nothing here opens a socket. Protocol facts come from the community CC2 protocol
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import re
+import socket
 
+import aiomqtt
 import pytest
-from aiomqtt.exceptions import MqttConnectError
+from aiomqtt.exceptions import MqttCodeError, MqttConnectError
 
 from orcaslicer_mcp.printer import cc2_transport as cc2
 from orcaslicer_mcp.printer.errors import PrinterError
@@ -38,6 +41,7 @@ class FakeLink:
         self.params = {"host": host, "password": password, "client_id": client_id}
         self.subs: list[str] = []
         self.published: list[tuple[str, dict | str]] = []
+        self.calls: list[tuple[str, str]] = []  # ("subscribe"|"publish", topic) in arrival order
         self.closed = False
         self._queue: asyncio.Queue = asyncio.Queue()
 
@@ -48,10 +52,26 @@ class FakeLink:
     async def __aexit__(self, *exc):
         self.closed = True
 
-    async def subscribe(self, topics):
-        self.subs.extend([topics] if isinstance(topics, str) else topics)
+    async def subscribe(self, topic):
+        """paho's own contract, held on purpose: one bare topic string per call, or (topic, qos)
+        pairs — never a list of bare strings, which paho reads as pairs and answers with
+        `ValueError: too many values to unpack`. This fake used to accept any shape, which is how a
+        wrong shape reached a real printer with only generic errors to show for it; the real-client
+        pin is `tests/test_cc2_transport_mqtt.py`, and the strictness test below keeps this fake from
+        going soft again."""
+        self.calls.append(("subscribe", topic if isinstance(topic, str) else repr(topic)))
+        if isinstance(topic, str):
+            self.subs.append(topic)
+            return
+        for item in topic:
+            pair = (isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str)
+                    and isinstance(item[1], int) and not isinstance(item[1], bool))
+            if not pair:
+                raise ValueError(f"too many values to unpack (expected 2): {item!r}")
+            self.subs.append(item[0])
 
     async def publish(self, topic, payload):
+        self.calls.append(("publish", topic))
         self.published.append((topic, json.loads(payload) if isinstance(payload, str) else payload))
         await self.broker.on_publish(self, topic, self.published[-1][1])
 
@@ -76,12 +96,15 @@ class FakeLink:
 class FakeBroker:
     """`replies` scripts the registration answers per attempt ("ok", "fail", "too many clients",
     None = no answer; the last entry repeats). `auth_rc` refuses the MQTT connect. `responder`
-    answers command requests: a dict of method -> result, or a callable(link, request)."""
+    answers command requests: a dict of method -> result, or a callable(link, request).
+    `subscribe_raises` stands every link's subscribe in place with one that fails, to test the
+    failures a subscribe can be."""
 
-    def __init__(self, replies=None, auth_rc=None, responder=None):
+    def __init__(self, replies=None, auth_rc=None, responder=None, subscribe_raises=None):
         self.replies = ["ok"] if replies is None else list(replies)
         self.auth_rc = auth_rc
         self.responder = responder
+        self.subscribe_raises = subscribe_raises
         self.links: list[FakeLink] = []
         self.reg_attempts = 0
 
@@ -89,6 +112,12 @@ class FakeBroker:
         if self.auth_rc is not None:
             raise MqttConnectError(self.auth_rc)
         self.links.append(link)
+        if self.subscribe_raises is not None:
+            exc = self.subscribe_raises
+
+            async def failing(topic):
+                raise exc
+            link.subscribe = failing
 
     async def on_publish(self, link, topic, msg):
         sn = topic.split("/")[1]
@@ -716,3 +745,266 @@ async def test_a_failed_open_leaves_no_session_behind(replies, auth_rc):
         assert broker.links[0].closed
     await asyncio.sleep(0.06)
     assert len(asyncio.all_tasks()) == before  # no heartbeat or reader outlived the failed open
+
+
+# --------------------------------------------------------------------------- subscribe: the shape
+# the real client takes, and the failures that are ours
+
+
+async def test_the_reply_topics_are_subscribed_one_awaited_call_per_topic_before_asking():
+    """The 2026-11-04 fault, pinned at the fake: the transport asked for its two reply topics with
+    one list of bare strings, real paho answered ValueError, and every CC2 read came back as a
+    generic tool error. One awaited call per topic, both before the first publish, is the contract."""
+    broker = FakeBroker()
+    async with await open_session(broker) as t:
+        link = broker.links[0]
+        assert link.calls[:2] == [("subscribe", t.register_topic), ("subscribe", t.response_topic)]
+        assert all(isinstance(topic, str) for _, topic in link.calls[:2])  # never a list of strings
+        assert link.calls[2] == ("publish", f"elegoo/{SN}/api_register")  # reading is open, then ask
+
+
+async def test_the_fake_link_refuses_the_subscribe_shape_paho_refuses():
+    """A guard on the guard: if this fake ever agrees to a list of bare topic strings again, it has
+    stopped being a stand-in for paho and the fault it missed comes back."""
+    link = FakeLink(FakeBroker(), HOST, "pw", "0cli000001")
+    with pytest.raises(ValueError) as e:
+        await link.subscribe([f"elegoo/{SN}/a", f"elegoo/{SN}/b"])
+    assert "too many values to unpack" in str(e.value)
+    await link.subscribe(f"elegoo/{SN}/a")          # what paho takes: one topic string
+    await link.subscribe([(f"elegoo/{SN}/b", 0)])   # and what it also takes: (topic, qos) pairs
+    assert link.subs == [f"elegoo/{SN}/a", f"elegoo/{SN}/b"]
+
+
+@pytest.mark.parametrize("exc,code,reason,foreign", [
+    (MqttCodeError(4, "Could not subscribe to topic"), "not_reachable", "subscribe_lost",
+     "Could not subscribe to topic"),
+    (aiomqtt.MqttError("Operation timed out"), "not_reachable", "subscribe_lost",
+     "Operation timed out"),
+    (OSError(errno.ENETUNREACH, "Network is unreachable"), "not_reachable", "subscribe_lost",
+     "Network is unreachable"),
+    (ValueError("too many values to unpack (expected 2)"), "protocol_error", "subscribe_form",
+     "too many values to unpack"),
+    (TypeError("a string-like object is required"), "protocol_error", "subscribe_form",
+     "a string-like object is required"),
+])
+async def test_a_subscribe_that_cannot_be_taken_reports_its_own_kind(exc, code, reason, foreign):
+    broker = FakeBroker(subscribe_raises=exc)
+    before = len(asyncio.all_tasks())
+    with pytest.raises(PrinterError) as e:
+        await open_session(broker, heartbeat_interval_s=0.02)
+    err = e.value
+    assert err.code == code and err.details["reason"] == reason
+    assert foreign not in err.message and foreign not in (err.hint or "")  # never the client's words
+    assert cc2.ENV_URL in err.hint or "printer" in err.message.lower()
+    assert broker.reg_attempts == 0            # nothing at all was published to the printer
+    assert broker.links and broker.links[0].closed
+    await asyncio.sleep(0.05)
+    assert len(asyncio.all_tasks()) == before  # and no reader or heartbeat outlived the failed open
+
+
+async def test_a_wrong_topic_form_blames_this_server_not_the_printer():
+    """The shape fault is the one a printer's owner cannot fix, so the words must not imply they can."""
+    broker = FakeBroker(subscribe_raises=ValueError("too many values to unpack (expected 2)"))
+    with pytest.raises(PrinterError) as e:
+        await open_session(broker)
+    err = e.value
+    assert err.details["reason"] == "subscribe_form"
+    assert "fault in this server" in err.message and "not in the printer" in err.message
+    assert "nothing to change on the printer" in err.hint.lower()
+
+
+async def test_a_cancelled_subscribe_is_not_a_printer_failure():
+    broker = FakeBroker(subscribe_raises=asyncio.CancelledError())
+    before = len(asyncio.all_tasks())
+    with pytest.raises(asyncio.CancelledError):
+        await open_session(broker, heartbeat_interval_s=0.02)
+    assert broker.reg_attempts == 0
+    assert broker.links and broker.links[0].closed  # teardown still ran on the cancelled path
+    await asyncio.sleep(0.05)
+    assert len(asyncio.all_tasks()) == before
+
+
+async def test_a_lost_subscribe_ends_a_live_session_honestly():
+    broker = FakeBroker()
+    async with await open_session(broker, heartbeat_interval_s=0.02) as t:
+        exc = OSError(errno.ECONNRESET, "Connection reset by peer")
+
+        async def failing(topic):
+            raise exc
+        broker.links[0].subscribe = failing
+        with pytest.raises(PrinterError) as e:
+            await t.subscribe(f"elegoo/{SN}/{t.client_id}/status")
+        assert e.value.code == "not_reachable" and e.value.details["reason"] == "subscribe_lost"
+        assert "Connection reset by peer" not in e.value.message
+        assert t.last_error is not None  # the channel is admitted dead, never quietly retried
+        with pytest.raises(PrinterError):
+            await t.request(1002, timeout_s=0.2)
+
+
+async def test_a_refused_subscribe_ends_a_live_session_and_blames_no_one_else():
+    """paho's own refusal to queue a subscribe (no live connection to ask with) is a dead session,
+    said as one, and it is the transport's own ending — not a printer fault and not a retry."""
+    broker = FakeBroker()
+    async with await open_session(broker, heartbeat_interval_s=0.02) as t:
+        exc = MqttCodeError(4, "Could not subscribe to topic")
+
+        async def failing(topic):
+            raise exc
+        broker.links[0].subscribe = failing
+        with pytest.raises(PrinterError) as e:
+            await t.subscribe(f"elegoo/{SN}/{t.client_id}/status")
+        assert e.value.code == "not_reachable" and e.value.details["reason"] == "subscribe_lost"
+        assert "Could not subscribe to topic" not in str(e.value)
+        assert t.last_error is not None   # admitted dead: the next command is the caller's decision
+        assert broker.reg_attempts == 1   # and nothing extra was ever published on the session
+
+
+# --------------------------------------------------------------------------- failures that never
+# reach the wire: the lookup, the probe, the connect
+
+
+async def test_a_lookup_that_failed_is_our_refusal_not_the_resolvers_words(monkeypatch):
+    async def fail(host):
+        raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+    monkeypatch.setattr(cc2, "_lookup", fail)
+    with pytest.raises(PrinterError) as e:
+        await cc2.resolve_target("printer.example")
+    err = e.value
+    assert err.code == "not_reachable" and err.details["reason"] == "dns_failed"
+    assert err.details["errno"] == socket.EAI_NONAME     # the number is kept, the sentence is not
+    assert "printer.example" in err.message              # the configured word is ours to show
+    assert "Name or service not known" not in str(err) and "resolver" not in err.message.lower()
+    assert cc2.ENV_URL in err.hint
+
+
+async def test_a_lookup_with_no_route_says_no_route(monkeypatch):
+    async def fail(host):
+        raise OSError(errno.ENETUNREACH, "Network is unreachable")
+    monkeypatch.setattr(cc2, "_lookup", fail)
+    with pytest.raises(PrinterError) as e:
+        await cc2.resolve_target("printer.example")
+    assert e.value.code == "not_reachable" and e.value.details["reason"] == "no_route"
+    assert e.value.details["errno"] == errno.ENETUNREACH
+    assert "Network is unreachable" not in str(e.value)
+
+
+async def test_a_name_no_resolver_can_hold_is_a_configuration_fault(monkeypatch):
+    async def fail(host):
+        raise UnicodeError("label mismatch")
+    monkeypatch.setattr(cc2, "_lookup", fail)
+    with pytest.raises(PrinterError) as e:
+        await cc2.resolve_target("printer.example")
+    assert e.value.code == "not_configured"
+    assert "label mismatch" not in str(e.value)
+
+
+async def test_a_tool_session_never_sees_a_raw_gaierror(monkeypatch):
+    """The whole point of the mapping: `_cc2_session` catches PrinterError, so anything else reaching
+    a tool comes back as a generic 'Error executing tool' with nothing honest in it."""
+    async def fail(host):
+        raise socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+    monkeypatch.setattr(cc2, "_lookup", fail)
+    with pytest.raises(PrinterError):  # not gaierror, not ValueError: a printer refusal
+        await cc2.open_transport(config(url="printer.example"))
+
+
+@pytest.mark.parametrize("no,reason", [(errno.ENETUNREACH, "no_route"),
+                                       (errno.EHOSTUNREACH, "no_route"),
+                                       (errno.EACCES, "probe_blocked"),
+                                       (errno.EPERM, "probe_blocked"),
+                                       (errno.EINVAL, "probe_failed")])
+async def test_a_probe_this_machine_cannot_send_names_the_family(monkeypatch, no, reason):
+    async def boom(*args, **kwargs):
+        raise OSError(no, "the OS's own sentence about a syscall")
+    monkeypatch.setattr(asyncio.get_running_loop(), "create_datagram_endpoint", boom)
+    before = len(asyncio.all_tasks())
+    with pytest.raises(PrinterError) as e:
+        await cc2.discover(HOST, attempts=1)
+    err = e.value
+    assert err.code == "not_reachable" and err.details["reason"] == reason
+    assert err.details["errno"] == no
+    assert "the OS's own sentence" not in str(err) and HOST in err.message
+    if reason == "probe_blocked":
+        assert "not a printer setting" in err.hint  # it looks like a dead printer; it is not one
+    await asyncio.sleep(0.02)
+    assert len(asyncio.all_tasks()) == before       # a refused probe leaves no protocol behind
+
+
+async def test_async_datagram_error_is_reported_and_not_retried(monkeypatch):
+    calls = []
+
+    async def endpoint(factory, **kwargs):
+        protocol = factory()
+        calls.append(protocol)
+
+        class Transport:
+            def sendto(self, payload):
+                protocol.error_received(OSError(errno.EACCES, "private error text"))
+
+            def close(self):
+                pass
+
+        return Transport(), protocol
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "create_datagram_endpoint", endpoint)
+    with pytest.raises(PrinterError) as exc:
+        await cc2.discover(HOST, attempts=3)
+    assert exc.value.details["reason"] == "probe_blocked"
+    assert "private error text" not in str(exc.value)
+    assert len(calls) == 1
+
+
+async def test_a_silent_probe_is_still_a_timeout_retried_not_an_errno(monkeypatch):
+    """TimeoutError is an OSError in Python, so the mapping must not swallow the one failure the
+    manual says to try again: silence is retried up to the bounded attempts, then reported as such."""
+    calls = []
+
+    async def never_answered(host, payload, timeout_s):
+        calls.append(host)
+        raise TimeoutError
+    monkeypatch.setattr(cc2, "_udp_exchange", never_answered)
+    with pytest.raises(PrinterError) as e:
+        await cc2.discover(HOST, attempts=2)
+    assert e.value.details.get("reason") is None and e.value.code == "not_reachable"
+    assert "did not answer" in e.value.message and len(calls) == 2
+
+
+async def test_a_bare_oserror_from_anywhere_in_discovery_still_becomes_a_refusal(monkeypatch):
+    """Belt: `_udp_exchange` maps its own errnos; `discover` maps anyone else's, including a fake
+    seam's, so no printer tool can ever be handed a bare OSError."""
+    async def broken(host, payload, timeout_s):
+        raise OSError(errno.ENETDOWN, "Network is down")
+    monkeypatch.setattr(cc2, "_udp_exchange", broken)
+    with pytest.raises(PrinterError) as e:
+        await cc2.discover(HOST, attempts=1)
+    assert e.value.code == "not_reachable" and e.value.details["errno"] == errno.ENETDOWN
+    assert "Network is down" not in str(e.value)
+
+
+@pytest.mark.parametrize("exc,reason,foreign", [
+    (OSError(errno.ENETUNREACH, "Network is unreachable"), "no_route", "Network is unreachable"),
+    (OSError(errno.EACCES, "Permission denied"), "connect_denied", "Permission denied"),
+    (aiomqtt.MqttError("Timeout during connect"), "connect_failed", "Timeout during connect"),
+])
+async def test_a_connect_that_never_completes_says_which_kind(exc, reason, foreign):
+    broker = FakeBroker()
+
+    async def boom(link):
+        raise exc
+    broker.on_connect = boom
+    with pytest.raises(PrinterError) as e:
+        await open_session(broker)
+    assert e.value.code == "not_reachable" and e.value.details["reason"] == reason
+    assert foreign not in str(e.value)
+
+async def test_cancelled_reply_wait_removes_pending_request():
+    broker = FakeBroker(responder=lambda link, msg: None)
+    async with await open_session(broker) as t:
+        task = asyncio.create_task(t.request(1002))
+        while not t._pending:
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not t._pending

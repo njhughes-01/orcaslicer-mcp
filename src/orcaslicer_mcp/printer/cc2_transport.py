@@ -11,11 +11,17 @@ address — resolved once, before discovery, and pinned, so the same address ser
 and the MQTT session and a name whose answer changes between lookups can only mislead a lookup
 we never make (the design's defence against DNS rebinding). Public, multicast, unspecified,
 link-local and broadcast answers are refused; ambiguous or mixed answers fail closed; the
-configured name survives only as a display word, and only when it is safe to display."""
+configured name survives only as a display word, and only when it is safe to display.
+Honesty of failure: a lookup that produced no address, a probe this machine could not send, and a
+subscription the MQTT client could not take are each reported as their own refusal (no route, refused
+here, a session that could not ask, a topic form of our own making) with the OS's and paho's own words
+left out — never as raw OS text, and never as the stack trace an MCP layer can only call
+"Error executing tool". Cancellation is never one of those failures and is never swallowed."""
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import ipaddress
 import json
 import os
@@ -57,6 +63,12 @@ ENV_URL = "ORCA_CC2_URL"
 ENV_CODE = "ORCA_CC2_ACCESS_CODE"
 ENV_CODE_FILE = "ORCA_CC2_ACCESS_CODE_FILE"
 
+# The MQTT 5 numbers paho 2.x puts on a v3.1.1 CONNACK refusal in place of the wire byte, for the
+# three refusals this adapter acts on: bad credentials and 'not authorized' both mean the access
+# code, and 'server unavailable' is the printer's roster being full. Taken from paho's own numbering
+# (ReasonCodes for the Connack packet); everything else is reported by the number it arrived with.
+_CONNACK_MQTT5_TO_311 = {0x86: 4, 0x87: 5, 0x88: 3}
+
 _URL_HINT = ("Set " + ENV_URL + " in this MCP server's settings to the printer's private LAN "
              "address — a literal address is the steadiest — for example 192.0.2.10 "
              "(LAN Only Mode printers need no port).")
@@ -67,11 +79,28 @@ _CODE_HINT = ("Enter the printer's access code on its touchscreen (Settings → 
 _SN_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")  # the serial goes into MQTT topics — nothing else fits
 _SAFE_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,253}")  # nothing an error line fears being told
 
+_REACH_HINT = ("Is it switched on and on the same network as this server, in LAN Only "
+               "Mode? If its address changed, " + _URL_HINT)
+_BLOCKED_HINT = ("Something on this machine — a sandbox, a firewall, a network namespace — will "
+                 "not let the probe out. That is not a printer setting; it needs fixing here. "
+                 + _URL_HINT)
+
+# The families of OS failure worth telling apart, held as numbers only: what decides the words a
+# refusal gets is the errno, never the OS's own sentence about it (which names the peer, the
+# interface and the syscall and is nothing a caller can act on).
+_NO_ROUTE_ERRNOS = frozenset(n for n in (getattr(errno, name, None) for name in
+                                         ("ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EHOSTDOWN",
+                                          "ENETRESET")) if n is not None)
+_DENIED_ERRNOS = frozenset(n for n in (getattr(errno, name, None) for name in
+                                       ("EACCES", "EPERM")) if n is not None)
+
 
 class Cc2Error(PrinterError):
     """A CC2 transport failure: the same codes every printer tool speaks, plus a `reason` detail
     saying which CC2 thing went wrong (``busy``, ``client_limit``, ``refused``, ``timeout``,
-    ``lost``) so callers can act without parsing messages."""
+    ``lost``) so callers can act without parsing messages. The refusals that never reached the wire
+    — no route, a refused socket, a subscribe that could not be taken — are plain PrinterError with
+    their own reasons, named where they are built."""
 
 
 class Cc2RegistrationError(Cc2Error):
@@ -215,6 +244,58 @@ def _refusal(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str | None:
     return None if ip.is_private else "public"
 
 
+# --- OS failures, told as our own refusals --------------------------------------------------------
+
+
+def _os_refusal(e: BaseException, message: str, hint: str, reason: str) -> PrinterError:
+    """An OS-level network failure as the structured refusal every printer tool speaks: the message
+    is ours, the only thing kept from the failure is its errno number, and `reason` names the family
+    so a caller can act without parsing prose. The OS's own sentence is never carried — it recites
+    syscalls, interfaces and peers, and this file keeps credentials out of every message by
+    construction, which is easier to be sure of if foreign text never gets in at all."""
+    details: dict[str, Any] = {"reason": reason}
+    if getattr(e, "errno", None) is not None:
+        details["errno"] = e.errno
+    return PrinterError("not_reachable", message, hint=hint, **details)
+
+
+def _dns_failure(shown: str, e: OSError) -> PrinterError:
+    """A lookup that produced no address. Nothing was contacted: the failure happened before any
+    socket existed. The resolver's wording is left out — it repeats the name we asked about and its
+    own internals — while its errno number is kept, because 'that name does not exist' and 'the
+    resolver would not answer' are different things for whoever reads the report."""
+    if e.errno in _NO_ROUTE_ERRNOS:
+        return _os_refusal(e,
+                           f"The CC2 address {shown} cannot be looked up from this machine: it has no "
+                           "route to anywhere that could answer for it.",
+                           _REACH_HINT, "no_route")
+    return _os_refusal(e,
+                       f"The CC2 address {shown} could not be resolved to an address, so nothing was "
+                       "contacted.",
+                       _REACH_HINT, "dns_failed")
+
+
+def _probe_failure(e: OSError, host: str) -> PrinterError:
+    """A LAN discovery probe that never left this machine, so the printer was never asked anything.
+    Told apart by errno: no route to that address; a refusal by something *here* (a sandbox, a
+    firewall, a network namespace), which is worth naming because from the outside it looks exactly
+    like a dead printer; or a socket failure we can only report. Not retried: an errno that refuses
+    a socket does not change between attempts."""
+    if e.errno in _NO_ROUTE_ERRNOS:
+        return _os_refusal(e,
+                           f"The LAN discovery probe to the printer at {host} could not leave this "
+                           "machine: there is no route to that address from here.",
+                           _REACH_HINT, "no_route")
+    if e.errno in _DENIED_ERRNOS:
+        return _os_refusal(e,
+                           f"This machine refused to send the LAN discovery probe to the printer at "
+                           f"{host}, so the printer was never asked anything.",
+                           _BLOCKED_HINT, "probe_blocked")
+    return _os_refusal(e,
+                       f"The LAN discovery probe to the printer at {host} could not be sent.",
+                       _REACH_HINT, "probe_failed")
+
+
 @dataclass(frozen=True)
 class ResolvedTarget:
     """The one address every request goes to, pinned before anything leaves, and the configured
@@ -229,7 +310,9 @@ class ResolvedTarget:
 
 async def _lookup(host: str) -> list[str]:
     """One address lookup, over every family the resolver answers for — so a mixed answer cannot
-    hide a public record behind a private first pick. Repeat answers are the same address twice."""
+    hide a public record behind a private first pick. Repeat answers are the same address twice. A
+    resolver failure simply raises: `resolve_target` is the one that turns it into an honest refusal,
+    so no OS wording about a lookup escapes from here."""
     infos = await asyncio.get_running_loop().getaddrinfo(host, MQTT_PORT, type=socket.SOCK_DGRAM)
     return list(dict.fromkeys(str(info[4][0]) for info in infos))
 
@@ -256,7 +339,14 @@ async def resolve_target(host: str) -> ResolvedTarget:
                                "only to the private LAN or loopback address of the one printer it "
                                "serves.", hint=_URL_HINT)
         return ResolvedTarget(ip=str(literal))
-    answers = await _lookup(host)
+    try:
+        answers = await _lookup(host)
+    except UnicodeError:  # a name no resolver could be handed at all: a configuration fault
+        raise PrinterError("not_configured",
+                           f"The CC2 address {shown} is not a name a resolver can accept, so nothing "
+                           "was contacted.", hint=_URL_HINT) from None
+    except OSError as e:  # includes socket.gaierror: the resolver said no, or could not be reached
+        raise _dns_failure(shown, e) from None
     if not answers:
         raise PrinterError("not_configured",
                            f"The CC2 address {shown} resolves to no address at all.", hint=_URL_HINT)
@@ -318,10 +408,21 @@ async def _udp_exchange(host: str, payload: bytes, timeout_s: float) -> dict:
             if not fut.done():
                 fut.set_result(data)
 
-    transport, _proto = await loop.create_datagram_endpoint(Probe, remote_addr=(host, DISCOVERY_PORT))
+        def error_received(self, exc) -> None:
+            if not fut.done():
+                fut.set_exception(exc)
+
+    try:
+        transport, _proto = await loop.create_datagram_endpoint(Probe, remote_addr=(host, DISCOVERY_PORT))
+    except OSError as e:  # a connected probe that cannot even be opened: no route, or refused here
+        raise _probe_failure(e, host) from None
     try:
         transport.sendto(payload)
         data = await asyncio.wait_for(fut, timeout_s)
+    except TimeoutError:
+        raise                      # silence is discover()'s to retry; an errno is not
+    except OSError as e:           # TimeoutError is an OSError, so it is named first on purpose
+        raise _probe_failure(e, host) from None
     finally:
         transport.close()
     try:
@@ -386,11 +487,14 @@ async def discover(host: str, *, timeout_s: float = DISCOVERY_TIMEOUT_S,
             body = await _udp_exchange(target.ip, probe, timeout_s)
         except TimeoutError:
             continue
+        except OSError as e:
+            # Belt: whatever raised it, a bare errno must not escape a printer tool as a generic
+            # failure. `_udp_exchange` maps its own; this maps anyone else's, same honest words.
+            raise _probe_failure(e, target.ip) from None
         return _parse_discovery(target, body)
     raise PrinterError("not_reachable",
                        f"The printer at {target.shown} did not answer the LAN discovery probe.",
-                       hint="Is it switched on and on the same network as this server, in LAN Only "
-                            "Mode? If its address changed, " + _URL_HINT)
+                       hint=_REACH_HINT)
 
 
 # --- the session -----------------------------------------------------------------------------------
@@ -420,11 +524,26 @@ def _request_id() -> str:
     return "".join(secrets.choice("0123456789abcdef") for _ in range(16)) + format(int(time.time() * 1000), "x")
 
 
+def _reason_number(rc: Any) -> int | None:
+    """The number a paho return code stands for, in MQTT 3.1.1's own numbering where paho knows the
+    equivalent. paho 2.x hands a CONNACK refusal over as a v3.1.1 reason code carrying MQTT 5's
+    number — 0x86 'bad user name or password' on a wire byte of 4 — so reading `.value` alone made a
+    printer refusing our access code look like an unnamed connection refusal, which is this file's own
+    fault pattern: a refusal that arrives without its kind. Only the equivalences paho's numbering
+    makes certain are mapped; anything else keeps the number it came with, and anything with no
+    number at all is None, which the plain report says rather than guesses."""
+    if rc is None:
+        return None
+    number = rc.value if hasattr(rc, "value") else rc
+    if isinstance(number, bool) or not isinstance(number, int):
+        return None
+    return _CONNACK_MQTT5_TO_311.get(number, number)
+
+
 def _connect_refusal(e: MqttCodeError, host: str) -> PrinterError:
     """A CONNACK refusal, told apart the way the manual numbers them: 4/5 are credentials, 3 is
     the broker taking no more clients right now, the rest we can only report."""
-    rc = getattr(e, "rc", None)
-    rc = rc.value if hasattr(rc, "value") else rc
+    rc = _reason_number(getattr(e, "rc", None))
     if rc in (4, 5):
         return PrinterError("auth_rejected",
                             f"The printer at {host} refused the access code over MQTT.", hint=_CODE_HINT)
@@ -435,7 +554,66 @@ def _connect_refusal(e: MqttCodeError, host: str) -> PrinterError:
                             hint="Close other clients (the web interface, ElegooSlicer, Home "
                                  "Assistant) or wait a moment, then try again.")
     return PrinterError("not_reachable",
-                        f"The printer at {host} refused the MQTT connection (code {rc}).")
+                        f"The printer at {host} refused the MQTT connection"
+                        + ("." if rc is None else f" (code {rc})."))
+
+
+def _subscribe_failure(e: BaseException, host: str, *, kind: str) -> PrinterError:
+    """A subscription that never took, as the structured failure every printer tool speaks, because
+    the alternative is the MCP layer reporting a bare stack trace as 'Error executing tool'. `kind`
+    says which family we saw and decides the words, so each stays honest about what it is:
+
+    ``lost``       the session could not ask at all: an MQTT error (including paho's own refusal to
+                   queue a subscribe without a live connection), an OS error, or a timeout.
+    ``bad_form``   the topic shape handed to the MQTT client was not one it accepts — a list of bare
+                   topic strings is exactly this: paho reads a list as (topic, qos) pairs and raises
+                   ValueError unpacking a string. That is a fault in *this server*, never in the
+                   printer, and the message says so rather than blaming the printer's network.
+
+    A broker that answers a SUBSCRIBE with a failure code is a third family, and it is not visible
+    here: paho hands those codes back as a return value and stays connected. `_subscribe` says so to
+    its callers, and the real-client test pins it as a known limitation rather than a fix.
+
+    The exception's own text is never copied: paho's and the OS's wording recites internals nobody
+    can act on, and this file keeps credentials out of every message by construction."""
+    if kind == "bad_form":
+        return PrinterError("protocol_error",
+                            "This server could not ask the printer's broker for its own reply topics: "
+                            "the topic form handed to its MQTT client was not one the client accepts. "
+                            "This is a fault in this server, not in the printer, and no command was "
+                            "sent to the printer.",
+                            hint="There is nothing to change on the printer or on the network. Update "
+                                 "this MCP server to its current release; if it persists, report it "
+                                 "with the server's version and this moment.",
+                            reason="subscribe_form")
+    return PrinterError("not_reachable",
+                        f"The MQTT session to the printer at {host} could not subscribe to its reply "
+                        "topics.",
+                        hint="Is it switched on, in LAN Only Mode, and reachable from here? If its "
+                             "address changed, " + _URL_HINT,
+                        reason="subscribe_lost")
+
+
+def _connect_failure(e: BaseException, host: str) -> PrinterError:
+    """An MQTT connect that never completed. The errno family is named when there is one, because
+    'this machine has no route to that address' and 'something here refuses the connection' are not
+    'the printer hung up on us', and telling them apart is the whole value of a refusal. An MQTT
+    error carrying no errno (a handshake timeout, a client already closing) keeps the plain words."""
+    no = getattr(e, "errno", None)
+    if no in _NO_ROUTE_ERRNOS:
+        return _os_refusal(e,
+                           f"The printer at {host} could not be reached from this machine: there is no "
+                           "route to its address.",
+                           _REACH_HINT, "no_route")
+    if no in _DENIED_ERRNOS:
+        return _os_refusal(e,
+                           f"This machine refused the MQTT connection to the printer at {host}, so the "
+                           "printer was never contacted.",
+                           _BLOCKED_HINT, "connect_denied")
+    return PrinterError("not_reachable",
+                        f"The printer at {host} did not take the MQTT connection.",
+                        hint="Is it switched on, in LAN Only Mode, and reachable from here?",
+                        reason="connect_failed")
 
 
 class Cc2Transport:
@@ -484,6 +662,13 @@ class Cc2Transport:
         """The failure that ended this session, once there is one."""
         return self._dead
 
+    @property
+    def closed(self) -> bool:
+        """Has this session been closed? The pool asks before lending a session out: a closed one can
+        only refuse, and saying so here keeps "closed" and "died" two readable facts instead of one
+        guess."""
+        return self._closed
+
     def pong_age_s(self) -> float | None:
         """Seconds since the printer last said PONG (opening the session counts as a fresh start).
         The manual's own budget is 65 s before the printer drops a silent client."""
@@ -492,8 +677,38 @@ class Cc2Transport:
         return time.monotonic() - self._last_pong
 
     async def subscribe(self, topic: str) -> None:
-        """Take on another topic for the life of the session (the status pushes of later tasks)."""
-        await self._link.subscribe(topic)
+        """Take on another topic for the life of the session (the status pushes of later tasks). One
+        topic per awaited call, for the reason `_subscribe` gives."""
+        await self._subscribe(topic)
+
+    async def _subscribe(self, topic: str) -> None:
+        """One topic, asked for the way paho takes it: a single topic string per awaited call.
+
+        A list of bare topic strings is not a shape paho accepts — it reads a list as (topic, qos)
+        pairs and raises ValueError unpacking a string — so a list is never handed to the link here,
+        and the real-client test (`tests/test_cc2_transport_mqtt.py`) pins that against a real
+        broker, which the fake link could not: it accepted any shape, so the mistake reached a CC2
+        printer. Ordinary failures come back as structured errors; cancellation is re-raised
+        untouched so the caller's teardown is the caller's own.
+
+        One thing cannot be seen from here and is not pretended: paho answers a SUBACK carrying a
+        failure code by handing the codes back as a return value and staying connected, so a printer
+        that grants nothing looks exactly like a printer that has nothing to say — a registration or
+        request timeout, honest about the silence and not about the cause. The real-client test pins
+        that as a limitation rather than a fix."""
+        try:
+            await self._link.subscribe(topic)
+        except asyncio.CancelledError:
+            raise
+        except (aiomqtt.MqttError, OSError) as e:  # the session or the socket gave out on the way;
+            # MqttCodeError is an MqttError, so paho's own refusal to queue a subscribe without a
+            # live connection is this same honest ending, and it is named first so an older aiomqtt
+            # that also made it a ValueError cannot fall through to the topic-form branch below.
+            err = _subscribe_failure(e, self.host, kind="lost")
+            self._mark_dead("could no longer subscribe to its topics")
+            raise err from e
+        except (TypeError, ValueError) as e:       # a topic form the client will not take: ours
+            raise _subscribe_failure(e, self.host, kind="bad_form") from e
 
     async def request(self, method: int, params: dict | None = None,
                       *, timeout_s: float | None = None) -> dict:
@@ -531,6 +746,8 @@ class Cc2Transport:
                 "or may not have reached it: nothing was retried.",
                 hint="Read the printer's state before deciding anything about this command.",
                 reason="timeout", ambiguous=True) from None
+        finally:
+            self._pending.pop(rid, None)
 
     async def close(self) -> None:
         """End the session: heartbeat and reader stopped, the MQTT link released. Idempotent —
@@ -567,15 +784,15 @@ class Cc2Transport:
             raise _connect_refusal(e, disc.host) from e
         except (aiomqtt.MqttError, OSError) as e:
             await stack.aclose()
-            raise PrinterError("not_reachable",
-                               f"The printer at {disc.host} did not take the MQTT connection.",
-                               hint="Is it switched on, in LAN Only Mode, and reachable from here?") from e
+            raise _connect_failure(e, disc.host) from e
         t = cls(link, disc=disc, client_id=client_id, request_id=_request_id(), stack=stack,
                 heartbeat_interval_s=heartbeat_interval_s, request_timeout_s=request_timeout_s)
         try:
             # Read first, then ask: an answer that arrives while we are still subscribing must not
-            # fall on the floor.
-            await link.subscribe([t.register_topic, t.response_topic])
+            # fall on the floor. One awaited call per topic — see `_subscribe` for why a list is not
+            # an option — and both complete before the registration is published.
+            await t._subscribe(t.register_topic)
+            await t._subscribe(t.response_topic)
             t._start_reader()
             await t._register(registration_attempts, registration_retry_delay_s, sleep)
         except BaseException:

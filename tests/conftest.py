@@ -31,6 +31,19 @@ def _isolate_outcome_store(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_cc2_session_pool():
+    """The CC2 tools share one MQTT session per process, so the pool is process state and no test may
+    inherit it: a test that stands a scripted printer in the seam must not be handed another test's,
+    and no session may outlive the test that borrowed it. `forget` drops the pooled session without
+    closing it — every test's session is a scripted fake with nothing to release, and the closing
+    itself is what the pool's own tests (tests/test_cc2_pool.py) prove."""
+    from orcaslicer_mcp import server
+    server._CC2_POOL.forget()
+    yield
+    server._CC2_POOL.forget()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_printer_state(monkeypatch, tmp_path_factory):
     """The printer tools remember the last printer on disk and cache probes in memory.
     No test may read or write the real file or inherit another test's cache or settings."""

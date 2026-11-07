@@ -86,9 +86,9 @@ SET_WAIT_S = 10.0
 # Said in every reply, so the candidate label is a field a model reads rather than a docstring it
 # may not have loaded. It is inside the reply cap on purpose: the sanitiser caps strings at exactly
 # NOTE_CAP characters, and a caveat cut in half is the half that gets trusted.
-UNVERIFIED = ("No CC2 has ever answered method 2004 on this project — this tool is the first to ask "
-              "one, on Elegoo's own client's shape. Nothing here has been seen to take effect on a "
-              "real print, so a refusal is evidence about this firmware, not a broken printer.")
+UNVERIFIED = ("Method 2004 changed and restored the setting on one CC2. Automatic refill during "
+              "a print remains unverified; a refusal is evidence about the printer's firmware, "
+              "not a broken printer.")
 
 _ACCEPT_TAIL = ("What the flag does at the printer when a CANVAS tray runs out has never been "
                 "observed on this machine. The observed value is one separate read-only CANVAS look "
