@@ -229,7 +229,7 @@ async def test_a_reply_that_is_null_is_not_an_object_either():
     (f"http://{HOST}:8080/?action=stream", HOST, "lan", 8080),
     (f"https://{HOST}/stream", HOST, "lan", None),
     (f"rtsp://{HOST}:8554/live", HOST, "lan", 8554),
-    ("ws://10.88.88.136:8080/stream", "10.88.88.136", "lan", 8080),
+    ("ws://10.20.30.40:8080/stream", "10.20.30.40", "lan", 8080),
     ("wss://172.20.0.5/stream", "172.20.0.5", "lan", None),
     ("rtmp://10.0.0.9/live", "10.0.0.9", "lan", None),
     ("http://127.0.0.1:8080/", "127.0.0.1", "loopback", 8080),

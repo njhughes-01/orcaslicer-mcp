@@ -320,7 +320,7 @@ def fake_dns(monkeypatch, *answers):
     return calls
 
 
-@pytest.mark.parametrize("addr", ["192.0.2.10", "10.16.69.190", "172.16.5.5", "192.168.1.50",
+@pytest.mark.parametrize("addr", ["192.0.2.10", "10.20.30.40", "172.16.5.5", "192.168.1.50",
                                   "127.0.0.1", "::1", "fd12:3456::1", "[fd12:3456::1]"])
 async def test_private_literal_addresses_are_pinned_as_they_stand(monkeypatch, addr):
     calls = never_resolve(monkeypatch)
