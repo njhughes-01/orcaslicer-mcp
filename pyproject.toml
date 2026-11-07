@@ -1,10 +1,11 @@
 [project]
 name = "orcaslicer-mcp"
 version = "0.1.19"
-description = "Work a running OrcaSlicer from Claude or any MCP client: load models, tune settings, slice, and understand the result through per-feature breakdowns, setting explanations, and physics checks"
+description = "Community fork of OrcaSlicer MCP with direct Elegoo Centauri Carbon 2 printer controls"
 readme = "README.md"
 license = { text = "AGPL-3.0-only" }
 authors = [{ name = "Max Ellis" }]
+maintainers = [{ name = "Nathan Hughes" }]
 requires-python = ">=3.11"
 keywords = ["mcp", "orcaslicer", "3d-printing", "slicer", "claude", "model-context-protocol"]
 classifiers = [
@@ -18,9 +19,9 @@ classifiers = [
 dependencies = ["mcp>=2.2,<3", "anyio>=4.9", "httpx>=0.27,<1", "websockets>=12", "aiomqtt>=2.4,<3"]
 
 [project.urls]
-Homepage = "https://github.com/maxellis/orcaslicer-mcp"
-Repository = "https://github.com/maxellis/orcaslicer-mcp"
-Changelog = "https://github.com/maxellis/orcaslicer-mcp/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/njhughes-01/orcaslicer-mcp"
+Repository = "https://github.com/njhughes-01/orcaslicer-mcp"
+Upstream = "https://github.com/MaxEllis/orcaslicer-mcp"
 "OrcaSlicer MCP build (fork)" = "https://github.com/maxellis/OrcaSlicer"
 Funding = "https://buymeacoffee.com/maxellis"
 
