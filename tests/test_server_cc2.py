@@ -1672,6 +1672,7 @@ async def test_a_fan_speed_that_is_not_a_whole_percent_refuses_before_any_sessio
     assert out["error"] == "protocol_error" and out["reason"] == reason
     assert not no_open
     assert "0-100" in out["message"] or "0-100" in out["hint"]
+    assert out["verified_on_this_printer"] is False and "1030" in out["unverified"]
     json.dumps(out)
 
 
@@ -1680,6 +1681,165 @@ async def test_a_fan_value_that_is_not_a_number_at_all_refuses_before_any_sessio
     assert out["error"] == "protocol_error" and out["reason"] == "fan_percent_range"
     assert not no_open
     json.dumps(out)
+
+
+async def test_a_fan_refusal_keeps_the_fields_every_fan_reply_carries(no_open):
+    # a refusal IS a fan reply, and this is the reply that needs the caveat most: whoever just sent a
+    # bare 255 is whoever needs to be told which of the two scales the tool refused to pick between, so
+    # the sentence and its false ride along even though the answer came before a session existed
+    out = await srv.cc2_set_fan(model=255)
+    assert out["verified_on_this_printer"] is False
+    assert "has ever answered 1030" in out["unverified"]
+    assert out["state_checked"] is False and "print is running" in out["state_note"]
+    assert srv._cc2_fan.UNVERIFIED in out["unverified"]     # whole, not cut by the reply cap
+    json.dumps(out)
+
+
+async def test_a_fan_preview_and_a_fan_command_both_advertise_the_state_they_did_not_read(monkeypatch):
+    # the two-phase shape reads as a safety check, so the admission goes on both replies a caller sees
+    open_fake(monkeypatch, two_looks())
+    preview = await srv.cc2_set_fan(model=100)
+    assert preview["state_checked"] is False and preview["state_note"] == srv._cc2_fan.STATE_NOT_CHECKED
+    assert preview["preview"]["state_checked"] is False
+    confirmed = await srv.cc2_set_fan(model=100, confirm=True)
+    assert confirmed["state_checked"] is False
+    assert confirmed["state_note"] == srv._cc2_fan.STATE_NOT_CHECKED
+    json.dumps(preview) and json.dumps(confirmed)
+
+
+# ------------------------------------------------ the same bar, through the door a client uses
+#
+# Everything above calls the tool function the way Python does, which is a real path — a script that
+# imports this server is a caller — but it is not the path an MCP client takes. Between a client's
+# tools/call and that function sits the server's own argument model, built from the schema this tool
+# publishes, and an argument model in lax mode reads 1 out of `true` and 50 out of `50.0` before one
+# line of this module runs. That is how a control whose entire promise is *nothing moves until somebody
+# says yes* ends up moving on the string "true", and how `model: true` becomes 2.55 on the part-cooling
+# fan. So the bar is asserted at that door too, through the server's own tool manager, with the
+# recorded wire as the witness: a scripted printer is standing there, configured, and nothing arrives.
+
+def mcp_json(result) -> dict:
+    """The reply as an MCP client actually reads it: the server's own JSON text block, parsed."""
+    return json.loads(result.content[0].text)
+
+
+async def mcp_call(arguments: dict):
+    """One `tools/call` for `cc2_set_fan` through the server's own tool manager, argument model and
+    reply conversion included — the half a direct Python call of the tool function steps over."""
+    return await srv.mcp._tool_manager.call_tool("cc2_set_fan", arguments, context=None,
+                                                 convert_result=True)
+
+
+@pytest.mark.parametrize("arguments, says", [
+    ({"model": True}, "is a boolean"),
+    ({"model": False}, "is a boolean"),
+    ({"model": 50.0}, "not a whole number"),
+    ({"model": "50.0"}, "not a whole number"),
+    ({"model": "++5"}, "not a whole number"),
+    ({"model": "\uff15\uff10"}, "not a whole number"),   # full-width 50: isdigit() says yes, int() reads it
+    ({"model": "fast"}, "not a whole number"),
+    ({"auxiliary": 25.5}, "not a whole number"),
+    ({"chamber": 0.5}, "not a whole number"),
+], ids=["bool-true", "bool-false", "float", "decimal-text", "double-plus", "full-width",
+        "name", "aux-float", "chamber-half"])
+async def test_the_mcp_argument_model_cannot_be_coerced_into_a_fan_speed(arguments, says, monkeypatch):
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    transport = open_fake(monkeypatch, healthy_status(method_1002=FANS_1002,
+                                                      method_1030={"error_code": 0}))
+    with pytest.raises(ToolError) as caught:
+        await mcp_call(arguments)
+    said = str(caught.value)
+    assert "whole percent 0-100" in said and says in said
+    assert "Nothing was sent" in said
+    assert "percent 0-100" in said                       # the hint names the scale it wants instead
+    assert transport.methods() == [] and transport.opens == []   # the printer never heard of the call
+
+
+@pytest.mark.parametrize("confirm", ["true", "True", "yes", "on", "1", 1, 0, 1.0, None, "false"],
+                         ids=["true-word", "True-word", "yes", "on", "one-word", "int-1", "int-0",
+                              "float-1", "null", "false-word"])
+async def test_a_confirm_spelled_past_the_boolean_never_sends_a_fan_command(confirm, monkeypatch):
+    # the P1 this closes: `confirm is True` behind a lax model is not a guard, because the model turns
+    # "true" into True on the way in — so the guard is asserted where the value is still a string
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    transport = open_fake(monkeypatch, two_looks())      # a printer that WOULD answer 1030
+    with pytest.raises(ToolError) as caught:
+        await mcp_call({"model": 100, "confirm": confirm})
+    said = str(caught.value)
+    assert "JSON booleans true or false" in said and "Nothing was sent" in said
+    assert "not a yes" in said
+    assert 1030 not in transport.methods()
+    assert transport.methods() == [] and transport.opens == []
+
+
+async def test_the_mcp_door_still_reads_whole_number_text_and_still_only_previews(monkeypatch):
+    # the strictness is about coercion, not about refusing text a client legitimately sends as a string:
+    # "50" is a whole percent and still reaches the preview, and a preview is still only a read
+    transport = open_fake(monkeypatch, healthy_status(method_1002=FANS_1002,
+                                                      method_1030={"error_code": 0}))
+    out = mcp_json(await mcp_call({"model": "50"}))
+    assert out["confirm_required"] is True
+    assert out["preview"]["will_send"]["params"] == {"fan": 127.5}
+    assert out["preview"]["asked_percent"] == {"fan": 50}
+    assert transport.methods() == [srv._cc2_state.METHOD_STATUS]
+
+
+async def test_the_mcp_door_sends_on_a_real_boolean_confirm_exactly_once(monkeypatch):
+    # the other half: the validator must not have made the confirmed path unreachable. Three requests,
+    # one of each, on the door a client actually drives.
+    transport = open_fake(monkeypatch, two_looks())
+    out = mcp_json(await mcp_call({"model": 100, "confirm": True}))
+    assert out["status"] == "accepted" and out["accepted"] is True
+    assert out["sent"] == {"fan": 255} and out["asked_percent"] == {"fan": 100}
+    assert transport.methods() == [1002, 1030, 1002]
+    assert out["verified_on_this_printer"] is False and out["state_checked"] is False
+
+
+async def test_a_fan_refusal_at_the_mcp_door_carries_the_scale_caveat_too(monkeypatch):
+    # 255 is a legal integer for the schema and this tool's own refusal at the printer's door, and it is
+    # exactly the number whose scale is in dispute — the caveat has to survive the reply conversion
+    open_fake(monkeypatch, healthy_status(method_1002=FANS_1002, method_1030={"error_code": 0}))
+    out = mcp_json(await mcp_call({"model": 255}))
+    assert out["error"] == "protocol_error" and out["reason"] == "fan_percent_range"
+    assert out["verified_on_this_printer"] is False and "1030" in out["unverified"]
+    assert out["state_checked"] is False
+    assert srv._cc2_fan.STATE_NOT_CHECKED == out["state_note"]   # whole through the sanitiser
+
+
+async def test_under_a_one_letter_code_a_fan_reply_still_names_the_fields_it_actually_sent(
+        monkeypatch):
+    """The reply the fan tool promises is a record of the frame that went out, and the credential pass
+    over key names is the one thing that could quietly rewrite that record: the access code is whatever
+    the printer's LAN happens to use, and a one-letter code is a substring of `fan`, `aux_fan` and
+    `box_fan`, of `state_checked` and `state_note`, and of `asked_percent`'s own keys. A preview and a
+    confirmed reply are both checked here, because it is the params block a caller compares against
+    their firmware's answer, and a key that arrives as `f<redacted>n is a key nobody can compare."""
+    def keys_of(value):
+        if isinstance(value, dict):
+            for key, inner in value.items():
+                yield key
+                yield from keys_of(inner)
+        elif isinstance(value, list):
+            for inner in value:
+                yield from keys_of(inner)
+
+    monkeypatch.setattr(srv, "_cc2_configured_code", lambda: "a")
+    open_fake(monkeypatch, healthy_status(method_1002=FANS_1002))     # 1030 unscripted: preview only
+    preview = await srv.cc2_set_fan(model=100)
+    open_fake(monkeypatch, two_looks())                               # a fresh printer for the command
+    confirmed = await srv.cc2_set_fan(model=100, confirm=True)
+    for reply in (preview, confirmed):
+        keys = set(keys_of(reply))
+        assert all("<redacted>" not in key for key in keys), sorted(keys - srv._CC2_REPLY_KEYS)
+    assert preview["preview"]["will_send"]["params"] == {"fan": 255}
+    assert preview["preview"]["asked_percent"] == {"fan": 100}
+    assert confirmed["sent"] == {"fan": 255}
+    assert confirmed["asked_percent"] == {"fan": 100}
+    assert confirmed["observed_fan_raw"] == {"model": 255, "auxiliary": 33, "chamber": 0}
+    assert confirmed["state_checked"] is False and confirmed["state_note"]
+    json.dumps(preview) and json.dumps(confirmed)
 
 
 # ------------------------------------------------- the CANVAS auto-refill switch (2004) — a labelled

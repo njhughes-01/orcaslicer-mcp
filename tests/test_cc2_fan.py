@@ -129,7 +129,7 @@ def timeout() -> PrinterError:
 
 
 @pytest.mark.parametrize("value,want", [(0, 0), (1, 1), (50, 50), (100, 100), ("50", 50),
-                                        (" 100 ", 100)])
+                                        (" 100 ", 100), ("+50", 50)])
 def test_a_whole_percent_reads_however_it_is_spelled(value, want):
     assert fan.parse_percent(value, "model") == want
 
@@ -147,6 +147,73 @@ def test_anything_that_is_not_a_whole_percent_refuses(bad):
     assert caught.value.details["reason"] == "fan_percent_range"
     assert "Nothing was sent" in caught.value.message
     assert "percent 0-100" in caught.value.hint
+
+
+@pytest.mark.parametrize("bad", ["++5", "+-5", "5 0", "5_0", "0x10", "\uff15\uff10", "\u0665\u0660",
+                                 "50.0", "1e2", "50,"],
+                         ids=["double-plus", "plus-minus", "inner-space", "underscore", "hex",
+                              "full-width-50", "arabic-indic-50", "decimal-text", "exponent",
+                              "trailing-comma"])
+def test_text_that_only_looks_like_a_percent_refuses_with_this_modules_error(bad):
+    # `str.isdigit()` answers yes to '\u0665' and to '\uff15\uff10' and `int()` then reads them happily,
+    # while `lstrip("+")` in front of a digit test handed `"++5"` straight to `int()`, which raised its
+    # own `ValueError` out of a function whose whole contract is a PrinterError naming the two scales.
+    # A raw ValueError reaching a reply is a crash where a caller was promised a reason and "nothing was
+    # sent", so these spellings refuse, and refuse in this module's words: the digits a percent may be
+    # written in are the ASCII ones this module can spell back in its own refusal.
+    with pytest.raises(PrinterError) as caught:
+        fan.parse_percent(bad, "model")
+    assert caught.value.code == "protocol_error"
+    assert caught.value.details["reason"] == "fan_percent_range"
+    assert "Nothing was sent" in caught.value.message
+    assert "percent 0-100" in caught.value.hint
+
+
+@pytest.mark.parametrize("bad", [True, False, 0.0, 50.0, 100.5, "50.0", "++5", "\uff15\uff10",
+                                 "fast", "50%"],
+                         ids=["bool-true", "bool-false", "float-zero", "float-50", "float-100.5",
+                              "decimal-text", "double-plus", "full-width-50", "name",
+                              "percent-suffix"])
+def test_the_schema_door_refuses_what_lax_coercion_would_turn_into_a_percent(bad):
+    # the shape this tool publishes is `{"type": "integer"}`, and an argument model in lax mode reads 1
+    # out of `true` and 50 out of `50.0` before this module sees anything — so `model=true` would put
+    # 2.55 on the part-cooling fan and a float would quietly become a percent. This is the same bar run
+    # one layer earlier, on the value while it is still the caller's own.
+    with pytest.raises(PrinterError) as caught:
+        fan.check_percent_input(bad)
+    assert caught.value.code == "protocol_error"
+    assert caught.value.details["reason"] == "fan_percent_type"
+    assert "Nothing was sent" in caught.value.message
+    assert "percent 0-100" in caught.value.hint
+
+
+@pytest.mark.parametrize("ok", [0, 1, 50, 100, "50", " 100 ", "+50", 101, 255, None])
+def test_the_schema_door_passes_through_what_the_printers_door_decides(ok):
+    # this door decides spelling, not the number: 101 and 255 are the range's problem, refused by
+    # parse_percent with the fan's own name in the sentence, and whole-number text is read on purpose
+    assert fan.check_percent_input(ok) is ok
+
+
+@pytest.mark.parametrize("bad", ["true", "True", "yes", "on", "1", 1, 0, 1.0, None, "", [True]],
+                         ids=["true-word", "True-word", "yes", "on", "one-word", "int-1", "int-0",
+                              "float", "missing", "empty", "list"])
+def test_a_confirm_that_is_not_a_json_boolean_is_never_a_yes(bad):
+    # `confirm is True` behind a lax argument model is not the guard it looks like: the schema says
+    # boolean and the model happily reads `"true"`, `"yes"`, `"on"` and `1` as true, which is how a
+    # two-phase control whose entire job is that nothing moves until somebody says yes gets typed past.
+    # A confirmation this server cannot read is refused, and the message names what it was given.
+    with pytest.raises(ValueError) as caught:
+        fan.strict_confirm(bad)
+    said = str(caught.value)
+    assert "JSON booleans true or false" in said
+    assert "Nothing was sent" in said
+    assert "not a yes" in said
+
+
+@pytest.mark.parametrize("ok", [True, False])
+def test_a_real_boolean_confirm_survives_the_validator_untouched(ok):
+    # the second lock stays: whatever reaches the tool body is still checked with `confirm is True`
+    assert fan.strict_confirm(ok) is ok
 
 
 @pytest.mark.parametrize("percent,want", [(0, 0), (20, 51), (100, 255), (10, 25.5), (50, 127.5),
@@ -234,6 +301,39 @@ async def test_the_preview_carries_the_printers_own_numbers_without_a_unit_claim
     assert preview["readback_unit"] == fan.READBACK_UNIT
     assert "No unit" in fan.READBACK_UNIT
     assert not any("percent" in k for k in preview["fans_now_raw"])
+
+
+async def test_the_preview_says_it_checked_nothing_about_the_moment():
+    # a two-phase control reads as a safety check, so a preview that stays silent about the print state
+    # it did not read would be read as a clean bill of health. What it carries instead is the truth:
+    # nothing about the moment was checked, and `cc2_status` is where the state lives.
+    t = scripted()
+    out = await fan.read_preview(t, {"model": 100})
+    assert out["state_checked"] is False and out["state_note"] == fan.STATE_NOT_CHECKED
+    assert out["preview"]["state_checked"] is False
+    assert out["preview"]["state_note"] == fan.STATE_NOT_CHECKED
+    assert "print is running" in fan.STATE_NOT_CHECKED
+    assert "cc2_status" in fan.STATE_NOT_CHECKED
+    # and it is a decision, not a missing gate: the sentence says the preview is not evidence of safety
+    assert "never evidence" in fan.STATE_NOT_CHECKED
+
+
+async def test_a_command_reply_carries_the_same_two_admissions_as_a_preview():
+    # a confirmed call is where a person could most easily believe the machine was checked, so the
+    # admission is on the reply the command earns as well as on the preview that preceded it
+    out = (await fan.set_fan(scripted(), {"model": 100})).as_dict()
+    assert out["state_checked"] is False and out["state_note"] == fan.STATE_NOT_CHECKED
+    assert out["verified_on_this_printer"] is False
+
+
+def test_a_refusal_before_a_session_exists_still_carries_what_every_fan_reply_carries():
+    # the four fields are this tool's promise on every reply, and a pre-session refusal is exactly the
+    # reply that needs the scale caveat: whoever just sent a bare 255 is whoever needs to be told which
+    # of the two scales the tool refused to pick between
+    keys = fan.refusal_keys()
+    assert set(keys) == set(fan.FAN_REFUSAL_KEYS)
+    assert keys["verified_on_this_printer"] is False and keys["state_checked"] is False
+    assert keys["unverified"] == fan.UNVERIFIED and keys["state_note"] == fan.STATE_NOT_CHECKED
 
 
 async def test_an_absent_fans_block_is_unknown_rather_than_zero():
@@ -520,7 +620,7 @@ def test_the_live_test_recipe_names_the_edits_a_real_one_requires():
 async def test_every_authored_string_fits_the_direct_tools_reply_cap():
     texts = [fan.UNVERIFIED, fan.SCALE_NOW, fan.READBACK_UNIT, fan.CONTRADICT.format(
         fan="model", value=0), fan.OBSERVE_UNKNOWN_NOTE, fan.PRE_READ_LOST_NOTE, fan._AT_LEAST_ONE,
-        job.PREVIEW_HOW]
+        fan.STATE_NOT_CHECKED, job.PREVIEW_HOW]
     texts += [n for n in (await fan.set_fan(scripted(), {"model": 100})).notes]
     texts += [n for n in (await fan.set_fan(scripted(command={"error_code": 1003}),
                                             {"model": 100})).notes]

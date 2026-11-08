@@ -1,14 +1,26 @@
 """CC2 fan control (method 1030), exposed as the ``cc2_set_fan`` tool — and still not claimed to
 work. What was true of it as an internal candidate is true of it as a tool, and is said in every
 reply rather than assumed away: no CC2 has ever answered 1030 for this project, so the fan scale on
-any given firmware is unproven. ``verified_on_this_printer`` is false in every reply with the
-sentence explaining why beside it, the preview puts the wire formula and this call's own numbers on
-the record before anything is sent, the argument bar refuses a number that is not the official UI's
-percent, and the read-back hands back the printer's numbers exactly as it answered them, with no
+any given firmware is unproven. ``verified_on_this_printer`` is false in every reply, refusals
+included (a caller who just typed a bare 255 is exactly the caller who needs the sentence beside it),
+the preview puts the wire formula and this call's own numbers on the record before anything is sent, the
+argument bar refuses a number that is not the official UI's percent at both doors it can be entered
+through, and the read-back hands back the printer's numbers exactly as it answered them, with no
 unit attached. It is a tool rather than a drawer because the disagreement below is precisely what a
 controlled live test settles, and a test with one already-checked frame to send beats one where
 somebody invents a frame at the console; ``tests/test_cc2_fan.py`` pins that posture, and
-``tests/test_server_cc2.py`` pins the tool's two phases at the tool layer.
+``tests/test_server_cc2.py`` pins the tool's two phases at the tool layer AND through the real MCP
+argument validation, because the published schema is a second door, and lax coercion at that door would
+otherwise let ``confirm="true"`` and ``model=true`` walk past the bar described below.
+
+WHAT THE PREVIEW DOES NOT SAY, said here because a two-phase control is read as a safety check. A
+preview carries the fans' own numbers and this call's arithmetic and nothing else: it does not report
+whether a print is running or whether this fan should be running at this moment, so every fan reply —
+preview, command and pre-session refusal alike — carries ``state_checked: false`` with the sentence that
+says so. That is a decision, not an unfinished gate: the slicer commands part cooling mid-print, so an
+idle gate inside this tool would break the fan's actual job, and no first-party source conditions 1030
+on the machine being idle. The judgment stays with the person, with ``cc2_status`` as the read that
+carries the state.
 
 WHY THE SCALE IS STILL UNPROVEN. The three first-party sources do not agree about the number that rides
 ``fan``/``aux_fan``/``box_fan``, and none of them is this printer:
@@ -59,6 +71,7 @@ never on a dead session. Nothing here contacts a printer, a network or a credent
 the pinned session, and no note or reply carries an address, a serial or a token."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 from typing import Any
@@ -84,6 +97,11 @@ SET_WAIT_S: float = 10.0
 
 PERCENT_MAX = 100                 # the official widget's own ceiling; nothing scales it again
 WIRE_MAX = 255                    # the number that percent becomes under the UI's arithmetic
+
+# Whole-number text, ASCII digits only, at most one leading `+` — see parse_percent for why `isdigit()`
+# is not this test ('٣' and '１２３' pass it and int() reads them) and why `lstrip('+')` before a digit
+# test is not either ('++5' walks straight into int() and raises the wrong exception).
+_PERCENT_TEXT = re.compile(r"\+?[0-9]+\Z")
 
 # Every authored string stays under the direct tools' reply cap (job.NOTE_CAP), asserted in
 # tests/test_cc2_fan.py, so nothing a future registration says gets cut mid-sentence.
@@ -116,6 +134,16 @@ _AT_LEAST_ONE = (
 PRE_READ_LOST_NOTE = (
     "The status read taken BEFORE the fan command did not land, so there is no earlier number to "
     "compare the fans against: every 'changed' below is unknown, not a number that stayed put."
+)
+# Said in every reply, preview and command alike, because the one thing this control does NOT look at
+# is the thing a person might assume a two-phase control looked at. It is not an idle gate on purpose:
+# the slicer commands part cooling mid-print, so refusing while a print runs would break the fan's own
+# job, and no first-party source conditions 1030 on the machine being idle. What is owed instead is the
+# truth — nothing was checked — beside the tool that does check.
+STATE_NOT_CHECKED = (
+    "Nothing here has checked whether a print is running or whether this fan should be running now, "
+    "and no source conditions 1030 on the machine being idle: a preview is never evidence the moment "
+    "is safe. Read cc2_status for the state."
 )
 
 
@@ -152,6 +180,8 @@ class Cc2FanResult:
             "observed_fan_raw": dict(seen.get("raw") or {}),
             "observed_fan_changed": dict(seen.get("changed") or {}),
             "readback_unit": READBACK_UNIT,
+            "state_checked": False,
+            "state_note": STATE_NOT_CHECKED,
             "verified_on_this_printer": self.verified_on_this_printer,
             "unverified": UNVERIFIED,
             "notes": list(self.notes),
@@ -169,11 +199,17 @@ def parse_percent(value: Any, fan: str) -> int:
     100 or a name. Refused before the printer is asked, with the scale named, because guessing which
     of the two competing scales a bare 127 was meant in is exactly the guess this module may not
     make. A caller holding a 0-255 number converts it to a percent deliberately, out loud, and says
-    so; this never accepts one as a percent and never accepts one as a wire value."""
+    so; this never accepts one as a percent and never accepts one as a wire value.
+
+    WHAT COUNTS AS TEXT, pinned because `str.isdigit()` is not the question. The digit test is ASCII
+    only, and one optional leading `+`: `"٣"` and `"１２３"` answer `isdigit()` yes and `int()` reads
+    them, and `lstrip("+")` before a `isdigit()` left `"++5"` to reach `int()` and raise its own
+    `ValueError` out of a function whose whole contract is a `PrinterError` that names the scale. A
+    percent this tool can repeat back in its own refusal is written in the digits it can spell."""
     number: int | None = None
     if isinstance(value, int) and not isinstance(value, bool):
         number = value
-    elif isinstance(value, str) and value.strip().lstrip("+").isdigit():
+    elif isinstance(value, str) and _PERCENT_TEXT.fullmatch(value.strip()):
         number = int(value.strip())
     if number is None or not 0 <= number <= PERCENT_MAX:
         raise PrinterError(
@@ -258,6 +294,73 @@ def asked_percent(values: dict[str, Any]) -> dict:
             for fan, value in values.items() if value is not None}
 
 
+def check_percent_input(value: Any) -> Any:
+    """The argument bar applied to a value BEFORE anything coerces it — the shape the MCP schema
+    validates, not the shape a Python call hands over. ``parse_percent`` refuses a float and a bool, and
+    it does refuse them when this module is called from Python; what the tool actually publishes is
+    ``{"type": "integer"}``, and an argument model in lax mode turns ``true`` into ``1`` and ``50.0``
+    into ``50`` before any of this module's code runs, so ``model=true`` would send 2.55 to the part fan
+    and a float would quietly become a percent. This is the same bar, run one layer earlier, so the value
+    that reaches the bar is still the caller's own. Accepted values pass through untouched — whole-number
+    text stays text, because ``parse_percent`` reads that on purpose and this is not the place deciding
+    the number. Refusals are this module's own ``PrinterError``, so the sentence naming the two scales is
+    the same one whichever door a caller came through; the fan's own name is added by ``parse_percent``,
+    which runs again on whatever survives here."""
+    if isinstance(value, bool):
+        why = "is a boolean, not a speed"
+    elif isinstance(value, float):
+        why = "is not a whole number"
+    elif isinstance(value, str) and not _PERCENT_TEXT.fullmatch(value.strip()):
+        # Text is welcome (some clients send every argument as text) but only in the spelling
+        # parse_percent can read: "50.0" would otherwise be coerced to 50 by the argument model, which
+        # is the same quiet guess as accepting a float.
+        why = "is not a whole number"
+    else:
+        return value
+    raise PrinterError(
+        "protocol_error",
+        f"Fan speed must be a whole percent 0-{PERCENT_MAX}; {str(value)[:40]!r} {why}. "
+        "Nothing was sent.",
+        hint=f"Pass each fan as a percent 0-100, the way Elegoo's own LAN control takes it. "
+             f"{_AT_LEAST_ONE}",
+        reason="fan_percent_type")
+
+
+# The refusal a fan argument earns, in the fields every fan reply carries. A refusal is a fan reply:
+# a caller who just typed a bare 255 is precisely the caller who needs to be told which scale the tool
+# did not assume, and a reply that drops the caveat at exactly that moment is a caveat that never fires.
+FAN_REFUSAL_KEYS = ("verified_on_this_printer", "unverified", "state_checked", "state_note")
+
+
+def refusal_keys() -> dict:
+    """The four fields every fan reply carries, for the paths that answer before a session exists."""
+    return {"verified_on_this_printer": False, "unverified": UNVERIFIED,
+            "state_checked": False, "state_note": STATE_NOT_CHECKED}
+
+
+def strict_confirm(value: Any) -> bool:
+    """``confirm`` as the two-phase guard actually needs it: a JSON boolean, or nothing.
+
+    ``confirm is True`` behind the argument model is not the guard it looks like. The schema says
+    ``{"type": "boolean"}`` and an argument model in lax mode reads ``"true"``, ``"yes"``, ``"1"``, ``1``
+    and ``"on"`` as true — so a caller, or a client with a text field between the user and the wire,
+    could spell its way past a two-phase control whose whole job is that nothing moves until somebody
+    says yes. Refusing is the honest direction here: a confirmation this server cannot read is not a
+    yes, and the reply says so and names the value it was given, so the caller can fix the spelling
+    rather than re-asking a question that was already answered.
+
+    This is a validator rather than a value: it runs on the raw argument before coercion, which is the
+    only moment the difference between ``true`` and ``"true"`` still exists. The tool's own
+    ``confirm is True`` check stays where it is — it is the second lock, and a Python caller that
+    imports this module still has to hand it a real ``True``."""
+    if not isinstance(value, bool):
+        raise ValueError(
+            "confirm must be the JSON booleans true or false, exactly as the schema types them; "
+            f"{str(value)[:40]!r} is a {type(value).__name__}. Nothing was sent. A fan confirmation "
+            "this server cannot read is not a yes: re-send with confirm as a real boolean.")
+    return value
+
+
 # --------------------------------------------------------------------------- the read-back
 
 
@@ -319,13 +422,17 @@ def _contradiction_note(sent: dict, before: dict, after: dict) -> str | None:
 
 async def read_preview(transport: Any, values: dict[str, Any],
                        *, timeout_s: float | None = None) -> dict:
-    """What this exact confirmed call would send, and what the printer says about its fans right now
-    — the companion's ``confirm_required`` shape, the job controls' and ``cc2_peripherals``'. The
-    read-only 1002 below is the only method this path ever sends; no 1030 leaves the wire without
-    ``confirm=True``. The preview is where the scale argument is made visible rather than assumed: it
-    shows the percent asked, the number it becomes, the formula that produced it, and that no CC2 has
-    ever answered 1030 here. A status read that fails is raised rather than papered over — a preview
-    built on nothing would be an invitation to confirm a guess."""
+    """What this exact confirmed call would send, and the numbers the printer reports for its fans
+    right now — the companion's ``confirm_required`` shape, the job controls' and ``cc2_peripherals``'.
+    Read what that does and does not include: the one read-only 1002 below is the only method this path
+    ever sends, and its fans block is all the state a preview carries. Whether a print is running, what
+    the nozzle is at and whether this is the moment for a fan are NOT in it, and no source conditions
+    1030 on the machine being idle, so a preview is never evidence that a fan change is safe at this
+    instant — ``state_checked: false`` says so on the face of every reply, and ``cc2_status`` is the
+    tool that reads the machine. The preview is where the scale argument is made visible rather than
+    assumed: it shows the percent asked, the number it becomes, the formula that produced it, and that no
+    CC2 has ever answered 1030 here. A status read that fails is raised rather than papered over — a
+    preview built on nothing would be an invitation to confirm a guess."""
     params = fan_params(values)
     machine = await st.fetch_machine_status(transport, timeout_s=timeout_s)
     preview = {
@@ -334,11 +441,14 @@ async def read_preview(transport: Any, values: dict[str, Any],
         "wire_formula": SCALE_NOW,
         "waits_up_to_s": SET_WAIT_S if timeout_s is None else timeout_s,
         **_reading(machine),
+        "state_checked": False,
+        "state_note": STATE_NOT_CHECKED,
         "verified_on_this_printer": False,
         "unverified": UNVERIFIED,
     }
     return {"confirm_required": True, "action": SETTING, "preview": preview,
-            "how": job.PREVIEW_HOW, "verified_on_this_printer": False, "unverified": UNVERIFIED}
+            "how": job.PREVIEW_HOW, "state_checked": False, "state_note": STATE_NOT_CHECKED,
+            "verified_on_this_printer": False, "unverified": UNVERIFIED}
 
 
 # --------------------------------------------------------------------------- the one command
