@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Iterable, Literal
 from mcp.server.mcpserver import MCPServer, Image, Context
-from pydantic import Field
+from pydantic import BeforeValidator, Field
 from mcp.types import TextContent, ToolAnnotations
 from .config import load_config
 from .client import OrcaClient
@@ -41,6 +41,7 @@ from .printer.snapshot import take_snapshot
 from .printer.status import _dur as _duration_text
 from .printer import cc2_canvas as _cc2_canvas
 from .printer import cc2_control as _cc2_control
+from .printer import cc2_fan as _cc2_fan
 from .printer import cc2_history as _cc2_history
 from .printer import cc2_info as _cc2_info
 from .printer import cc2_peripherals as _cc2_peripherals
@@ -2085,17 +2086,17 @@ async def check_printer_match() -> dict:
 
 
 # --- Direct Elegoo Centauri Carbon 2 printing (configured, never switched on) ----------------
-# Sixteen tools — the reads cc2_status, cc2_list_files, cc2_printer_info, cc2_file_detail,
+# Seventeen tools — the reads cc2_status, cc2_list_files, cc2_printer_info, cc2_file_detail,
 # cc2_file_thumbnail, cc2_print_history and cc2_camera_snapshot, then cc2_upload_gcode,
 # cc2_start_print, the job
 # controls cc2_pause_print, cc2_resume_print and cc2_stop_print, then the peripheral controls
-# cc2_set_light, cc2_set_print_speed and cc2_set_temperature, and the CANVAS switch
+# cc2_set_light, cc2_set_print_speed, cc2_set_temperature and cc2_set_fan, and the CANVAS switch
 # cc2_set_auto_refill — speak to the
 # printer directly (LAN discovery, MQTT, HTTP upload, one HTTP camera stream, one start command, one
 # control command) through
 # the printer/cc2_* adapters, with no OrcaSlicer and no Home Assistant in the path.
 #
-# They are declared the way every other tool on this server is: a client sees all sixteen in
+# They are declared the way every other tool on this server is: a client sees all seventeen in
 # tools/list whether or not a printer has been configured. What makes them safe is not hiding them.
 # With no address set (ORCA_CC2_URL empty) every one of them refuses in-process and says so —
 # not_configured, with printer_contacted=false — before any address is resolved and before any
@@ -2108,7 +2109,7 @@ async def check_printer_match() -> dict:
 # One session, not one per call. The printer's own MQTT broker takes about four clients and reaps a
 # departed one on its own clock, so when every tool call registered, used and closed its own session
 # the fourth ordinary call in a row met "too many clients" (reason=client_limit) from an idle,
-# healthy printer. So fourteen of the sixteen tools borrow the process's one registered session through
+# healthy printer. So sixteen of the seventeen tools borrow the process's one registered session through
 # printer/cc2_pool.py: opens are serialised so two simultaneous calls cannot register twice, while
 # requests on an established session run concurrently because the transport matches every answer to
 # the request id it stamped. A session that reports itself dead, or that the configuration left
@@ -2125,7 +2126,7 @@ async def check_printer_match() -> dict:
 # and neither sends a protocol command.
 #
 # These are the server's only printer WRITEs, and MCP tool annotations are advisory metadata, a hint
-# to a client, never an access control: the nine writes carry readOnlyHint=false and
+# to a client, never an access control: the ten writes carry readOnlyHint=false and
 # cc2_stop_print additionally destructiveHint=true, and what actually reaches a human is the
 # maintainer companion's two-phase confirm, enforced in every control tool's own body so it still
 # holds for a client running with permission prompts off. Credentials from the cc2_transport config
@@ -2135,10 +2136,11 @@ async def check_printer_match() -> dict:
 # built field by field from the adapters' parsed, fail-closed state, and everything passes through
 # _cc2_out(): strings capped, control characters stripped, non-JSON-safe numbers turned to None.
 
-# The sixteen direct tools, in declaration order: the seven reads first (the live state, the file
+# The seventeen direct tools, in declaration order: the seven reads first (the live state, the file
 # inventory, what the printer is, what one of its files is, what that file looks like, what it has
 # printed before, and what its camera sees), then the
-# upload and the start, then the three job controls, then the three peripheral controls, then the
+# upload and the start, then the three job controls, then the four peripheral controls (light, speed
+# mode, temperature, fan), then the
 # CANVAS auto-refill switch. Each is
 # registered by its own @mcp.tool() below, and tests assert that
 # this roster and the registered cc2_* set are the same list, so a decorator lost in a refactor fails
@@ -2148,7 +2150,8 @@ CC2_TOOL_NAMES: tuple[str, ...] = (
     "cc2_print_history", "cc2_camera_snapshot",
     "cc2_upload_gcode", "cc2_start_print",
     "cc2_pause_print", "cc2_resume_print", "cc2_stop_print",
-    "cc2_set_light", "cc2_set_print_speed", "cc2_set_temperature", "cc2_set_auto_refill",
+    "cc2_set_light", "cc2_set_print_speed", "cc2_set_temperature", "cc2_set_fan",
+    "cc2_set_auto_refill",
 )
 
 # Every key name a CC2 reply may carry, as the strings this server and its printer/cc2_* adapters
@@ -2172,10 +2175,11 @@ CC2_TOOL_NAMES: tuple[str, ...] = (
 _CC2_REPLY_KEYS = frozenset({
      "_filaments_answered", "accepted", "action", "active", "active_canvas_id", "active_tray_id",
     "actual_now_c", "ambiguous", "asked", "asked_percent", "attachments", "auto_refill",
-    "auto_refill_is_known", "auto_refill_now", "auto_refill_raw_now", "auxiliary", "axes",
-    "base64_chars", "bed", "bed_c", "bed_clear_required", "bed_first_layer_temp", "bed_target_c",
+    "auto_refill_is_known", "auto_refill_now", "auto_refill_raw_now", "aux_fan", "auxiliary",
+    "axes", "base64_chars", "bed", "bed_c", "bed_clear_required", "bed_first_layer_temp",
+    "bed_target_c",
     "bed_temp", "bed_temp_c", "bed_warning", "bed_warning_provenance", "began_at", "begin_time",
-    "brand", "brightness", "build", "bytes", "camera_connected", "cancelled", "canvas",
+    "brand", "brightness", "box_fan", "build", "bytes", "camera_connected", "cancelled", "canvas",
     "canvas_id", "canvas_load", "canvas_unload", "ceiling_c", "chamber", "changed", "client_id",
     "color", "command_attempted", "commanded_bed_setpoints", "commanded_nozzle_setpoints",
     "commanded_nozzle_setpoints_c", "complete", "completeness", "config", "confirm_required",
@@ -2183,7 +2187,7 @@ _CC2_REPLY_KEYS = frozenset({
     "display", "distance", "driving_a_filament_operation", "duration_seconds", "empty",
     "end_time", "ended_at", "entries", "entries_in_reply", "entries_kept", "error", "error_code",
     "est_filament_g", "est_print_s", "extruder", "extrusion_nozzle_temps",
-    "extrusion_nozzle_temps_c", "fans_now_raw", "field", "filament_grams", "filaments",
+    "extrusion_nozzle_temps_c", "fan", "fans_now_raw", "field", "filament_grams", "filaments",
     "file_in_this_listing", "file_name", "file_now", "file_path", "file_size_bytes", "filename",
     "files", "firmware", "first_layer", "hardware", "hardware_version", "has_more", "heater",
     "heater_bed", "heater_is_known", "hint", "home", "homed_axes", "homed_axes_now", "how", "id",
@@ -2213,7 +2217,8 @@ _CC2_REPLY_KEYS = frozenset({
     "resolution", "resume", "returned", "sent", "sent_bytes", "sent_params", "serial",
     "serial_agree", "session_serial", "setting", "sign_convention", "size_bytes", "slot_map",
     "soc_version", "speed", "speed_mode", "speed_name", "standby", "started_accepted", "state",
-    "state_known", "state_word", "status", "status_labels", "steady", "stop", "storage",
+    "state_checked", "state_known", "state_note", "state_word", "status", "status_labels",
+    "steady", "stop", "storage",
     "storage_media", "sub_status", "sub_status_word", "target_now_c", "task_id", "task_name",
     "task_status", "task_status_label", "temps", "then_reads", "time_lapse_video_duration",
     "time_lapse_video_size", "time_lapse_video_status", "time_lapse_video_url",
@@ -3365,6 +3370,152 @@ async def cc2_set_temperature(
     return await _cc2_temperature_tool(field, params, confirm)
 
 
+def _cc2_fan_percent(value):
+    """``cc2_fan``'s argument bar, spelled the one way an argument validator may speak. The rule and its
+    sentence stay in the module; a validator that raises anything but a ``ValueError`` is reported to the
+    client as an anonymous crash with none of its text, and the whole point of refusing at this door is
+    the sentence that names the two scales. So the module's ``PrinterError`` is re-raised here as the
+    ``ValueError`` pydantic turns into an argument-validation failure the caller can read and fix — and
+    the module's own bar still runs again on whatever survives, so nothing is decided twice on purpose.
+    Accepted values pass through untouched, whole-number text included: that spelling is read on
+    purpose."""
+    try:
+        return _cc2_fan.check_percent_input(value)
+    except PrinterError as e:
+        raise ValueError(f"{e.message} {e.hint}") from e
+
+
+def _cc2_fan_err(e: PrinterError) -> dict:
+    """A fan refusal, in the shape every fan reply carries. ``_cc2_err`` alone would drop the two fields
+    this tool promises on every reply, and the refusal is exactly the reply that needs them: whoever
+    just sent a bare 255 is whoever needs to be told which of the two scales this tool refused to pick
+    between, and which one the number it sent became when it was accepted."""
+    return {**_cc2_err(e), **_cc2_fan.refusal_keys()}
+
+
+async def _cc2_fan_tool(values: dict, confirm) -> dict:
+    """The one body behind cc2_set_fan, and the same two phases the job, peripheral and temperature
+    controls run. Like every direct tool it can only reach a printer once one is configured; with no
+    address set the session seam refuses in-process, before any method of any kind is sent.
+
+    A call that is not exactly ``confirm=True`` borrows the shared CC2 session and sends exactly one
+    read-only 1002, and hands back the ``confirm_required`` preview carrying this call's own exact
+    params, the percent asked beside the number it becomes, and the formula that produced it — so the
+    arithmetic a confirmed call would put on the wire is on the record before anything changes, and no
+    1030 ever leaves the wire on a preview path (the tests watch the recorded wire for exactly that). A
+    confirmed call takes one read-only 1002 first so the read-back afterwards can say whether a fan's
+    number moved, then sends the one 1030 once through the adapter, which never resends an unanswered
+    command, then takes its single look. The confirmation is a decision-for-a-human device, not an
+    access control: it carries the user's authorization for this action, which their standing yes for
+    this print or session may already supply, so it obliges no fresh question of its own.
+
+    What is NOT in a preview, said because a two-phase control reads as a safety check: the fans' own
+    numbers and this call's arithmetic are all the state it carries. It does not say whether a print is
+    running or whether a fan should be running at this moment, so every reply from this tool carries
+    ``state_checked: false`` and the sentence that says so, and ``cc2_status`` is the tool that reads the
+    machine. That is a decision and not an unfinished gate — a refusal to command a fan while a print
+    runs would break the fan's own job, since the slicer commands part cooling mid-print — and no
+    first-party source conditions 1030 on the machine being idle."""
+    async with _cc2_session() as sess:
+        if sess.transport is None:
+            return sess.error
+        try:
+            if confirm is True:
+                out = (await _cc2_fan.set_fan_with_before(sess.transport, values)).as_dict()
+            else:
+                out = await _cc2_fan.read_preview(sess.transport, values)
+        except PrinterError as e:
+            return _cc2_fan_err(e)
+        return _cc2_out(out)
+
+
+@mcp.tool()
+async def cc2_set_fan(
+    model: Annotated[int | None, BeforeValidator(_cc2_fan_percent), Field(description=(
+        "The part-cooling fan (the protocol's `fan` field) as a whole percent 0-100 — 0 stops it, 100 "
+        "is what Elegoo's own LAN control's slider maxes at. Omit it (leave null) to leave this fan "
+        "alone: it is NOT treated as 0. Anything that is not a whole percent 0-100 — 127, 255, 101, a "
+        "float, a bool, a name — refuses with nothing sent, at the schema door and again at the "
+        "printer's door, because the two scales in the sources are the one thing nobody has proven on "
+        "this firmware and guessing which one a bare number meant is exactly the guess this tool will "
+        "not make."))] = None,
+    auxiliary: Annotated[int | None, BeforeValidator(_cc2_fan_percent), Field(description=(
+        "The auxiliary fan (`aux_fan`) as a whole percent 0-100, same rules and same refusal as "
+        "`model`; omit it to leave that fan alone."))] = None,
+    chamber: Annotated[int | None, BeforeValidator(_cc2_fan_percent), Field(description=(
+        "The chamber/box fan (`box_fan`) as a whole percent 0-100, same rules and same refusal as "
+        "`model`; omit it to leave that fan alone. This is the fan field and nothing else — it is not a "
+        "heater and it heats nothing."))] = None,
+    confirm: Annotated[bool, BeforeValidator(_cc2_fan.strict_confirm),
+                       Field(strict=True, description=(
+        "Second-call only: omitted or false returns a preview and sends nothing; the JSON boolean true "
+        "sends the one fan command, and a true spelled any other way (`\"true\"`, `\"yes\"`, `1`) refuses "
+        "with nothing sent — a confirmation this server cannot read is not a yes. Confirm once the user "
+        "has authorized the fans — a yes they already gave for this print or session covers it and needs "
+        "no fresh question, so ask only when nothing authorizes it — read them the preview first then, "
+        "knowing what that preview does not carry: the fans' numbers, not whether a print is "
+        "running."))] = False,
+) -> dict:
+    """Command the configured CC2 printer's fans as `model` (part cooling), `auxiliary` or `chamber`,
+    each a whole percent 0-100. Read this first: the fan scale is unproven, because no CC2 has ever
+    answered method 1030 for this project. A fan you omit is left alone, never zeroed.
+
+    TWO-PHASE like every other control here: without confirm=true this reads the printer once and
+    returns a preview (what the printer reports for each fan right now, the exact 1030 a confirmed
+    call would send, the percent asked beside the number it becomes, and the formula) and changes
+    nothing; only an exact confirm=true sends it, and the confirmation carries the user's
+    authorization, which their standing yes for this print or session may already supply. A confirm
+    spelled any other way — "true", "yes", 1 — refuses with nothing sent rather than being read as a
+    yes, because a two-phase control whose guard can be typed past is not a guard. An accepted
+    command means only that the printer took the frame, and every reply says that beside
+    `verified_on_this_printer: false`.
+
+    WHERE THE NUMBERS COME FROM, because a fan tool that guesses is the hazard. The three first-party
+    sources do not agree: the LAN control the printer serves itself takes a percent 0-100 from its
+    slider and sends `percent / 100 * 255` **unreduced** (50% leaves as 127.5 because that client
+    rounds nothing) under the fields `fan` / `aux_fan` / `box_fan`; the older integration's manual
+    records 0-255 for those same fields; and that integration's own code validates 0-100 and sends it
+    unconverted. This tool therefore takes the official UI's input (a percent), applies the official
+    UI's own arithmetic to reach the wire, and calls neither number proven. There is no argument for
+    a raw 0-255 value and no way to bypass the formula: a caller holding a 0-255 number converts it
+    to a percent deliberately and says so. `controller_fan` and `heater_fan` appear in the printer's
+    status read and in no source's command, so they cannot be commanded here at all.
+
+    What actually goes out: one 1030 carrying only the named fans, sent once and never resent, waited
+    for 10 s — the longer of the two first-party windows (the official LAN client waits 5 s for this
+    method, the integration 10 s for every command). Accepted (an explicit integer error_code 0, which
+    is the printer not refusing), refused (its code kept, and it earns no further read) and ambiguous
+    (no answer, an unreadable one, or a dropped session) are kept apart exactly as the other controls
+    keep them, and a lost answer is never a refusal and never a reason to send again.
+
+    The read-back is the part a live test reads out, and it is deliberately uninterpreted: a confirmed
+    call reads the printer once before the command and once after it, reports each fan's number
+    **exactly as its 1002 answered `fans.<fan>.speed`** with no unit claimed and no percentage derived
+    from it, and says per fan whether that raw number moved (true / false / unknown — an absent fan
+    block stays unknown, never zero). A pre-read or a look that does not land is named as such rather
+    than becoming a confident 'nothing changed'. So after an accepted 100% a printer reporting 255 is
+    the official UI's formula holding; a 100 says the integration's code is right and the UI's scalar
+    is decorative; and no movement at all says that field is not the fan you meant. If an accepted
+    command left a commanded fan's number exactly where it was, a note says that as the raw-against-
+    raw fact it is without calling it a failure, and it earns no second command. `cc2_status` reads
+    the machine state on demand.
+
+    Whether a fan should be running is not something this tool can see, and it says so rather than
+    implying otherwise: a preview carries the fans' own numbers and this call's arithmetic and nothing
+    else — not whether a print is running, not what the nozzle is at, not whether this is the moment for
+    that fan — so every reply from this tool carries `state_checked: false` beside the sentence that
+    names it, and `cc2_status` is the tool that reads the machine. No source conditions 1030 on a printer
+    being idle or on a print running, and an idle gate here would be a tool refusing to do the thing the
+    slicer uses the same fan field for mid-print, so the judgment stays with the person who can see the
+    print; a refusal out of this tool is evidence about your firmware, not a broken printer."""
+    values = {"model": model, "auxiliary": auxiliary, "chamber": chamber}
+    try:
+        _cc2_fan.fan_params(values)      # the argument bar is the point: it refuses before a session
+    except PrinterError as e:
+        return _cc2_fan_err(e)      # and the refusal is still a fan reply, caveats and all
+    return await _cc2_fan_tool(values, confirm)
+
+
 async def _cc2_auto_refill_tool(params: dict, confirm: bool) -> dict:
     """The one body behind cc2_set_auto_refill, and the same two phases every other CC2 control runs.
     Like every direct tool it can only reach a printer once one is configured; with no address set the
@@ -3562,6 +3713,7 @@ _TOOL_ANNOTATIONS: dict[str, tuple[str, bool, bool]] = {
     # G-code does. What makes it careful is the ceiling it refuses to exceed and the preview that
     # names its source, not a destructiveHint.
     "cc2_set_temperature": ("Set a CC2 heater temperature", False, False),
+    "cc2_set_fan": ("Set a CC2 fan speed", False, False),
     # The CANVAS switch is the same kind of write as the other three and no more destructive than the
     # light: it flips one stored boolean on the printer, it can be flipped back by asking again, and
     # it destroys nothing. What makes it careful is that it has never met this firmware, which is said
@@ -3582,7 +3734,7 @@ _OPEN_WORLD_TOOLS = frozenset({"get_printer_status", "wait_for_printer", "list_p
                                "cc2_print_history", "cc2_camera_snapshot",
                                "cc2_upload_gcode", "cc2_start_print", "cc2_pause_print",
                                "cc2_resume_print", "cc2_stop_print", "cc2_set_light",
-                               "cc2_set_print_speed", "cc2_set_temperature",
+                               "cc2_set_print_speed", "cc2_set_temperature", "cc2_set_fan",
                                "cc2_set_auto_refill"})
 _IDEMPOTENT_TOOLS = frozenset({"list_print_history"})
 

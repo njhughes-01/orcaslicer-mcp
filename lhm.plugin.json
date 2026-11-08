@@ -346,6 +346,10 @@
       "description": "Set one heater's target temperature on the configured CC2 printer: heater is 'extruder' (the nozzle) or 'heater_bed' (the bed, also read as 'bed'), target in degrees Celsius, one heater per call."
     },
     {
+      "name": "cc2_set_fan",
+      "description": "Command the configured CC2 printer's fans as `model` (part cooling), `auxiliary` or `chamber`, each a whole percent 0-100. Read this first: the fan scale is unproven, because no CC2 has ever answered method 1030 for this project. A fan you omit is left alone, never zeroed."
+    },
+    {
       "name": "cc2_set_auto_refill",
       "description": "Turn the configured CC2 printer's CANVAS auto-refill switch on or off with one boolean, and read this before calling it: the setting was changed and restored on one CC2, but automatic refill during a print remains unverified."
     }
