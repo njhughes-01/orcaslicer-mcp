@@ -1,5 +1,5 @@
-"""The sixteen direct CC2 tools exactly as the server wires them, against scripted fakes: the
-adapters, the reply sanitiser, and what happens before a printer is ever configured. The sixteen are
+"""The seventeen direct CC2 tools exactly as the server wires them, against scripted fakes: the
+adapters, the reply sanitiser, and what happens before a printer is ever configured. The seventeen are
 declared the way every other tool on this server is, so the default posture is proven first: with no
 ORCA_CC2_URL set — the fixture clears it, every credential variable and every receipt store for the
 whole module — each tool answers not_configured with printer_contacted=false, and NOTHING touches the
@@ -58,7 +58,7 @@ had to be cut for size is reported as cut rather than as the whole history, a re
 shape refuses instead of being read as a LAN answer, and a time-lapse link carrying a login never
 leaves the reply.
 
-Fourteen of the sixteen tools share the process's one registered session (printer/cc2_pool.py), because
+Sixteen of the seventeen tools share the process's one registered session (printer/cc2_pool.py), because
 the printer's own broker takes about four clients and reaps a departed one slowly: proven here at the
 layer the calls arrive at — a run of four ordinary calls registers once, two calls at the same moment
 wait for one open instead of each registering, a session the transport reported dead is closed and
@@ -68,12 +68,12 @@ that session was met with, a cancelled call gives its hold back and leaves the s
 next, and the server's own exit closes it (including the exit where stdio failed). The pool's own
 corner cases — the idle window, a configuration change while a call is in flight, a double release —
 are tests/test_cc2_pool.py, and the real-client proof that one registration answers two requests is
-the loopback test in tests/test_cc2_transport_mqtt.py. The sixteenth, `cc2_camera_snapshot`, borrows no
+the loopback test in tests/test_cc2_transport_mqtt.py. The seventeenth, `cc2_camera_snapshot`, borrows no
 session by design: its picture is one bounded HTTP GET of the printer's own camera stream, so it spends
 none of the printer's client slots — what it shares with the transport is the configuration and the
 address pinning, and its own guards and refusal paths are tests/test_cc2_snapshot.py.
 Discovery is proven last, in fresh interpreters whose environment the test builds from PATH, HOME and
-the variables it names: all sixteen direct tools are listed with no printer config at all, the list is
+the variables it names: all seventeen direct tools are listed with no printer config at all, the list is
 identical when a printer address is configured, the server's other tools come back identical in
 every one of them, and in a child that raises the moment any socket, name lookup, MQTT link or HTTP
 request is attempted, every direct tool still answers not_configured. No live printer, no Home
@@ -504,13 +504,15 @@ ALL_TOOLS = (
     lambda: srv.cc2_set_print_speed(mode=0, confirm=True),
     lambda: srv.cc2_set_temperature(heater="extruder", target=220),
     lambda: srv.cc2_set_temperature(heater="bed", target=0, confirm=True),
+    lambda: srv.cc2_set_fan(model=100),
+    lambda: srv.cc2_set_fan(model=0, auxiliary=50, confirm=True),
     lambda: srv.cc2_set_auto_refill(auto_refill=True),
     lambda: srv.cc2_set_auto_refill(auto_refill=False, confirm=True),
 )
 
 
 async def test_with_no_printer_address_every_tool_refuses_with_zero_network(no_network, no_open):
-    # the whole default posture in one place: sixteen tools a client can see and call, no printer
+    # the whole default posture in one place: seventeen tools a client can see and call, no printer
     # configured, and an honest refusal whose every field is plain JSON and whose every promise holds
     for call in ALL_TOOLS:
         out = await call()
@@ -1486,6 +1488,200 @@ async def test_a_refused_ceiling_says_it_cannot_be_raised_from_here(no_open):
 
 
 
+# ---------------------------------------------------- the fan controls (1030 fan / aux_fan / box_fan)
+#
+# The same two phases a fourth time, and the reason this one sat in a drawer first: the sources
+# disagree about the number and no CC2 has ever answered 1030 for this project. So what these tests
+# hold the tool to is never "the fan is now at X%" — it is that the tool sends the official LAN
+# control's own arithmetic and says where it came from, refuses anything that is not that control's
+# percent before a session is opened, sends only the fans that were named, keeps the printer's numbers
+# exactly as its 1002 answered them with no unit attached, says in every reply that none of it is
+# proven on this firmware, and reads the machine once before the command and once after it so the
+# question "did that number move?" has an answer. The frames below script a `fans` block in the shape
+# both readers spell it (doc-derived, exactly as the module's own tests mark it), plus the
+# `controller_fan` / `heater_fan` blocks the integration's status mapping names and this tool never
+# commands.
+
+FANS_1002 = {**IDLE_1002, "fans": {"fan": {"speed": 0}, "aux_fan": {"speed": 0},
+                                    "box_fan": {"speed": 0}, "controller_fan": {"speed": 128},
+                                    "heater_fan": {"speed": 0}}}
+SPUN_1002 = {**IDLE_1002, "fans": {"fan": {"speed": 255}, "aux_fan": {"speed": 33},
+                                    "box_fan": {"speed": 0}, "controller_fan": {"speed": 128},
+                                    "heater_fan": {"speed": 0}}}
+
+
+def two_looks(*, before=None, after=None) -> ScriptedTransport:
+    """A printer that answers the status frame twice, differently: the tool layer's confirmed path
+    reads once before its command and once after, and a deque is how a test hands it two answers."""
+    return healthy_status(method_1002=deque([FANS_1002 if before is None else before,
+                                             SPUN_1002 if after is None else after]),
+                          method_1030={"error_code": 0})
+
+
+async def test_a_fan_preview_reads_state_once_and_never_sends_a_command(monkeypatch):
+    transport = open_fake(monkeypatch, healthy_status(method_1002=FANS_1002))   # 1030 unscripted
+    out = await srv.cc2_set_fan(model=100)
+    assert out["confirm_required"] is True and out["action"] == "fan"
+    p = out["preview"]
+    assert p["will_send"] == {"method": 1030, "params": {"fan": 255}}
+    assert p["asked_percent"] == {"fan": 100} and p["waits_up_to_s"] == 10.0
+    assert p["fans_now_raw"] == {"model": 0, "auxiliary": 0, "chamber": 0}
+    assert transport.methods() == [srv._cc2_state.METHOD_STATUS]
+    assert "Nothing was sent to the printer" in out["how"] and "confirm=true" in out["how"]
+    json.dumps(out)
+
+
+async def test_the_fan_preview_shows_the_formula_and_says_the_scale_is_unproven(monkeypatch):
+    # the whole argument of this tool, visible before anything is sent: whose arithmetic the number is,
+    # and that no CC2 has ever answered the method
+    open_fake(monkeypatch, healthy_status(method_1002=FANS_1002))
+    out = await srv.cc2_set_fan(model=50, chamber=0)
+    p = out["preview"]
+    assert p["will_send"]["params"] == {"fan": 127.5, "box_fan": 0}
+    assert "percent / 100 * 255" in p["wire_formula"]
+    assert out["verified_on_this_printer"] is False and p["verified_on_this_printer"] is False
+    assert "has ever answered 1030" in out["unverified"] and "has ever answered 1030" in p["unverified"]
+    json.dumps(out)
+
+
+async def test_a_truthy_but_non_true_confirm_leaves_a_fan_a_preview(monkeypatch):
+    # exact-or-preview, the rule every other control holds to
+    transport = open_fake(monkeypatch, healthy_status(method_1002=FANS_1002,
+                                                      method_1030={"error_code": 0}))
+    out = await srv.cc2_set_fan(model=100, confirm="true")
+    assert out["confirm_required"] is True
+    assert transport.methods() == [srv._cc2_state.METHOD_STATUS]
+
+
+async def test_a_confirmed_fan_call_reads_once_sends_once_and_reads_once_again(monkeypatch):
+    # three requests and no fourth: the pre-read, the one 1030, the one look — and the three field
+    # spellings the official client writes, with this call's own percents kept beside them
+    transport = open_fake(monkeypatch, two_looks())
+    out = await srv.cc2_set_fan(model=100, auxiliary=13, chamber=0, confirm=True)
+    assert out["status"] == "accepted" and out["accepted"] is True
+    assert out["method"] == 1030 and out["waited_s"] == 10.0 and out["error_code"] is None
+    assert out["sent"] == {"fan": 255, "aux_fan": 33.15, "box_fan": 0}
+    assert out["asked_percent"] == {"fan": 100, "aux_fan": 13, "box_fan": 0}
+    assert transport.methods() == [1002, 1030, 1002]
+    assert transport.params_for(1030) == {"fan": 255, "aux_fan": 33.15, "box_fan": 0}
+    assert len(transport.requests) == 3
+    json.dumps(out)
+
+
+async def test_a_fan_that_was_not_asked_for_is_never_sent_and_never_zeroed(monkeypatch):
+    # omitting a fan is not the same as stopping it: the official client omits the key too, and a zero
+    # on the wire would be a command to shut that fan up
+    transport = open_fake(monkeypatch, two_looks())
+    out = await srv.cc2_set_fan(auxiliary=50, confirm=True)
+    assert transport.params_for(1030) == {"aux_fan": 127.5}
+    assert out["sent"] == {"aux_fan": 127.5} and out["asked_percent"] == {"aux_fan": 50}
+    assert transport.methods().count(1030) == 1
+    json.dumps(out)
+
+
+async def test_the_printers_fan_numbers_come_back_as_they_arrived_with_no_unit_claimed(monkeypatch):
+    # 255 is what the printer answered, not "100%": the only percent in this reply is the caller's own
+    open_fake(monkeypatch, two_looks())
+    out = await srv.cc2_set_fan(model=100, confirm=True)
+    assert out["observed_fan_raw"] == {"model": 255, "auxiliary": 33, "chamber": 0}
+    assert [key for key in out if "percent" in key] == ["asked_percent"]
+    assert "No unit" in out["readback_unit"]
+    json.dumps(out)
+
+
+async def test_a_number_that_moved_is_reported_as_having_moved(monkeypatch):
+    # the measurement the live test exists to make, at the tool layer: raw against raw, per fan, and
+    # an accepted 100% that left 255 where it found 0 is said as movement, never as a proven scale
+    open_fake(monkeypatch, two_looks())
+    out = await srv.cc2_set_fan(model=100, chamber=0, confirm=True)
+    assert out["observed_fan_changed"] == {"model": True, "auxiliary": True, "chamber": False}
+    assert out["verified_on_this_printer"] is False
+    assert any("proves the printer took the frame" in n for n in out["notes"])
+    json.dumps(out)
+
+
+async def test_an_accepted_fan_command_the_status_does_not_move_is_said_at_the_tool_layer(
+        monkeypatch):
+    # both reads say 0: the disagreement is reported as the raw-against-raw fact it is, without
+    # doubting the printer's answer or earning a second command
+    transport = open_fake(monkeypatch, healthy_status(method_1002=FANS_1002,
+                                                      method_1030={"error_code": 0}))
+    out = await srv.cc2_set_fan(model=100, confirm=True)
+    assert out["accepted"] is True and out["observed_fan_changed"]["model"] is False
+    contra = [n for n in out["notes"] if "did not move" in n or "the same number" in n]
+    assert len(contra) == 1 and "model" in contra[0]
+    assert transport.methods().count(1030) == 1
+    json.dumps(out)
+
+
+async def test_a_lost_fan_answer_says_the_look_before_it_did_not_land_and_still_sends_once(
+        monkeypatch):
+    # a status read that fails before the command is a missing comparison, not a reason to hold the
+    # command back: the printer's answer to the 1030 is still the printer's own words
+    transport = open_fake(monkeypatch, healthy_status(
+        method_1002=deque([PrinterError("protocol_error", "simulated: no status", reason="no_data"),
+                           FANS_1002]), method_1030={"error_code": 0}))
+    out = await srv.cc2_set_fan(model=60, confirm=True)
+    assert transport.methods() == [1002, 1030, 1002] and transport.methods().count(1030) == 1
+    assert out["status"] == "accepted"
+    assert all(value is None for value in out["observed_fan_changed"].values())
+    assert any("did not land" in n and "unknown" in n for n in out["notes"])
+    json.dumps(out)
+
+
+async def test_a_lost_fan_answer_is_ambiguous_at_the_tool_layer_and_never_resent(monkeypatch):
+    lost = srv._cc2_transport.Cc2TimeoutError("protocol_error", "simulated: never answered",
+                                              reason="timeout", ambiguous=True)
+    transport = open_fake(monkeypatch, healthy_status(
+        method_1002=deque([FANS_1002, SPUN_1002]), method_1030=lost))
+    out = await srv.cc2_set_fan(model=100, confirm=True)
+    assert out["status"] == "ambiguous" and out["accepted"] is False
+    assert transport.methods() == [1002, 1030, 1002]
+    joined = " ".join(out["notes"])
+    assert "neither a refusal nor a failure" in joined and "nothing was retried" in joined
+    json.dumps(out)
+
+
+async def test_a_refused_fan_keeps_its_code_and_reads_nothing_more(monkeypatch):
+    # the pre-read runs before the command exists, so an on-record refusal stays final: one look total
+    transport = open_fake(monkeypatch, healthy_status(method_1002=FANS_1002,
+                                                      method_1030={"error_code": 1003}))
+    out = await srv.cc2_set_fan(chamber=100, confirm=True)
+    assert out["status"] == "refused" and out["error_code"] == 1003 and out["accepted"] is False
+    assert transport.methods() == [1002, 1030]
+    assert "1003" in " ".join(out["notes"])
+    assert not any("did not land" in n for n in out["notes"])
+    json.dumps(out)
+
+
+@pytest.mark.parametrize("kwargs, reason", [
+    ({"model": 101}, "fan_percent_range"),
+    ({"model": 127}, "fan_percent_range"),      # a 0-255 number is not this tool's input
+    ({"model": 255}, "fan_percent_range"),
+    ({"model": -1}, "fan_percent_range"),
+    ({"model": 25.5}, "fan_percent_range"),
+    ({"model": True}, "fan_percent_range"),
+    ({"chamber": 101}, "fan_percent_range"),
+    ({}, "fan_none"),                            # three fans offered, none asked for
+], ids=["101", "127", "255", "minus", "float", "bool", "chamber-101", "nothing"])
+async def test_a_fan_speed_that_is_not_a_whole_percent_refuses_before_any_session(kwargs, reason,
+                                                                                 no_open):
+    # no argument that is not the official control's percent may reach the printer: no session, no
+    # method — and the refusal names the scale, because the two competing ones are the whole problem
+    out = await srv.cc2_set_fan(**kwargs)
+    assert out["error"] == "protocol_error" and out["reason"] == reason
+    assert not no_open
+    assert "0-100" in out["message"] or "0-100" in out["hint"]
+    json.dumps(out)
+
+
+async def test_a_fan_value_that_is_not_a_number_at_all_refuses_before_any_session(no_open):
+    out = await srv.cc2_set_fan(model="fast")
+    assert out["error"] == "protocol_error" and out["reason"] == "fan_percent_range"
+    assert not no_open
+    json.dumps(out)
+
+
 # ------------------------------------------------- the CANVAS auto-refill switch (2004) — a labelled
 # ------------------------------------------------- candidate, proven at the tool layer
 #
@@ -2197,11 +2393,25 @@ def test_json_schema_is_mcp_compatible_and_documented():
     assert all(p.get("description") for p in refill["properties"].values())
     assert "plain boolean" in refill["properties"]["auto_refill"]["description"]
     assert "Second-call only" in refill["properties"]["confirm"]["description"]
+    # the fan control is typed the same plain way: three optional percents and the optional confirm.
+    # Nothing is required, because "which fans?" is answered by the three being absent — and there is
+    # no schema-level range, because refusing 127 means saying *why* (the two competing scales, and
+    # neither proven on this firmware), which a schema cannot say. A null means "leave that fan
+    # alone", which is a different thing from 0, and the description has to carry that difference.
+    fan_tool = tools["cc2_set_fan"].input_schema
+    assert fan_tool["type"] == "object" and fan_tool.get("required", []) == []
+    for name in ("model", "auxiliary", "chamber"):
+        prop = fan_tool["properties"][name]
+        assert {s["type"] for s in prop["anyOf"]} == {"integer", "null"}, name
+        assert "whole percent 0-100" in prop["description"], name
+        assert all(p.get("description") for p in fan_tool["properties"].values())
+    assert fan_tool["properties"]["model"]["description"].count("NOT treated as 0") == 1
+    assert fan_tool["properties"]["confirm"]["default"] is False
 
 
-def test_annotations_classify_the_sixteen_cc2_tools():
+def test_annotations_classify_the_seventeen_cc2_tools():
     tools = srv.mcp._tool_manager._tools
-    # the whole tool list is the annotation table: sixteen direct tools and everything that predates
+    # the whole tool list is the annotation table: seventeen direct tools and everything that predates
     # them, each with its title and hints, nothing registered that the table does not speak for
     assert set(srv._TOOL_ANNOTATIONS) == set(tools)
     for name in ("cc2_status", "cc2_list_files", "cc2_printer_info", "cc2_file_detail",
@@ -2210,7 +2420,7 @@ def test_annotations_classify_the_sixteen_cc2_tools():
         assert ann.read_only_hint is True and ann.destructive_hint is None
         assert ann.open_world_hint is True and ann.idempotent_hint is None
     for name in ("cc2_upload_gcode", "cc2_start_print", "cc2_pause_print", "cc2_resume_print",
-                 "cc2_set_light", "cc2_set_print_speed", "cc2_set_temperature",
+                 "cc2_set_light", "cc2_set_print_speed", "cc2_set_temperature", "cc2_set_fan",
                  "cc2_set_auto_refill"):
         ann = tools[name].annotations
         assert ann.read_only_hint is False and ann.destructive_hint is False
@@ -2226,7 +2436,7 @@ def test_annotations_classify_the_sixteen_cc2_tools():
 # interpreter. Each child gets a hand-built environment — PATH, HOME and exactly the variables the
 # test names — so it is proven by construction that no credential, printer address or receipt store
 # was present for it to read, let alone echo. What the new posture has to buy is exactly this: the
-# sixteen direct tools are listed by default, a printer address changes nothing about that list, and
+# seventeen direct tools are listed by default, a printer address changes nothing about that list, and
 # the server's other tools come back identical in every case.
 
 BASELINE_TOOLS = frozenset(srv.mcp._tool_manager._tools) - CC2_NAMES
@@ -2258,6 +2468,8 @@ PROBE_CALLS = [
     ("cc2_temperature_preview", "cc2_set_temperature", {"heater": "extruder", "target": 220}),
     ("cc2_temperature_confirmed", "cc2_set_temperature",
      {"heater": "heater_bed", "target": 60, "confirm": True}),
+    ("cc2_fan_preview", "cc2_set_fan", {"model": 100}),
+    ("cc2_fan_confirmed", "cc2_set_fan", {"model": 0, "auxiliary": 50, "confirm": True}),
     ("cc2_auto_refill_preview", "cc2_set_auto_refill", {"auto_refill": True}),
     ("cc2_auto_refill_confirmed", "cc2_set_auto_refill",
      {"auto_refill": False, "confirm": True}),
@@ -2326,9 +2538,9 @@ def child(argv: str, env_overrides: dict[str, str], *, home: str | None = None,
     return done.stderr
 
 
-def test_all_sixteen_direct_tools_are_listed_with_no_printer_config(tmp_path):
+def test_all_seventeen_direct_tools_are_listed_with_no_printer_config(tmp_path):
     # the posture Nathan asked for: no read/write switch, no hidden tools. A client pointed at a
-    # server with no printer configured is still shown all sixteen — in an empty HOME, with no
+    # server with no printer configured is still shown all seventeen — in an empty HOME, with no
     # credential anywhere in the child's environment — and every other tool is untouched by it
     names = set(json.loads(child(LIST_TOOLS, {}, home=str(tmp_path))))
     assert CC2_NAMES == frozenset(srv.CC2_TOOL_NAMES)
@@ -2343,7 +2555,7 @@ def test_a_configured_address_changes_nothing_about_what_is_listed(tmp_path):
     assert configured == plain == BASELINE_TOOLS | CC2_NAMES
 
 
-def test_a_child_that_forbids_the_network_lists_all_sixteen_and_refuses_all_sixteen(tmp_path):
+def test_a_child_that_forbids_the_network_lists_all_seventeen_and_refuses_all_seventeen(tmp_path):
     # discovery needs nothing, and a call with nothing configured answers honestly instead of
     # reaching out: the guards in the child raise on the first socket, name lookup, MQTT link or
     # HTTP request, so this test passing IS the zero-network proof
@@ -2373,6 +2585,6 @@ def test_the_probe_child_is_armed_and_fails_when_a_tool_reaches_the_network(tmp_
 
 def test_this_module_leaves_the_direct_tools_listed_as_it_found_them():
     # a hygiene check on the module itself, last by file order: the tests above patch, fake and
-    # restore freely, and this is where a leak would surface. The sixteen are declared at import, so
-    # what a later module must see is exactly those sixteen plus everything that predates them
+    # restore freely, and this is where a leak would surface. The seventeen are declared at import, so
+    # what a later module must see is exactly those seventeen plus everything that predates them
     assert frozenset(srv.mcp._tool_manager._tools) == BASELINE_TOOLS | CC2_NAMES

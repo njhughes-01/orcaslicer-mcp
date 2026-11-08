@@ -1,12 +1,13 @@
-"""The CC2 fan candidate (method 1030) against scripted replies — internal, unregistered, and
-nothing here opens a socket. The transport is a fake that records every method and the timeout each
+"""The CC2 fan control (method 1030) against scripted replies — a registered tool, an unproven
+scale, and nothing here opens a socket. The transport is a fake that records every method and the
+timeout each
 request asked for, so "sent once, never resent" and "the preview sends only the read-only 1002" are
 recorded facts rather than claims.
 
 The 1002 frames carry the ``fans`` block exactly as both readers spell it (``fans.fan.speed``,
 ``fans.aux_fan.speed``, ``fans.box_fan.speed``, plus the ``controller_fan``/``heater_fan`` blocks the
 integration's status mapping names), marked doc-derived: no CC2 has ever answered 1030 for this
-project, which is the whole reason the module is a candidate. What the tests pin down:
+project, which is why every reply says so rather than settling it. What the tests pin down:
 
 * the argument bar — a whole percent 0..100 reads, and so does whole-number text; a 0-255 number
   above 100 (127, 255), a float, a bool, a name and a fourth fan name do not;
@@ -22,8 +23,12 @@ project, which is the whole reason the module is a candidate. What the tests pin
   arrived, no percentage is derived from them anywhere, ``changed`` compares raw against raw, an
   absent fan block is unknown rather than zero, and every reply says
   ``verified_on_this_printer: false``;
-* the candidate posture holds — no tool is registered, nothing in server.py, the README or either
-  manifest mentions it, and every authored string fits the direct tools' reply cap."""
+* the confirmed path reads once before the command and once after it — 1002, 1030, 1002, one of each,
+  with a pre-read that fails reported rather than hidden, and a refusal still earning no look after
+  it;
+* the exposed posture — the tool is registered and declared like the other CC2 controls, it is named
+  in the server, the README, the listing and the changelog, those lines still say the scale is
+  unproven, and every authored string fits the direct tools' reply cap."""
 from __future__ import annotations
 
 import copy
@@ -390,27 +395,98 @@ async def test_no_reply_carries_an_address_a_serial_or_a_credential():
             assert banned not in reported
 
 
-# --------------------------------------------------------------------------- the candidate posture
+# --------------------------------------------------------------------------- the confirmed path's two looks
 
 
-def test_no_fan_tool_is_registered():
+async def test_the_confirmed_path_reads_once_before_the_command_once_after_and_never_thrice():
+    # 1002 -> 1030 -> 1002, in that order, one of each: the look before is what makes 'moved' a fact,
+    # and three requests is the whole budget — a fourth would be a poll or a resend in disguise
+    transport = FakeFanTransport({1002: deque([
+        frame_1002(),
+        frame_1002(fans={"fan": {"speed": 255}, "aux_fan": {"speed": 0},
+                            "box_fan": {"speed": 0}})]),
+        1030: {"error_code": 0}})
+    out = await fan.set_fan_with_before(transport, {"model": 100})
+    assert transport.methods() == [1002, 1030, 1002]
+    assert len(transport.calls(1030)) == 1 and transport.calls(1030)[0][1] == {"fan": 255}
+    assert out.accepted and out.status is job.ControlStatus.ACCEPTED
+    json.dumps(out.as_dict())
+
+
+async def test_the_number_moving_is_reported_as_moving():
+    # 0 -> 255 after an accepted 100%: the one observation the live test came for, and here the unit
+    # still says nothing about it — 'moved' is raw against raw
+    transport = FakeFanTransport({1002: deque([frame_1002(), frame_1002(
+        fans={"fan": {"speed": 255}, "aux_fan": {"speed": 0}, "box_fan": {"speed": 0}})]),
+        1030: {"error_code": 0}})
+    out = await fan.set_fan_with_before(transport, {"model": 100})
+    assert out.observed["raw"]["model"] == 255
+    assert out.observed["changed"] == {"model": True, "auxiliary": False, "chamber": False}
+    assert out.as_dict()["observed_fan_changed"]["model"] is True
+
+
+async def test_a_pre_read_that_does_not_lands_still_sends_the_command_and_says_what_is_missing():
+    # the printer's answer to the 1030 is still the printer's own words, so a failed read before it
+    # is reported, not turned into a reason to withhold the command — and 'changed' stays unknown
+    transport = FakeFanTransport({1002: deque([PrinterError("protocol_error", "simulated: no 1002",
+                                                            reason="no_data"), frame_1002()]),
+                                  1030: {"error_code": 0}})
+    out = await fan.set_fan_with_before(transport, {"model": 60})
+    assert transport.methods() == [1002, 1030, 1002] and len(transport.calls(1030)) == 1
+    assert out.accepted
+    assert all(value is None for value in out.observed["changed"].values())
+    assert any("did not land" in n and "unknown" in n for n in out.notes)
+
+
+async def test_a_refusal_from_the_printer_keeps_its_vocabulary_whole_and_reads_nothing_after():
+    # the pre-read runs before the command exists, so it does not soften the rule that an on-record
+    # refusal earns no follow-up read — and the reply keeps saying that plain thing about itself
+    transport = FakeFanTransport({1002: frame_1002(), 1030: {"error_code": 1003}})
+    out = await fan.set_fan_with_before(transport, {"chamber": 100})
+    assert transport.methods() == [1002, 1030]
+    assert out.status is job.ControlStatus.REFUSED and out.error_code == 1003
+    assert not any("did not land" in n for n in out.notes)
+    assert any("Nothing was resent" in n for n in out.notes)
+
+
+def test_the_pre_read_note_and_its_reason_stay_inside_the_reply_cap():
+    # the house rule for composed notes: the sentence is what a caller acts on, so a long reason loses
+    # its tail, never the sentence, and the whole thing still fits
+    long_why = "x" * 900
+    budget = job.NOTE_CAP - len(fan.PRE_READ_LOST_NOTE) - len(fan._PRE_READ_PREFIX)
+    composed = fan.PRE_READ_LOST_NOTE + fan._PRE_READ_PREFIX + long_why[:max(0, budget)]
+    assert len(fan.PRE_READ_LOST_NOTE) <= job.NOTE_CAP
+    assert budget > 0 and len(composed) <= job.NOTE_CAP
+
+
+# --------------------------------------------------------------------------- the exposed posture
+
+
+def test_the_fan_tool_is_registered_and_declared_like_every_other_cc2_control():
     import orcaslicer_mcp.server as srv
 
     names = set(srv.mcp._tool_manager._tools)
-    assert not [n for n in names if n.startswith("cc2_") and "fan" in n]
-    assert not [n for n in srv.CC2_TOOL_NAMES if "fan" in n.lower()]
-    assert not [n for n in srv._TOOL_ANNOTATIONS if n.startswith("cc2_") and "fan" in n]
-    assert not [n for n in srv._OPEN_WORLD_TOOLS if "fan" in str(n)]
+    assert "cc2_set_fan" in names
+    assert "cc2_set_fan" in srv.CC2_TOOL_NAMES
+    assert "cc2_set_fan" in srv._OPEN_WORLD_TOOLS
+    title, read_only, destructive = srv._TOOL_ANNOTATIONS["cc2_set_fan"]
+    assert title and read_only is False and destructive is False
 
 
 @pytest.mark.parametrize("relative", ["src/orcaslicer_mcp/server.py", "README.md",
-                                      "lhm.plugin.json", "mcpb/manifest.json",
-                                      "scripts/gen_lhm_tools.py"])
-def test_the_candidate_is_not_offered_as_a_supported_capability(relative):
+                                      "lhm.plugin.json", "CHANGELOG.md"])
+def test_the_fan_tool_is_named_where_a_client_or_a_human_reads_capabilities(relative):
     text = (ROOT / relative).read_text(encoding="utf-8")
-    assert "cc2_fan" not in text
-    assert "cc2_set_fan" not in text
-    assert "fan control" not in text.lower()
+    assert "cc2_set_fan" in text, relative
+
+
+@pytest.mark.parametrize("relative", ["README.md", "CHANGELOG.md"])
+def test_the_docs_keep_saying_the_scale_is_unproven_where_they_name_the_fan_tool(relative):
+    # exposure must not read as proof: the line that names cc2_set_fan has to carry the caveat with it
+    lines = (ROOT / relative).read_text(encoding="utf-8").splitlines()
+    named = [line for line in lines if "cc2_set_fan" in line]
+    assert named, relative
+    assert any("unproven" in line or "never answered 1030" in line for line in named), relative
 
 
 def test_the_module_is_importable_but_imports_nothing_from_the_server():
@@ -423,8 +499,8 @@ def test_the_module_is_importable_but_imports_nothing_from_the_server():
 
 
 def test_the_peripheral_module_still_refuses_to_send_1030():
-    # this candidate changes nothing about the module that holds the method back: two implementations
-    # of one disagreement is bad, but quietly widening a tested-and-documented refusal is worse
+    # exposing the fan as its own tool changes nothing about the module that held the method back:
+    # two implementations of one disagreement is bad, and quietly widening a tested refusal is worse
     from orcaslicer_mcp.printer import cc2_peripherals as per
 
     assert fan.METHOD_SET_FAN not in per._METHODS.values()
@@ -435,10 +511,10 @@ def test_the_live_test_recipe_names_the_edits_a_real_one_requires():
     for structure in ("CC2_TOOL_NAMES", "_TOOL_ANNOTATIONS", "_OPEN_WORLD_TOOLS", "@mcp.tool()"):
         assert structure in server
 
-
 async def test_every_authored_string_fits_the_direct_tools_reply_cap():
     texts = [fan.UNVERIFIED, fan.SCALE_NOW, fan.READBACK_UNIT, fan.CONTRADICT.format(
-        fan="model", value=0), fan.OBSERVE_UNKNOWN_NOTE, fan._AT_LEAST_ONE, job.PREVIEW_HOW]
+        fan="model", value=0), fan.OBSERVE_UNKNOWN_NOTE, fan.PRE_READ_LOST_NOTE, fan._AT_LEAST_ONE,
+        job.PREVIEW_HOW]
     texts += [n for n in (await fan.set_fan(scripted(), {"model": 100})).notes]
     texts += [n for n in (await fan.set_fan(scripted(command={"error_code": 1003}),
                                             {"model": 100})).notes]

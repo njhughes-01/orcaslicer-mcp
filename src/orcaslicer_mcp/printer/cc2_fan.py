@@ -1,11 +1,16 @@
-"""INTERNAL CANDIDATE for CC2 fan control (method 1030) — not a tool, not exposed, not claimed to
-work. Nothing imports this module: ``server.py`` declares no fan tool, ``CC2_TOOL_NAMES``,
-``_TOOL_ANNOTATIONS`` and ``_OPEN_WORLD_TOOLS`` do not name one, and no manifest or README mentions
-it; ``tests/test_cc2_fan.py`` fails if that posture changes. It exists so a controlled live test,
-with Nathan and an idle printer present, has one already-checked frame to send instead of somebody
-inventing one at the console.
+"""CC2 fan control (method 1030), exposed as the ``cc2_set_fan`` tool — and still not claimed to
+work. What was true of it as an internal candidate is true of it as a tool, and is said in every
+reply rather than assumed away: no CC2 has ever answered 1030 for this project, so the fan scale on
+any given firmware is unproven. ``verified_on_this_printer`` is false in every reply with the
+sentence explaining why beside it, the preview puts the wire formula and this call's own numbers on
+the record before anything is sent, the argument bar refuses a number that is not the official UI's
+percent, and the read-back hands back the printer's numbers exactly as it answered them, with no
+unit attached. It is a tool rather than a drawer because the disagreement below is precisely what a
+controlled live test settles, and a test with one already-checked frame to send beats one where
+somebody invents a frame at the console; ``tests/test_cc2_fan.py`` pins that posture, and
+``tests/test_server_cc2.py`` pins the tool's two phases at the tool layer.
 
-WHY IT IS STILL A CANDIDATE. The three first-party sources do not agree about the number that rides
+WHY THE SCALE IS STILL UNPROVEN. The three first-party sources do not agree about the number that rides
 ``fan``/``aux_fan``/``box_fan``, and none of them is this printer:
 
 * **Elegoo's own LAN control** (the 3.6 MB bundle the printer serves, ``lan/index.html``) has exactly
@@ -13,7 +18,7 @@ WHY IT IS STILL A CANDIDATE. The three first-party sources do not agree about th
   ``{auxiliaryFanSpeed: v/100*255}`` and ``{chassisFanSpeed: v/100*255}``, and the store they reach
   (``printer-mqtt``) sends ``{method: 1030, params: {fan, box_fan, aux_fan}}`` — each key omitted
   when its value is undefined — treating ``error_code === 0`` as success and passing ``G7*5``
-  (``G7 = 1e3``, so 5 s). So the widget Nathan drags holds a **percent 0-100** and the number that
+  (``G7 = 1e3``, so 5 s). So the widget a person drags holds a **percent 0-100** and the number that
   leaves is that percent times 2.55, i.e. the **0-255 family, unreduced** (50 % leaves as 127.5,
   because the client does not round).
 * **That same client's read-back agrees with the wire, not with the widget**: it paints the widgets
@@ -55,6 +60,7 @@ the pinned session, and no note or reply carries an address, a serial or a token
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from typing import Any
 
 from . import cc2_control as job
@@ -65,9 +71,9 @@ from .cc2_transport import Cc2TimeoutError, PrinterError
 SETTING = "fan"
 METHOD_SET_FAN = 1030             # FanControl in the official client's own enum
 
-# The three fields the official client writes, beside the label Nathan's own sources use for them
-# (its model/auxiliary/chassis words and pycentauri's model/auxiliary/chamber spellings agree on
-# these three and only these three). Order carries no meaning: the client's own key order differs.
+# The three fields the official client writes, beside the labels its own widgets use for them (its
+# model/auxiliary/chassis words and pycentauri's model/auxiliary/chamber spellings agree on these
+# three and only these three). Order carries no meaning: the client's own key order differs.
 FAN_FIELDS: dict[str, str] = {"model": "fan", "auxiliary": "aux_fan", "chamber": "box_fan"}
 FANS: tuple[str, ...] = tuple(FAN_FIELDS)
 
@@ -82,7 +88,7 @@ WIRE_MAX = 255                    # the number that percent becomes under the UI
 # Every authored string stays under the direct tools' reply cap (job.NOTE_CAP), asserted in
 # tests/test_cc2_fan.py, so nothing a future registration says gets cut mid-sentence.
 UNVERIFIED = (
-    "No CC2 has ever answered 1030 for this project, so the fan scale on Nathan's firmware is "
+    "No CC2 has ever answered 1030 for this project, so the fan scale on your firmware is "
     "unproven: the official LAN control multiplies its percent by 2.55 before sending, the "
     "integration's manual says 0-255, and its own code sends 0-100 unconverted."
 )
@@ -107,6 +113,11 @@ _AT_LEAST_ONE = (
     "Pass the fan(s) to change as model / auxiliary / chamber, each a whole percent 0-100. A fan you "
     "leave out is left alone — the official client omits it from the request too."
 )
+PRE_READ_LOST_NOTE = (
+    "The status read taken BEFORE the fan command did not land, so there is no earlier number to "
+    "compare the fans against: every 'changed' below is unknown, not a number that stayed put."
+)
+_PRE_READ_PREFIX = " Why it did not land: "
 
 
 @dataclass(frozen=True)
@@ -436,3 +447,43 @@ async def set_fan(transport: Any, values: dict[str, Any], *,
         notes.append(lost_note)
     return Cc2FanResult(**base(ControlStatus.ACCEPTED, accepted=True, observed=observed,
                                notes=tuple(notes)))
+
+
+# --------------------------------------------------------------------------- the two-read confirmed path
+
+
+async def _pre_read(transport: Any) -> tuple[dict | None, str | None]:
+    """One read-only 1002 taken **before** a command, or the note that it did not land. Its only job
+    is to give the follow-up look something to compare against, because ``changed`` is a fact about
+    two raw readings and cannot exist with one. It is not a pre-check: nothing here decides whether
+    the command should go, and no source conditions 1030 on a prior read. The note carries the
+    printer-side reason inside the reply cap, and drops the reason rather than the sentence when even
+    that would not fit, because the sentence is the part a caller acts on."""
+    try:
+        return {"fans_now_raw": fan_raws(await st.fetch_machine_status(transport))}, None
+    except PrinterError as e:
+        why = getattr(e, "message", None) or str(e)
+        budget = job.NOTE_CAP - len(PRE_READ_LOST_NOTE) - len(_PRE_READ_PREFIX)
+        tail = _PRE_READ_PREFIX + why[:max(0, budget)] if budget > 0 else ""
+        return None, PRE_READ_LOST_NOTE + tail
+
+
+async def set_fan_with_before(transport: Any, values: dict[str, Any], *,
+                              timeout_s: float | None = None) -> Cc2FanResult:
+    """``set_fan`` with the reading that makes ``observed_fan_changed`` a fact instead of a row of
+    nulls. Three requests in total, no more: one read-only 1002 for what each fan reports before the
+    command, the one 1030, and the single read-only 1002 ``set_fan`` already takes afterwards — which
+    is the measurement the live test came for, raw number against raw number from the same frame
+    field. The pre-read never becomes a second command, a resend or a poll, and it does not disturb
+    the rule that a refusal on record earns no follow-up read: the command has not left when it runs.
+
+    A pre-read that does not land is reported, not hidden, and is not a reason to withhold the
+    command: the printer's answer to the 1030 and its own one look afterwards are still the printer's
+    words, while every ``changed`` stays None rather than becoming a confident False. That note is
+    added only when a look actually followed the command, so a refusal reply keeps saying the one
+    thing that matters about a refusal — nothing was read after it."""
+    before, lost = await _pre_read(transport)
+    result = await set_fan(transport, values, before=before, timeout_s=timeout_s)
+    if lost is not None and result.status is not ControlStatus.REFUSED:
+        result = dataclass_replace(result, notes=result.notes + (lost,))
+    return result
