@@ -449,14 +449,20 @@ async def test_a_refusal_from_the_printer_keeps_its_vocabulary_whole_and_reads_n
     assert any("Nothing was resent" in n for n in out.notes)
 
 
-def test_the_pre_read_note_and_its_reason_stay_inside_the_reply_cap():
-    # the house rule for composed notes: the sentence is what a caller acts on, so a long reason loses
-    # its tail, never the sentence, and the whole thing still fits
-    long_why = "x" * 900
-    budget = job.NOTE_CAP - len(fan.PRE_READ_LOST_NOTE) - len(fan._PRE_READ_PREFIX)
-    composed = fan.PRE_READ_LOST_NOTE + fan._PRE_READ_PREFIX + long_why[:max(0, budget)]
-    assert len(fan.PRE_READ_LOST_NOTE) <= job.NOTE_CAP
-    assert budget > 0 and len(composed) <= job.NOTE_CAP
+async def test_a_pre_read_failure_never_echoes_the_transport_and_stays_inside_the_cap():
+    # the after-command look's note quotes the transport, the house pattern; this module's own rule is
+    # that a note it authors carries no address, no serial and no token, so the pre-read note stays
+    # its own sentence however noisy the failure underneath it was
+    host_sounding = PrinterError("protocol_error",
+                                 f"simulated: the printer at {HOST} ({SN}) refused with token "
+                                 f"{FAKE_TOKEN}", reason="no_data")
+    transport = FakeFanTransport({1002: deque([host_sounding, frame_1002()]), 1030: {"error_code": 0}})
+    out = await fan.set_fan_with_before(transport, {"model": 100})
+    reported = json.dumps(out.as_dict())
+    assert any("did not land" in n for n in out.notes) and out.accepted
+    for banned in (HOST, SN, FAKE_TOKEN):
+        assert banned not in reported, banned
+    assert all(len(note) <= job.NOTE_CAP for note in out.notes), [len(n) for n in out.notes]
 
 
 # --------------------------------------------------------------------------- the exposed posture

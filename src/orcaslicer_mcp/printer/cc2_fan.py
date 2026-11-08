@@ -117,7 +117,6 @@ PRE_READ_LOST_NOTE = (
     "The status read taken BEFORE the fan command did not land, so there is no earlier number to "
     "compare the fans against: every 'changed' below is unknown, not a number that stayed put."
 )
-_PRE_READ_PREFIX = " Why it did not land: "
 
 
 @dataclass(frozen=True)
@@ -456,16 +455,17 @@ async def _pre_read(transport: Any) -> tuple[dict | None, str | None]:
     """One read-only 1002 taken **before** a command, or the note that it did not land. Its only job
     is to give the follow-up look something to compare against, because ``changed`` is a fact about
     two raw readings and cannot exist with one. It is not a pre-check: nothing here decides whether
-    the command should go, and no source conditions 1030 on a prior read. The note carries the
-    printer-side reason inside the reply cap, and drops the reason rather than the sentence when even
-    that would not fit, because the sentence is the part a caller acts on."""
+    the command should go, and no source conditions 1030 on a prior read.
+
+    The note is this module's own sentence and nothing else, deliberately: it does not echo the
+    transport's message the way the after-command look's note does, because the only new thing a
+    pre-read can fail with is a session that was already in trouble, and this module's rule is that no
+    note it authors carries an address, a serial or a token. What a caller needs here is the one word
+    that matters — the comparison is unknown — and ``cc2_status`` reads on demand."""
     try:
         return {"fans_now_raw": fan_raws(await st.fetch_machine_status(transport))}, None
-    except PrinterError as e:
-        why = getattr(e, "message", None) or str(e)
-        budget = job.NOTE_CAP - len(PRE_READ_LOST_NOTE) - len(_PRE_READ_PREFIX)
-        tail = _PRE_READ_PREFIX + why[:max(0, budget)] if budget > 0 else ""
-        return None, PRE_READ_LOST_NOTE + tail
+    except PrinterError:
+        return None, PRE_READ_LOST_NOTE
 
 
 async def set_fan_with_before(transport: Any, values: dict[str, Any], *,
