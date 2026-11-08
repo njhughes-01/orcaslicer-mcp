@@ -170,7 +170,7 @@ uv venv && uv pip install -e ".[dev]"
 uv run pytest   # unit tests against a mock API, plus a guarded live smoke test
 ```
 
-The live smoke test skips itself unless `ORCA_API_URL` and `ORCA_API_TOKEN` point at a running OrcaSlicer MCP build.
+The live smoke test skips itself unless `ORCA_API_URL` and `ORCA_API_TOKEN` point at a running OrcaSlicer MCP build. Optional real-slice regression tests also skip unless `ORCA_CC2_TEST_GCODE` points to a suitable local CC2 G-code file.
 
 Design specs and protocol notes live in [`docs/`](docs/).
 

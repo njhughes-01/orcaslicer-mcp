@@ -1239,11 +1239,12 @@ def test_a_bare_flag_after_a_compact_setpoint_stays_a_flag_and_the_file_parses()
 
 def _mount_slice_text() -> str:
     """The real 2026-11-04 CC2 slice this workflow exists for, or a skip: it is a machine-local file,
-    not a repo fixture (``ORCA_CC2_TEST_GCODE`` overrides the path). Tests that use it assert on the
+    not a repo fixture (``ORCA_CC2_TEST_GCODE`` supplies the path). Tests that use it assert on the
     file's own commands, so a substituted path cannot let them pass by accident."""
-    path = Path(os.environ.get(
-        "ORCA_CC2_TEST_GCODE",
-        "/home/killerherts/.orcaslicer-mcp/gcode/eva-chube-petg-260c-80c.gcode"))
+    configured_path = os.environ.get("ORCA_CC2_TEST_GCODE")
+    if not configured_path:
+        pytest.skip("set ORCA_CC2_TEST_GCODE to run the optional real-slice checks")
+    path = Path(configured_path)
     if not path.is_file():
         pytest.skip(f"{path} is only on the machine that mounted it")
     return path.read_text(encoding="utf-8", errors="replace")
