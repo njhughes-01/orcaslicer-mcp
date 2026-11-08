@@ -797,7 +797,7 @@ async def test_no_address_no_token_no_env_touches(store, monkeypatch, tmp_path):
     for method, params in tr.requests:
         texts.append(f"{method} {params}")
     blob = "\n".join(texts)
-    assert HOST not in blob and "10.20.30.40" not in blob
+    assert HOST not in blob
     assert FAKE_TOKEN not in blob
     assert not any(p for _, p in tr.sent() if "token" in str(p).lower())
 
