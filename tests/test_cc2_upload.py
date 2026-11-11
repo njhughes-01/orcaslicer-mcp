@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import stat
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -2184,6 +2185,14 @@ async def test_a_final_listing_cannot_be_proven_complete_so_nothing_is_claimed(t
 # --------------------------------------------------------------------------- the receipt, private to the byte
 
 
+def _as_written_to_disk(receipt: Cc2UploadReceipt) -> Cc2UploadReceipt:
+    """The same receipt as this store can hand it back. The three upload-only parse facts
+    (designs 1 and 5) are never written to disk, so a receipt that carried them returns from the
+    store without them; comparing that shape is what keeps the round-trip assertions below
+    asserting the round trip, rather than quietly comparing two different receipts."""
+    return replace(receipt, printer_model=None, vendor_templates=None, templates_compared=None)
+
+
 async def test_the_receipt_binds_printer_name_size_hash_and_every_parsed_setting(
         tmp_path, store):
     src = write_gcode(tmp_path, nozzle_first=265.0, nozzle=255.0, bed_first=80.0, bed=70.0)
@@ -2207,7 +2216,8 @@ async def test_the_receipt_binds_printer_name_size_hash_and_every_parsed_setting
 
     path = store.path_for(SN, DEST)
     raw = path.read_bytes()
-    assert receipt == store.load(SN, DEST)  # round-trips through disk, exactly
+    assert _as_written_to_disk(receipt) == store.load(SN, DEST)  # round-trips exactly; the three
+    # upload-only parse facts (designs 1 and 5) are the only thing disk does not keep
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE(store.root.stat().st_mode) == 0o700
     assert stat.S_IMODE((store.root / "receipts").stat().st_mode) == 0o700
@@ -2436,8 +2446,57 @@ async def test_an_uploaded_two_tool_file_records_every_tool_on_its_receipt(tmp_p
     assert (receipt.tool_index, receipt.material, receipt.nozzle_temp) == (0, "PLA", 210.0)
     assert receipt.extrusion_nozzle_temps == (210.0,)  # flat union, first order seen
     assert 240.0 not in receipt.commanded_nozzle_setpoints  # the flush R is no setpoint
-    assert store.load(SN, DEST) == receipt  # every tool of it survives the store too
+    assert store.load(SN, DEST) == _as_written_to_disk(receipt)  # every tool survives the store too
 
+
+
+def test_the_upload_only_parse_facts_never_join_the_receipt_on_disk():
+    # design 1 and 5's facts ride the receipt only as far as the reply that answers the upload:
+    # to_dict does not write them, from_dict never reads them, and the format and version a start
+    # trusts are untouched — a receipt read back describes the file on the printer, re-checked by
+    # nobody, so it says nothing about templates
+    r = _sample_receipt(printer_model="Elegoo Centauri Carbon 2",
+                        vendor_templates="modified: machine_end_gcode", templates_compared=3)
+    data = r.to_dict()
+    assert not ({"printer_model", "vendor_templates", "templates_compared"} & data.keys())
+    assert data["version"] == RECEIPT_VERSION
+    back = Cc2UploadReceipt.from_dict(data)
+    assert (back.printer_model, back.vendor_templates, back.templates_compared) == (None, None,
+                                                                                    None)
+    assert back != r  # the honest statement of what a round trip does: it drops exactly these
+    assert back.to_dict() == data  # and writes the identical bytes on the way back out
+    for kw in (dict(templates_compared=6),      # more than the five templates this build knows
+               dict(templates_compared=True),   # a flag is not a count
+               dict(templates_compared=-1),
+               dict(vendor_templates=""),       # a verdict that says nothing
+               dict(printer_model="bad\nserial")):
+        with pytest.raises(PrinterError):  # validated on the way in like every other field
+            _sample_receipt(**kw)
+
+
+async def test_the_uploaded_receipt_carries_the_model_and_template_verdict_the_parse_found(
+        tmp_path, store, gcode_fixture):
+    # the same facts from the writer, on the file that really is two-colour and really is stock:
+    # the upload returns them, so cc2_upload_gcode's reply needs no re-parse and no getattr
+    # guesswork, and the receipt the store hands a later start carries none of them
+    src = tmp_path / "penelope-two-colour.gcode"
+    src.write_text(gcode_fixture("cc2_two_tool"), encoding="utf-8")
+    body = src.read_bytes()
+    tr = FakeTransport([("other.gcode", 1)], [("other.gcode", 1), (DEST, len(body))])
+    receipt, http = await run(tr, src, store=store)
+
+    assert receipt.printer_model == "Elegoo Centauri Carbon 2"  # the model the gate accepted
+    assert receipt.vendor_templates == "stock"                  # all five templates are stock
+    assert receipt.templates_compared == 5                       # and all five were compared
+    raw = store.path_for(SN, DEST).read_bytes()
+    for never in (b"printer_model", b"vendor_templates", b"templates_compared",
+                  b"machine_start_gcode", b"Elegoo"):  # the model line, the verdict and the
+        assert never not in raw                        # template text never reach the store
+
+    loaded = store.load(SN, DEST)
+    assert (loaded.printer_model, loaded.vendor_templates,
+            loaded.templates_compared) == (None, None, None)
+    assert loaded == _as_written_to_disk(receipt)  # everything else still round-trips exactly
 
 
 def test_a_tool_extrusion_temperature_the_flat_union_lacks_refuses_the_receipt():

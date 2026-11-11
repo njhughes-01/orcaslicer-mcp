@@ -2212,6 +2212,16 @@ async def upload_gcode(transport: Any, path: str | os.PathLike[str], destination
                     commanded_bed_setpoints=settings.bed_setpoints,
                     extrusion_nozzle_temps=settings.extrusion_nozzle_temps,
                     tool_index=settings.tool_index,
+                    # design 1 and 5's parse facts, carried only as far as the upload reply: the
+                    # model line the gate accepted, whether the file's five machine templates are
+                    # the stock ones and how many of the five it actually wrote. They are not
+                    # part of the receipt on disk (cc2_receipts writes none of them and reads
+                    # none back), because they describe this parse, not the file that now sits on
+                    # the printer — a start reading them off the store would be trusting a
+                    # verdict nobody re-ran
+                    printer_model=settings.printer_model,
+                    vendor_templates=settings.vendor_templates,
+                    templates_compared=settings.templates_compared,
                     # every tool the file selected carries its own entry — its material, its own
                     # setpoints, the temperatures its extrusion ran at, and apart from them any
                     # accepted flush R both spools it touched were pushed through (design
