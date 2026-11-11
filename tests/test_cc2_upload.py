@@ -345,8 +345,10 @@ def test_the_two_tool_fixture_parses_to_two_pla_tools_at_210_flushing_at_240_on_
     # the real grey/black Penelope-tag slice, trimmed by task 1.1 to head + first T1 change
     # block + tail: two PLA tools both printing at 210 °C, and the vendor's own change-filament
     # purge flushing at R 240 — the declared nozzle_temperature_range_high of both tools. 240
-    # is therefore a verified extrusion temperature of BOTH spools: the tray each tool maps
-    # to must be rated for it at start (design 3). The fixture lives beside the tests and is
+    # is therefore a flush temperature of BOTH spools, kept apart from the printing
+    # temperatures (design amendment 9): no M109 waits at it, so it is neither an extrusion
+    # temperature nor a commanded setpoint, and the start reports it against each tray's rated
+    # maximum instead of refusing on it. The fixture lives beside the tests and is
     # not committed (tests/fixtures/*.gcode is ignored — see the change's tasks.md, task 1.1).
     fixture = Path(__file__).parent / "fixtures" / "cc2_two_tool.gcode"
     if not fixture.is_file():
@@ -355,12 +357,14 @@ def test_the_two_tool_fixture_parses_to_two_pla_tools_at_210_flushing_at_240_on_
     assert [t.tool_index for t in s.tools] == [0, 1]
     assert [t.material for t in s.tools] == ["PLA", "PLA"]
     assert all((t.nozzle_first_layer_temp, t.nozzle_temp) == (210.0, 210.0) for t in s.tools)
-    assert [t.extrusion_nozzle_temps for t in s.tools] == [(210.0, 240.0), (210.0, 240.0)]
+    assert [t.extrusion_nozzle_temps for t in s.tools] == [(210.0,), (210.0,)]
+    assert [t.flush_nozzle_temps for t in s.tools] == [(240.0,), (240.0,)]
     # the flat fields stay the first tool's config story beside the file-wide verified one
     assert (s.tool_index, s.material, s.nozzle_temp, s.nozzle_first_layer_temp) == (
         0, "PLA", 210.0, 210.0)
-    assert s.extrusion_nozzle_temps == (210.0, 240.0)
-    assert s.nozzle_setpoints == (140.0, 210.0)   # the 140 preheat stays evidence, not a setpoint
+    assert s.extrusion_nozzle_temps == (210.0,)
+    # the 140 preheat stays evidence, not a print setpoint, and the flush R is no setpoint at all
+    assert s.nozzle_setpoints == (140.0, 210.0)
     # and the real slice writes its speed overrides (M220 S100) — allowed by design 5, below
     assert "M220 S100" in fixture.read_text(encoding="utf-8", errors="replace")
 
@@ -370,13 +374,19 @@ def test_a_flush_r_may_stand_off_the_verified_target_only_as_both_tools_declared
     # R=[nozzle_temperature_range_high], so every real multi-colour file flushes hotter than it
     # prints. R equal to the verified target needs no exception at all; an R that equals the
     # declared high of BOTH the tool being left and the tool switched to is accepted and
-    # recorded as an extrusion temperature of both spools, because the flush really extrudes at
-    # R; an R that equals either one of them — or neither, one degree of difference included —
-    # refuses, because no wait ever proved that number and no spool has been read for it.
+    # recorded as a flush temperature of both spools (design amendment 9) — never as a
+    # printing temperature, and never as a commanded setpoint, while the purge's Q and S stay
+    # the verified waits they must be; an R that equals either one of them — or neither, one
+    # degree of difference included — refuses, because no wait ever proved that number and the
+    # file's own declared range does not bound it.
     s = up.parse_gcode_text(_two_tool_frame(r_flush=240.0, range_high="240,240"))
-    assert all(240.0 in t.extrusion_nozzle_temps for t in s.tools)
+    assert [t.flush_nozzle_temps for t in s.tools] == [(240.0,), (240.0,)]
+    assert [t.extrusion_nozzle_temps for t in s.tools] == [(210.0,), (210.0,)]
+    assert s.extrusion_nozzle_temps == (210.0,)
+    assert 240.0 not in s.nozzle_setpoints and 210.0 in s.nozzle_setpoints
     same = up.parse_gcode_text(_two_tool_frame(r_flush=210.0))   # R == target: no exception used
     assert [t.extrusion_nozzle_temps for t in same.tools] == [(210.0,), (210.0,)]
+    assert [t.flush_nozzle_temps for t in same.tools] == [(), ()]
     for bad_r, high in ((250.0, "240,240"),    # the acceptance's own number, moved by ten
                         (239.0, "240,240"),    # one below the declared high is still a different
                         (240.0, "240,250"),    # heat: both tools must declare it, and the
@@ -1986,16 +1996,17 @@ def test_the_verified_extrusion_temps_survive_the_atomic_round_trip_through_disk
 
 def _two_tool_receipt(**over):
     """A receipt as the real grey/black slice's parse would write one: two PLA tools printing
-    at 210 °C, the vendor's change-filament flush R 240 recorded as a verified extrusion
-    temperature of BOTH spools (design 3 — the flush pushed both through the hot end at it),
-    and the 140 preheat left as commanded evidence, never as extrusion. 240 is no commanded
-    setpoint here, so this is the receipt shape only version 3 may carry."""
+    at 210 °C, the vendor's change-filament flush R 240 recorded as a flush temperature of BOTH
+    spools (design amendment 9 — the flush pushed both through the hot end at it, but no wait
+    ever proved it, so it is no printing temperature), and the 140 preheat left as commanded
+    evidence, never as extrusion. ``flush_nozzle_temps`` is a field only version 3 carries."""
     tools = tuple(
         ToolReceipt(tool_index=index, material="PLA", nozzle_first_layer_temp=210.0,
-                    nozzle_temp=210.0, extrusion_nozzle_temps=(210.0, 240.0))
+                    nozzle_temp=210.0, extrusion_nozzle_temps=(210.0,),
+                    flush_nozzle_temps=(240.0,))
         for index in (0, 1))
     base = dict(material="PLA", nozzle_first_layer_temp=210.0, nozzle_temp=210.0,
-                commanded_nozzle_setpoints=(140.0, 210.0), extrusion_nozzle_temps=(210.0, 240.0),
+                commanded_nozzle_setpoints=(140.0, 210.0), extrusion_nozzle_temps=(210.0,),
                 tool_index=0, tools=tools)
     base.update(over)
     return _sample_receipt(**base)
@@ -2008,8 +2019,10 @@ def test_a_v3_receipt_round_trips_every_tool_and_the_flat_fields_stay_the_first_
     assert data["version"] == RECEIPT_VERSION == 3
     assert [tool["tool_index"] for tool in data["tools"]] == [0, 1]
     assert all(tool["material"] == "PLA" and tool["nozzle_temp"] == 210.0
-               and tool["extrusion_nozzle_temps"] == [210.0, 240.0]
-               for tool in data["tools"])  # the flush R is each tool's own, for task 4's tray check
+               and tool["extrusion_nozzle_temps"] == [210.0]
+               and tool["flush_nozzle_temps"] == [240.0]
+               for tool in data["tools"])  # the flush R is each tool's own, apart from printing
+    assert Cc2UploadReceipt.from_dict(data).tools[1].flush_nozzle_temps == (240.0,)
     # the flat fields stay the first tool's story for readers that know only them
     first = data["tools"][0]
     assert (r.material, r.tool_index, r.nozzle_first_layer_temp, r.nozzle_temp) == (
@@ -2025,7 +2038,8 @@ def test_the_tools_survive_the_atomic_round_trip_through_disk(tmp_path):
     assert store.load(SN, DEST) == r
     data = json.loads(store.path_for(SN, DEST).read_text(encoding="utf-8"))
     assert data["version"] == 3 and len(data["tools"]) == 2
-    assert data["tools"][1]["extrusion_nozzle_temps"] == [210.0, 240.0]
+    assert data["tools"][1]["extrusion_nozzle_temps"] == [210.0]
+    assert [tool["flush_nozzle_temps"] for tool in data["tools"]] == [[240.0], [240.0]]
 
 
 def test_a_version_2_receipt_reads_as_one_tool_built_from_the_flat_fields():
@@ -2040,6 +2054,7 @@ def test_a_version_2_receipt_reads_as_one_tool_built_from_the_flat_fields():
                                       nozzle_first_layer_temp=r.nozzle_first_layer_temp,
                                       nozzle_temp=r.nozzle_temp,
                                       extrusion_nozzle_temps=r.extrusion_nozzle_temps),)  # … built
+    assert back.tools[0].flush_nozzle_temps == ()  # v2 knew no flush field: read as none
     with pytest.raises(PrinterError):  # … and v2 knew no flush R that could explain an
         Cc2UploadReceipt.from_dict(  # uncommanded extrusion, so reading v2 keeps enforcing it
             dict(v2, extrusion_nozzle_temps=[300.0]))
@@ -2057,6 +2072,9 @@ def test_a_v3_dict_with_a_malformed_tool_entry_is_refused():
         [dict(entry, tool_index="0")],  # a tool that is not a number
         [dict(entry, nozzle_temp=500.0)],  # a temperature outside the fence
         [dict(entry, extrusion_nozzle_temps="210")],  # temperatures spelled as a string
+        [{k: v for k, v in entry.items() if k != "flush_nozzle_temps"}],  # v3 always writes it
+        [dict(entry, flush_nozzle_temps="240")],  # flush temperatures spelled as a string
+        [dict(entry, flush_nozzle_temps=[500.0])],  # a flush outside the fence
         [dict(entry, extrusion_nozzle_temps=[210.0, 400.0]), base["tools"][1]],
         # 400 °C is inside the fence but no commanded setpoint and no flush both flushing
         # tools carried — a temperature the parser could not have written for that tool
@@ -2071,18 +2089,20 @@ def test_a_v3_dict_with_a_malformed_tool_entry_is_refused():
 async def test_an_uploaded_two_tool_file_records_every_tool_on_its_receipt(tmp_path, store):
     # the writer, not just the reader: the two-tool frame — start purge at T0, the change-
     # filament purge flushing at R 240 (both tools' declared range high), T1's own wait —
-    # uploads, and the receipt it writes carries both tools with the flush R recorded for
-    # each, so the start (task 4) can refuse any tray rated under 240 for either tool
+    # uploads, and the receipt it writes carries both tools with the flush R recorded as each
+    # one's flush temperature (design amendment 9), apart from the printing temperatures the
+    # start's rated-range check reads
     src = tmp_path / "two-colour.gcode"
     src.write_text(_two_tool_frame(), encoding="utf-8")
     body = src.read_bytes()
     tr = FakeTransport([("other.gcode", 1)], [("other.gcode", 1), (DEST, len(body))])
     receipt, http = await run(tr, src, store=store)
     assert [(t.tool_index, t.material, t.nozzle_first_layer_temp, t.nozzle_temp,
-             t.extrusion_nozzle_temps) for t in receipt.tools] == [
-        (0, "PLA", 210.0, 210.0, (210.0, 240.0)), (1, "PLA", 210.0, 210.0, (210.0, 240.0))]
+             t.extrusion_nozzle_temps, t.flush_nozzle_temps) for t in receipt.tools] == [
+        (0, "PLA", 210.0, 210.0, (210.0,), (240.0,)), (1, "PLA", 210.0, 210.0, (210.0,), (240.0,))]
     assert (receipt.tool_index, receipt.material, receipt.nozzle_temp) == (0, "PLA", 210.0)
-    assert receipt.extrusion_nozzle_temps == (210.0, 240.0)  # flat union, first order seen
+    assert receipt.extrusion_nozzle_temps == (210.0,)  # flat union, first order seen
+    assert 240.0 not in receipt.commanded_nozzle_setpoints  # the flush R is no setpoint
     assert store.load(SN, DEST) == receipt  # every tool of it survives the store too
 
 

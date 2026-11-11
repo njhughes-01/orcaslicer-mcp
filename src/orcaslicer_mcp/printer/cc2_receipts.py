@@ -41,18 +41,21 @@ from .errors import PrinterError
 # Version 2 added ``extrusion_nozzle_temps``: the nozzle temperatures extrusion was verified to
 # run at (each proven by an M109 wait at that exact target, in command order), which a start
 # compares against the loaded spool's range. Version 3 added ``tools``: one entry per tool the
-# file selects — its own material, first-layer and steady nozzle setpoints, and the nozzle
-# temperatures that tool's extrusion was verified at, which is also where an accepted flush R
-# (the multi-tool change's design 3) is recorded: the flush pushed both spools through the hot
-# end at it, so it belongs to every tool printing below it, and a start refuses any mapped tray
-# whose rated maximum sits under it. The flat ``material``/``tool_index``/``nozzle_*`` fields
-# keep the first tool's values, and the flat ``extrusion_nozzle_temps`` the file-wide verified
-# union, for readers that know only those. This build writes version 3 and reads it fully; it
-# reads version 2 as a one-tool receipt built from the flat fields, keeping v2's stricter rule
-# that every extrusion temperature is a commanded setpoint (a v2 file had no flush-R exception
-# to explain one). Version 1 recorded only the indiscriminate commanded setpoints, which cannot
-# tell a 140 °C non-extruding preheat from a cold extrusion; no version-1 receipt was ever
-# written outside a test, and this build reads nothing else.
+# file selects — its own material, first-layer and steady nozzle setpoints, the nozzle
+# temperatures that tool's extrusion was verified at, and, apart from them, the tool's
+# ``flush_nozzle_temps``: every accepted flush R (the multi-tool change's design amendment 9)
+# the tool was left or entered at. A flush R is the vendor purge's declared range-high, which
+# the flush really extrudes at but no M109 ever waits at, so it is no printing temperature; a
+# start reports it against each tray's rated maximum instead. The flat ``material``/
+# ``tool_index``/``nozzle_*`` fields keep the first tool's values, and the flat
+# ``extrusion_nozzle_temps`` the file-wide verified union, for readers that know only those.
+# This build writes version 3 and reads it fully; every v3 tool entry must carry
+# ``flush_nozzle_temps``, empty or not. It reads version 2 as a one-tool receipt built from the
+# flat fields, with no flush temperatures, keeping v2's stricter rule that every extrusion
+# temperature is a commanded setpoint (a v2 file had no flush-R exception to explain one).
+# Version 1 recorded only the indiscriminate commanded setpoints, which cannot tell a 140 °C
+# non-extruding preheat from a cold extrusion; no version-1 receipt was ever written outside a
+# test, and this build reads nothing else.
 RECEIPT_VERSION = 3
 ENV_RECEIPTS_DIR = "ORCA_CC2_RECEIPTS_DIR"
 DEFAULT_DIR = Path.home() / ".local" / "share" / "orcaslicer-mcp" / "cc2-receipts"
@@ -118,19 +121,24 @@ def _checked_temps(value: object, label: str) -> tuple[float, ...]:
 class ToolReceipt:
     """What the receipt says about one of the file's own tools: the material it prints, the
     nozzle setpoints it prints at (first layer may legitimately differ from the rest, and both
-    are kept), and the nozzle temperatures that tool's extrusion was verified to run at — each
-    one either an M109 wait that tool ran behind or a flush temperature the purge pushed
-    through it (design 3), and the list a start compares against the tray that tool maps to.
+    are kept), the nozzle temperatures that tool's extrusion was verified to run at — each one
+    an M109 wait that tool ran behind, and the list a start compares against the tray that tool
+    maps to — and, kept apart, ``flush_nozzle_temps``: every accepted flush R the tool was left
+    or entered at (design amendment 9), a temperature the purge pushed through it without any
+    wait, which a start reports against the tray's rated maximum rather than refusing on.
     The first entry of the receipt's ``tools`` is the tool the receipt's flat fields describe."""
     tool_index: int
     material: str
     nozzle_first_layer_temp: float
     nozzle_temp: float
     extrusion_nozzle_temps: tuple[float, ...]
+    flush_nozzle_temps: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "extrusion_nozzle_temps",
-                           tuple(self.extrusion_nozzle_temps or ()))
+        for field_name in ("extrusion_nozzle_temps", "flush_nozzle_temps"):
+            value = getattr(self, field_name)
+            if not isinstance(value, (str, bytes)):  # a string is refused below, not split
+                object.__setattr__(self, field_name, tuple(value or ()))
         if (isinstance(self.tool_index, bool) or not isinstance(self.tool_index, int)
                 or self.tool_index < 0):
             raise PrinterError("protocol_error",
@@ -140,6 +148,7 @@ class ToolReceipt:
         _checked_temp(self.nozzle_first_layer_temp, "first-layer nozzle temperature")
         _checked_temp(self.nozzle_temp, "nozzle temperature")
         _checked_temps(self.extrusion_nozzle_temps, "extrusion nozzle temperatures")
+        _checked_temps(self.flush_nozzle_temps, "flush nozzle temperatures")
 
     def to_dict(self) -> dict:
         return {
@@ -148,13 +157,15 @@ class ToolReceipt:
             "nozzle_first_layer_temp": self.nozzle_first_layer_temp,
             "nozzle_temp": self.nozzle_temp,
             "extrusion_nozzle_temps": list(self.extrusion_nozzle_temps),
+            "flush_nozzle_temps": list(self.flush_nozzle_temps),
         }
 
     @classmethod
     def from_dict(cls, data: object) -> "ToolReceipt":
         """One tool entry of a version-3 receipt, failing closed at every gate like its parent:
-        not an object, a missing field — anything else raises, because a tool entry a start
-        compares a tray against cannot half-exist."""
+        not an object, a missing field (``flush_nozzle_temps`` included: version 3 always writes
+        it, so an entry without it was not written by this store) — anything else raises,
+        because a tool entry a start compares a tray against cannot half-exist."""
         if not isinstance(data, dict):
             raise Cc2UploadReceipt._bad("carries a tool entry that is not an object")
 
@@ -167,7 +178,8 @@ class ToolReceipt:
                    material=need("material"),
                    nozzle_first_layer_temp=need("nozzle_first_layer_temp"),
                    nozzle_temp=need("nozzle_temp"),
-                   extrusion_nozzle_temps=need("extrusion_nozzle_temps"))
+                   extrusion_nozzle_temps=need("extrusion_nozzle_temps"),
+                   flush_nozzle_temps=need("flush_nozzle_temps"))
 
 
 @dataclass(frozen=True)
@@ -183,14 +195,15 @@ class Cc2UploadReceipt:
     steady setpoints against a spool range and treats the rest as evidence, not as targets.
     ``extrusion_nozzle_temps`` is the start's other half: the nozzle temperatures extrusion was
     verified to run at file-wide (the union over the file's tools, first order seen) — each one
-    proven by an M109 wait at that temperature in command order, or accepted as a flush R, the
-    vendor change-filament purge's own declared range-high, which the flush really extruded at
-    (design 3). So a non-extruding preheat (a 140 °C flush warm-up before the 260 °C wait) never
+    proven by an M109 wait at that temperature in command order. An accepted flush R, the vendor
+    change-filament purge's own declared range-high, is not among them: it lives in each tool's
+    ``flush_nozzle_temps`` (design amendment 9). So a non-extruding preheat (a 140 °C flush warm-up before the 260 °C wait) never
     reads as a printing temperature, and every temperature that must sit inside the loaded
-    spool's range does. A verified wait is always a commanded setpoint; a flush R need not be —
-    it is recorded instead for every tool printing below it, because the flush pushed those
-    spools through the hot end at it. A receipt carrying an extrusion temperature neither story
-    explains was not written by this store, and one carrying more of them only ever makes a
+    spool's range does. A verified wait is always a commanded setpoint. The rule below still
+    admits, for a version-3 receipt, an extrusion temperature that is no commanded setpoint when
+    every tool printing below it carries it (the shape task 1.3 accepted while a flush R was
+    still recorded as an extrusion temperature); this build no longer writes one. A receipt
+    carrying an extrusion temperature neither story explains was not written by this store, and one carrying more of them only ever makes a
     start refuse more trays, never fewer — that direction is stated here because it is the
     whole reason the loosened rule costs nothing. ``tools`` carries one ``ToolReceipt`` per
     tool the file selects, in the parse's first-seen order; the flat ``material``,
@@ -275,12 +288,13 @@ class Cc2UploadReceipt:
                                    "its first tool's values, so it is refused rather than "
                                    "half-trusted.", reason="receipt_invalid")
         # Every extrusion temperature — the file-wide union's or any one tool's — must be one
-        # the parse could have arrived at (design 3): a commanded M104/M109 setpoint, or a
-        # flush temperature, hotter than the print, carried by every tool printing below it
-        # because the flush pushed all of those spools through the hot end at it. A v3 receipt
-        # therefore may carry an extrusion temperature no M109 ever commanded — the vendor's
-        # own change-filament purge writes one — and the safe direction is stated in the
-        # docstring: extra extrusion temperatures only ever make a start refuse more trays.
+        # the parse could have arrived at: a commanded M104/M109 setpoint, or (the rule task 1.3
+        # wrote while design 3 still recorded a flush R as an extrusion temperature) a
+        # temperature hotter than the print carried by every tool printing below it. Since
+        # design amendment 9 the parse keeps flush R in ``flush_nozzle_temps`` and writes only
+        # verified waits here, so the second branch is kept for receipts written before it, and
+        # the safe direction is stated in the docstring: extra extrusion temperatures only ever
+        # make a start refuse more trays.
         recorded = list(dict.fromkeys(
             list(extrusion) + [t for tool in self.tools for t in tool.extrusion_nozzle_temps]))
         unexplained: list[float] = []
