@@ -144,7 +144,7 @@ from typing import Any
 import httpx
 
 from . import cc2_state
-from .cc2_receipts import Cc2ReceiptStore, Cc2UploadReceipt
+from .cc2_receipts import Cc2ReceiptStore, Cc2UploadReceipt, ToolReceipt
 from .cc2_transport import AccessCode, _refusal
 from .errors import PrinterError
 
@@ -1851,6 +1851,16 @@ async def upload_gcode(transport: Any, path: str | os.PathLike[str], destination
                     commanded_bed_setpoints=settings.bed_setpoints,
                     extrusion_nozzle_temps=settings.extrusion_nozzle_temps,
                     tool_index=settings.tool_index,
+                    # every tool the file selected carries its own entry — its material, its own
+                    # setpoints, and the temperatures its extrusion ran at, including any
+                    # accepted flush R both spools it touched were pushed through (design 3);
+                    # the flat fields above stay the first tool's story beside them
+                    tools=tuple(
+                        ToolReceipt(tool_index=tool.tool_index, material=tool.material,
+                                    nozzle_first_layer_temp=tool.nozzle_first_layer_temp,
+                                    nozzle_temp=tool.nozzle_temp,
+                                    extrusion_nozzle_temps=tool.extrusion_nozzle_temps)
+                        for tool in settings.tools),
                     uploaded_at=datetime.now(UTC))
             except PrinterError as e:
                 raise Cc2UploadError(

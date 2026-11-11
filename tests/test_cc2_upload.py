@@ -32,7 +32,8 @@ import pytest
 
 from orcaslicer_mcp.printer import cc2_state as st
 from orcaslicer_mcp.printer import cc2_upload as up
-from orcaslicer_mcp.printer.cc2_receipts import RECEIPT_VERSION, Cc2ReceiptStore, Cc2UploadReceipt
+from orcaslicer_mcp.printer.cc2_receipts import (RECEIPT_VERSION, Cc2ReceiptStore,
+                                                  Cc2UploadReceipt, ToolReceipt)
 from orcaslicer_mcp.printer.cc2_transport import AccessCode
 from orcaslicer_mcp.printer.errors import PrinterError
 
@@ -1981,6 +1982,108 @@ def test_the_verified_extrusion_temps_survive_the_atomic_round_trip_through_disk
             encoding="utf-8")), extrusion_nozzle_temps=(260.0, 221.0)))
     cold = _sample_receipt(extrusion_nozzle_temps=())  # a file with no extrusion at all may
     assert Cc2UploadReceipt.from_dict(cold.to_dict()) == cold  # exist honestly; empty is allowed
+
+
+def _two_tool_receipt(**over):
+    """A receipt as the real grey/black slice's parse would write one: two PLA tools printing
+    at 210 °C, the vendor's change-filament flush R 240 recorded as a verified extrusion
+    temperature of BOTH spools (design 3 — the flush pushed both through the hot end at it),
+    and the 140 preheat left as commanded evidence, never as extrusion. 240 is no commanded
+    setpoint here, so this is the receipt shape only version 3 may carry."""
+    tools = tuple(
+        ToolReceipt(tool_index=index, material="PLA", nozzle_first_layer_temp=210.0,
+                    nozzle_temp=210.0, extrusion_nozzle_temps=(210.0, 240.0))
+        for index in (0, 1))
+    base = dict(material="PLA", nozzle_first_layer_temp=210.0, nozzle_temp=210.0,
+                commanded_nozzle_setpoints=(140.0, 210.0), extrusion_nozzle_temps=(210.0, 240.0),
+                tool_index=0, tools=tools)
+    base.update(over)
+    return _sample_receipt(**base)
+
+
+def test_a_v3_receipt_round_trips_every_tool_and_the_flat_fields_stay_the_first_tools():
+    r = _two_tool_receipt()
+    assert Cc2UploadReceipt.from_dict(r.to_dict()) == r  # in memory, every tool survives
+    data = r.to_dict()
+    assert data["version"] == RECEIPT_VERSION == 3
+    assert [tool["tool_index"] for tool in data["tools"]] == [0, 1]
+    assert all(tool["material"] == "PLA" and tool["nozzle_temp"] == 210.0
+               and tool["extrusion_nozzle_temps"] == [210.0, 240.0]
+               for tool in data["tools"])  # the flush R is each tool's own, for task 4's tray check
+    # the flat fields stay the first tool's story for readers that know only them
+    first = data["tools"][0]
+    assert (r.material, r.tool_index, r.nozzle_first_layer_temp, r.nozzle_temp) == (
+        first["material"], first["tool_index"], first["nozzle_first_layer_temp"],
+        first["nozzle_temp"])
+    # and the whole thing survives the atomic round trip through disk unchanged
+
+
+def test_the_tools_survive_the_atomic_round_trip_through_disk(tmp_path):
+    store = Cc2ReceiptStore(tmp_path / "s")
+    r = _two_tool_receipt()
+    store.save(r)
+    assert store.load(SN, DEST) == r
+    data = json.loads(store.path_for(SN, DEST).read_text(encoding="utf-8"))
+    assert data["version"] == 3 and len(data["tools"]) == 2
+    assert data["tools"][1]["extrusion_nozzle_temps"] == [210.0, 240.0]
+
+
+def test_a_version_2_receipt_reads_as_one_tool_built_from_the_flat_fields():
+    r = _sample_receipt(commanded_nozzle_setpoints=(140.0, 260.0, 220.0),
+                        extrusion_nozzle_temps=(260.0, 220.0))
+    v2 = r.to_dict()
+    del v2["tools"]  # a v2 file never wrote one
+    v2["version"] = 2
+    back = Cc2UploadReceipt.from_dict(v2)
+    assert back == r  # the same receipt, now honestly carrying its one tool …
+    assert back.tools == (ToolReceipt(tool_index=r.tool_index, material=r.material,
+                                      nozzle_first_layer_temp=r.nozzle_first_layer_temp,
+                                      nozzle_temp=r.nozzle_temp,
+                                      extrusion_nozzle_temps=r.extrusion_nozzle_temps),)  # … built
+    with pytest.raises(PrinterError):  # … and v2 knew no flush R that could explain an
+        Cc2UploadReceipt.from_dict(  # uncommanded extrusion, so reading v2 keeps enforcing it
+            dict(v2, extrusion_nozzle_temps=[300.0]))
+
+
+def test_a_v3_dict_with_a_malformed_tool_entry_is_refused():
+    base = _two_tool_receipt().to_dict()
+    entry = base["tools"][0]
+    for broken in [
+        [],  # a version-3 receipt must name its tools, not leave them to be guessed
+        "01",  # not a list at all
+        [entry, 1],  # an entry that is not an entry
+        [{k: v for k, v in entry.items() if k != "material"}],  # a half entry
+        [dict(entry, material=5)],  # a material that is not a word
+        [dict(entry, tool_index="0")],  # a tool that is not a number
+        [dict(entry, nozzle_temp=500.0)],  # a temperature outside the fence
+        [dict(entry, extrusion_nozzle_temps="210")],  # temperatures spelled as a string
+        [dict(entry, extrusion_nozzle_temps=[210.0, 400.0]), base["tools"][1]],
+        # 400 °C is inside the fence but no commanded setpoint and no flush both flushing
+        # tools carried — a temperature the parser could not have written for that tool
+        [base["tools"][0], dict(base["tools"][1], tool_index=0)],  # the same tool named twice
+        [dict(entry, material="PETG"), base["tools"][1]],  # first entry that disagrees with
+    ]:  # the flat fields is not the receipt the parse wrote
+        data = dict(base, tools=broken)
+        with pytest.raises(PrinterError):
+            Cc2UploadReceipt.from_dict(data)
+
+
+async def test_an_uploaded_two_tool_file_records_every_tool_on_its_receipt(tmp_path, store):
+    # the writer, not just the reader: the two-tool frame — start purge at T0, the change-
+    # filament purge flushing at R 240 (both tools' declared range high), T1's own wait —
+    # uploads, and the receipt it writes carries both tools with the flush R recorded for
+    # each, so the start (task 4) can refuse any tray rated under 240 for either tool
+    src = tmp_path / "two-colour.gcode"
+    src.write_text(_two_tool_frame(), encoding="utf-8")
+    body = src.read_bytes()
+    tr = FakeTransport([("other.gcode", 1)], [("other.gcode", 1), (DEST, len(body))])
+    receipt, http = await run(tr, src, store=store)
+    assert [(t.tool_index, t.material, t.nozzle_first_layer_temp, t.nozzle_temp,
+             t.extrusion_nozzle_temps) for t in receipt.tools] == [
+        (0, "PLA", 210.0, 210.0, (210.0, 240.0)), (1, "PLA", 210.0, 210.0, (210.0, 240.0))]
+    assert (receipt.tool_index, receipt.material, receipt.nozzle_temp) == (0, "PLA", 210.0)
+    assert receipt.extrusion_nozzle_temps == (210.0, 240.0)  # flat union, first order seen
+    assert store.load(SN, DEST) == receipt  # every tool of it survives the store too
 
 
 def test_store_paths_and_locks_are_keyed_by_printer_not_by_the_callers_imagination(tmp_path):
