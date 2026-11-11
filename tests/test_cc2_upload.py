@@ -762,6 +762,93 @@ def test_a_layer_two_transition_fires_only_for_the_tool_in_force():
     assert s.extrusion_nozzle_temps == (210.0, 220.0)
 
 
+# --- design 3: a mixed-temperature tool change, in the real slice's own shape ---------------------
+#
+# The observed tower order (inventory B.2 O2, the grey/black Penelope-tag slice): ``M220 S100``,
+# ``G4 S0``, ``M104 S<next>``, ``G4 S0``, ``G1 E-2``, travel, then the change-filament block
+# ``M6211 T<next> L M N Q<old> R<range high> S<next>`` and its ``T<next>`` restatement. The fixture
+# prints both tools at 210 °C, so its own tower M104 is a no-op; the frame below moves tool 1's
+# declared steady temperature to 220 °C and edits that one change block to match — the tower
+# M104, the retract behind it, and the purge with ``Q`` at the old tool's waited 210 and ``S`` at
+# the incoming tool's declared 220, which the firmware's own ``M109 S`` inside the purge waits at.
+
+
+def _mixed_change_fixture(load) -> str:
+    """The two-tool fixture as a mixed-temperature change: tool 1 declares 210 initial / 220
+    steady, the tower commands ``M104 S220``, and the change-filament purge reads
+    ``Q210 R240 S220``. Everything else — both other purges, both range highs at 240, the tail —
+    stays the real slice's own text. ``load`` is the session's ``gcode_fixture`` loader."""
+    original = load("cc2_two_tool")
+    text = (original
+            .replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+            .replace("M104 S210", "M104 S220", 1)
+            .replace("M6211 T1 L34.9231 M523 N523 Q210 R240 S210",
+                     "M6211 T1 L34.9231 M523 N523 Q210 R240 S220", 1))
+    assert text != original, "the fixture lost the lines the mixed change edits"
+    return text
+
+
+def test_a_mixed_temperature_tool_change_parses_with_the_purges_waited_s_recorded(gcode_fixture):
+    # design 3: the tower's bare M104 to tool 1's declared 220 arms a pending tool-change
+    # setpoint, the G1 E-2 that follows runs behind tool 0's still-armed 210 wait, and the purge
+    # consumes it: Q 210 is the wait in force (tool 0's story), S 220 is tool 1's own declared
+    # steady temperature and the wait the print continues at, so 220 joins tool 1's verified
+    # extrusion story and the file-wide one — while tool 0 keeps only its 210, and the vendor's
+    # 240 flush R stays a flush temperature of both spools exactly as on the equal-temperature
+    # original. The T1 select and every later 220 °C extrusion parse behind the purge's own wait.
+    s = up.parse_gcode_text(_mixed_change_fixture(gcode_fixture))
+    assert [t.tool_index for t in s.tools] == [0, 1]
+    tool0, tool1 = s.tools
+    assert tool1.nozzle_temp == 220.0
+    assert tool1.extrusion_nozzle_temps == (220.0,)
+    assert tool0.extrusion_nozzle_temps == (210.0,)
+    assert s.extrusion_nozzle_temps == (210.0, 220.0)
+    assert [t.flush_nozzle_temps for t in s.tools] == [(240.0,), (240.0,)]
+    assert 220.0 in s.nozzle_setpoints and 240.0 not in s.nozzle_setpoints
+
+
+def test_a_mixed_tool_change_purge_q_that_is_not_the_wait_in_force_refuses(gcode_fixture):
+    # Q is what the purge runs its retract, cut and channel-check steps at, on the filament
+    # still in force — 230 is neither tool 0's waited 210 nor any wait the file holds, so the
+    # purge would move the hot end un-waited immediately before a filament switch that pushes
+    # filament, and the refusal names Q and both numbers
+    text = _mixed_change_fixture(gcode_fixture).replace(
+        "M6211 T1 L34.9231 M523 N523 Q210 R240 S220",
+        "M6211 T1 L34.9231 M523 N523 Q230 R240 S220", 1)
+    assert text != _mixed_change_fixture(gcode_fixture)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(text)
+    assert "sets Q to 230" in bad.value.message and "210" in bad.value.message
+    assert "Nothing was sent" in bad.value.message
+
+
+def test_a_forward_extrusion_between_the_tower_m104_and_its_purge_refuses(gcode_fixture):
+    # between the tower's M104 S220 and the purge that waits at 220, only the negative-E
+    # retraction may run: a forward E there would push the outgoing tool's filament toward an
+    # un-waited target (and after the switch, the incoming's at a number no wait has proved at
+    # that point), so it refuses naming the pending setpoint and the purge that must come first
+    text = _mixed_change_fixture(gcode_fixture).replace(
+        "M104 S220\nG4 S0\nG1 E-2\n", "M104 S220\nG4 S0\nG1 E-2\nG1 E1 F300\n", 1)
+    assert text != _mixed_change_fixture(gcode_fixture)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(text)
+    msg = bad.value.message
+    assert "220" in msg and "tool-change setpoint" in msg and "M6211" in msg
+    assert "Nothing was sent" in msg
+
+
+def test_the_unedited_two_tool_fixture_still_parses_identically(gcode_fixture):
+    # the equal-temperature change is the mixed change's ordinary case and satisfies the new
+    # Q/S rules unchanged: the unedited fixture — both tools at 210, the purge's Q and S both
+    # the waited 210 — parses to exactly the story it parsed to before design 3, down to the
+    # tuple-for-tuple temperature lists and the flat setpoints
+    s = up.parse_gcode_text(gcode_fixture("cc2_two_tool"))
+    assert [t.extrusion_nozzle_temps for t in s.tools] == [(210.0,), (210.0,)]
+    assert [t.flush_nozzle_temps for t in s.tools] == [(240.0,), (240.0,)]
+    assert s.extrusion_nozzle_temps == (210.0,)
+    assert s.nozzle_setpoints == (140.0, 210.0)
+
+
 @pytest.mark.parametrize("mesh", ["BED_MESH_CALIBRATE",
                                   "bed_mesh_calibrate ADAPTIVE=0 FROM_SLICER=1"])
 def test_a_bed_mesh_resets_the_verified_wait_so_the_next_extrusion_needs_a_fresh_m109(mesh):

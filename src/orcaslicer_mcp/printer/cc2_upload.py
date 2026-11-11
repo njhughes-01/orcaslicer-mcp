@@ -73,7 +73,14 @@ precisely how a cold or unverified extrusion reaches the printer. A target chang
 extrusion — with one exception (design 2): a bare ``M104`` that steps a verified wait at the
 current tool's declared ``nozzle_temperature_initial_layer`` up to that tool's declared
 ``nozzle_temperature`` is the slicer's own layer-two transition, keeps the wait armed, and has
-its value recorded as one of that tool's verified extrusion temperatures. A nozzle cooldown (``S0``) before the file's last extrusion contradicts itself — the
+its value recorded as one of that tool's verified extrusion temperatures. A second exception
+(design 3): at a wipe-tower tool change a bare ``M104`` to the declared ``nozzle_temperature`` of
+a tool other than the one in force is a *pending tool-change setpoint* — it does not revoke the
+armed wait for retractions (negative-E moves, which run while the hot end still holds the old
+verified temperature), every forward extrusion refuses, and only an ``M6211`` purge consumes the
+pending value: its ``Q`` must be the wait still armed, its ``S`` the declared steady print
+temperature of the tool it switches in (which the firmware's own ``M109 S`` inside the purge
+waits at), and after the purge that ``S`` is the verified temperature the print continues at. A nozzle cooldown (``S0``) before the file's last extrusion contradicts itself — the
 filament path is cold while the file still means to extrude — and is refused; the end-block
 cooldown after the last extrusion is the normal ending it is. No printing-temperature range is
 checked here, at all: what a spool tolerates is the CANVAS tray's answer at start, and the
@@ -825,8 +832,8 @@ def _config_merged_values(config: dict[str, list[str]], key: str, label: str) ->
     — and repeats the line across config sections; a missing key, an empty value or position, or
     repeats that disagree for the same position (on value or on length) are the same inconsistent
     file ``_config_single`` refuses for a single key. ``_config_per_tool`` is this plus the
-    tool-aware tail; design 2's in-scan transition check reaches for this half alone, refusal-
-    free, through ``_declared_list_or_none``."""
+    tool-aware tail; the design 2 and design 3 in-scan ``M104`` checks reach for this half alone,
+    refusal-free, through ``_declared_list_or_none``."""
     occurrences = config.get(key)
     if not occurrences:
         raise _refuse(f"it carries no {label} (no '; {key} =' config line), and print settings "
@@ -936,6 +943,28 @@ def _declared_for_tool(values: list[str] | None, tool: int) -> float | None:
         return None
 
 
+def _other_tool_declares(values: list[str] | None, current_tool: int, value: float) -> bool:
+    """Design 3a: does some tool **other than** the one in force declare a steady
+    ``nozzle_temperature`` of exactly ``value``? Read refusal-free off the merged position list
+    like design 2's transition check (``_declared_list_or_none``): a value that is not a number
+    declares nothing (the after-scan read refuses such a list anyway), and a one-value list
+    declares the file's single selected tool — never a second one — so it can never arm a
+    pending change; the file that selects two tools beside one value is refused after the scan
+    naming the key, exactly as it always was."""
+    if values is None or len(values) == 1:
+        return False
+    for index, raw in enumerate(values):
+        if index == current_tool:
+            continue
+        try:
+            declared = float(raw)
+        except ValueError:
+            continue
+        if declared == value:
+            return True
+    return False
+
+
 def _parse_S(token: str) -> float:
     """One ``S<temperature>`` parameter, whatever case its letter arrived in. This is the one place a
     parameter letter's case is folded, so every caller reads one spelling: Klipper matches a command
@@ -1042,11 +1071,15 @@ def _compact_heater(line: str, head: str, rest: str) -> tuple[str, str] | None:
 #   4. ``M104 S<R>`` — **no wait** — and every flush extrusion of the purge then runs at R;
 #   5. ``M109 S<S>`` — a **wait** at S — the purge's final extrusion, then ``G180 S818`` (travels).
 #
-# So the purge's extrusions run at Q, at R and at S, and only a purge whose three setpoints are all
-# the temperature the file has already verified a wait at leaves this parser's temperature story
-# whole: an R elsewhere is an extrusion at a target no wait ever proved (the same rule that refuses
-# ``M104 S220`` followed by ``G1 E6``), and a Q elsewhere moves the hot end, in the ``A=0`` case with
-# no wait at all, immediately before a filament switch that pushes filament.
+# So the purge's extrusions run at Q, at R and at S, and the purge's temperature story is whole
+# only when (design 3) Q is the verified wait still in force — the outgoing tool's own temperature,
+# which the purge's retracts, cut and channel-check steps run behind — and S is either that same
+# wait (an equal-temperature change, today's shape) or the steady ``nozzle_temperature`` the file
+# declares for the tool the purge switches in (a mixed-temperature change, where the purge's own
+# ``M109 S`` is the wait that arms the print's continuation at S). An R elsewhere is an extrusion at
+# a target no wait ever proved (the same rule that refuses ``M104 S220`` followed by ``G1 E6``,
+# beside the vendor's declared-range-high exception below), and a Q elsewhere moves the hot end, in
+# the ``A=0`` case with no wait at all, immediately before a filament switch that pushes filament.
 _PURGE_FIELDS: dict[str, tuple[str, float, float, bool]] = {
     # letter: (what the firmware calls it, its clamp low, its clamp high, must be a whole number?)
     "T": ("the purge's tool (next_extruder)", 0.0, 31.0, True),
@@ -1077,8 +1110,10 @@ _PURGE_LETTER_WHY = {
          "file's own declared range high (the one exception the vendor's change_filament_gcode "
          "writes, and it is read per tool and recorded as a flush temperature — see the "
          "flush-R rule in parse_gcode_settings)",
-    "S": "S is the purge's own final M109 and its last extrusion runs at it, so the file's verified "
-         "wait would no longer be the temperature the print continues at",
+    "S": "S is the purge's own final M109 and its last extrusion runs at it, so it is the "
+         "temperature the print continues at: either the wait the file has already verified, or "
+         "the incoming tool's own declared steady print temperature, which this very command "
+         "waits at (design 3)",
 }
 
 _PURGE_PARAM_RE = re.compile(r"([A-Za-z])([-+]?(?:\d+\.?\d*|\.\d+))")
@@ -1218,9 +1253,16 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     every ``M6211`` purge) must find a wait at exactly the target in force, or the file is
     refused — which is what keeps the real 140 °C non-extruding preheat legal while no cold
     extrusion can slip through, and no printing-temperature range is hardcoded anywhere here.
-    The purge is read for its own facts as well, against the published firmware (``_PURGE_FIELDS``):
-    its ``Q``/``R``/``S`` are the three setpoints it heats to, in that order and with ``R`` never
-    waited at. ``Q`` and ``S`` must equal the verified target. ``R`` alone carries one exception,
+    The purge is read for its own facts as well, against the published firmware
+    (``_PURGE_FIELDS``): its ``Q``/``R``/``S`` are the three setpoints it heats to, in that order
+    and with ``R`` never waited at. ``Q`` must equal the verified wait in force — the outgoing
+    tool's temperature, which the purge's retracts, cut and channel-check steps run behind. ``S``
+    is the temperature the print continues at (the firmware's own ``M109 S`` inside the purge
+    waits at it), so it must be either that same wait (an equal-temperature change) or the steady
+    ``nozzle_temperature`` the file declares for the purge's tool (a mixed-temperature change,
+    design 3); after a purge the wait in force is ``S``, the current tool is the purge's ``T``,
+    and a pending wipe-tower setpoint — a tower ``M104`` to a second tool's declared temperature,
+    behind which only retractions may run — is retired. ``R`` alone carries one exception,
     because the vendor's own ``change_filament_gcode`` writes ``R=[nozzle_temperature_range_high]``:
     an off-target R is allowed only when it equals the file's declared ``nozzle_temperature_range_high``
     of **both** the tool being left and the tool switched to (read per tool, below), and that value
@@ -1243,9 +1285,9 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     own tool selects are known — the material and the nozzle first-layer and steady setpoints
     read per selected tool (``_config_per_tool``), each refusing to be missing, ambiguous or
     unphysical; the same per-tool read decides any deferred flush-R exception, against the file's
-    declared ``nozzle_temperature_range_high`` list. The one config read that reaches into the
-    scan is design 2's (the layer-two ``M104`` transition): its two nozzle-setpoint keys are
-    merged refusal-free before the scan (``_declared_list_or_none``) and indexed per tool lazily
+    declared ``nozzle_temperature_range_high`` list. The config reads that reach into the scan
+    are design 2's (the layer-two ``M104`` transition) and design 3's (the pending tool-change
+    ``M104``): the two nozzle-setpoint keys are merged refusal-free before the scan (``_declared_list_or_none``) and indexed per tool lazily
     (``_declared_for_tool``) — the choice over hoisting the refusing per-tool reads above the
     scan, which would need a tool list the scan has not built yet and would move which refusal
     fires first; a missing or broken list there simply means no transition fires, and the
@@ -1293,13 +1335,14 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     bed_first = _config_temp(config, first_key, "initial-layer bed temperature", maximum=_BED_MAX)
     bed = _config_temp(config, steady_key, "steady bed temperature", maximum=_BED_MAX)
 
-    # design 2's transition check reads these two keys inside the scan below, where the tool in
-    # force is known but the refusing per-tool read still is not (the tool list is only complete
-    # when the scan ends): merged position lists, refusal-free, indexed by tool lazily — see
+    # designs 2 and 3 read these two keys inside the scan below, where the tool in force is known
+    # but the refusing per-tool read still is not (the tool list is only complete when the scan
+    # ends): merged position lists, refusal-free, indexed by tool lazily — see
     # _declared_list_or_none and _declared_for_tool for why neither the refusal nor the tool
-    # rules move up here. nozzle_temperature_range_high is not one of them: design 2 touches no
-    # flush rule, and reading it up front would make a file that never purges answer for a key
-    # it has never needed — the flush-R read stays the after-scan, only-when-used exception it is.
+    # rules move up here. nozzle_temperature_range_high is not one of them: neither design 2 nor
+    # design 3 touches the flush-R rule, and reading it up front would make a file that never
+    # purges answer for a key it has never needed — the flush-R read stays the after-scan,
+    # only-when-used exception it is.
     firsts_pre = _declared_list_or_none(config, "nozzle_temperature_initial_layer")
     nozzles_pre = _declared_list_or_none(config, "nozzle_temperature")
 
@@ -1311,12 +1354,16 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     # whose only tool mention is inside an M6211 has no tool, exactly as before — but a purge naming a
     # tool the file never selects is a second tool, because the firmware switches that filament.
     purge_tools: list[int] = []
-    # the command-order story: the nozzle target in force, the value of the most recent M109
-    # that actually waited there, the temperatures extrusion ran at, and where the file's own
-    # extrusions and nozzle cooldowns fell — the last of these needed because an S0 is only
-    # honest after the file is done extruding
+    # the command-order story: the nozzle target in force, the value of the most recent verified
+    # wait (an M109 at exactly that target, or a purge's own firmware-waited S), the temperatures
+    # extrusion ran at, and where the file's own extrusions and nozzle cooldowns fell — the last
+    # of these needed because an S0 is only honest after the file is done extruding
     nozzle_target: float | None = None
     waited: float | None = None
+    # design 3a's pending tool-change setpoint: a wipe-tower ``M104`` to another tool's declared
+    # steady temperature arms it while the old wait stands; retractions run behind that wait, any
+    # forward extrusion refuses, and an ``M6211`` retires it (the firmware waits at its ``S``)
+    pending_tool_temp: float | None = None
     extrusion_temps: list[float] = []
     # per-tool verified-extrusion story: tool index -> temperatures that tool's extrusion ran
     # behind a verified wait, first order seen (the file-wide ``extrusion_temps`` stays the union
@@ -1395,6 +1442,7 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                 if value == 0.0:          # gate below reads the nozzle's state only, and the
                     cooldown_at.append(idx)  # mid-file-S0 rule after the loop is a nozzle rule
                     nozzle_target, waited = 0.0, (0.0 if head == "M109" else waited)
+                    pending_tool_temp = None  # a cooldown replaces any pending tool-change setpoint
                 elif head == "M104":      # a setpoint without a wait — an allowed preheat, but
                     if (waited is not None and current_tool is not None and value != waited
                             and waited == _declared_for_tool(firsts_pre, current_tool)
@@ -1410,17 +1458,33 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                         # here, not merely allowed, because both temperatures must then fit the
                         # tray at start. Any other bare M104 keeps today's rule below.
                         nozzle_target = waited = value
+                        pending_tool_temp = None  # an armed wait retires any pending change
                         if value not in extrusion_temps:
                             extrusion_temps.append(value)
                         if value not in per_tool_temps.setdefault(current_tool, []):
                             per_tool_temps[current_tool].append(value)
+                    elif (waited is not None and current_tool is not None and value != waited
+                            and _other_tool_declares(nozzles_pre, current_tool, value)):
+                        # design 3a: the wipe-tower tool change as the slicer writes it — the
+                        # observed order is M104 S<next>, a G1 E-2 retract, travel, then the
+                        # change_filament M6211 whose S is this very number. The target moves
+                        # toward the incoming tool's declared print temperature while the old
+                        # verified wait stays armed for retractions only (the hot end still
+                        # holds it, and the firmware's own M109 tolerance is ±5 °C); any
+                        # forward extrusion before the purge refuses, and the value joins no
+                        # temperature story until the purge waits at it. Any other bare M104
+                        # keeps today's rule below.
+                        nozzle_target = value
+                        pending_tool_temp = value
                     else:                  # any other bare M104: a target moved without a wait
                         nozzle_target = value  # revives the requirement; only a matching M109
                         # re-arms extrusion (the wait must still come before the extrusion)
+                        pending_tool_temp = None
                 else:                     # M109: the target, and a verified wait at exactly it
                     nozzle_target = waited = value
                 if head == "M109":
                     mesh_seen = False     # a fresh wait now stands behind the target again
+                    pending_tool_temp = None  # and no tool-change setpoint is pending any more
             continue
         if head == "G180":
             # The CC2's macro dispatcher, decided number by number: _g180_macro has already refused
@@ -1432,6 +1496,7 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
             if _g180_macro(line, rest).ends_print:
                 unload_seen = True
                 nozzle_target, waited = None, None
+                pending_tool_temp = None  # nothing past the unload is knowable, pending included
             continue
         if head == "BED_MESH_CALIBRATE":
             # design 4 (and the rewritten reason on _SAFE_WORD_COMMANDS): no verified M109 wait
@@ -1455,52 +1520,86 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                 raise _refuse(f"the purge command {line[:40]!r} extrudes at a nozzle target of "
                               f"{nozzle_target:g} °C — that is the heater off, and a purge "
                               "there would be a cold one")
-            if waited != nozzle_target:
-                raise _refuse(f"the purge command {line[:40]!r} extrudes at a commanded nozzle "
-                              f"target of {nozzle_target:g} °C that no M109 was ever waited at "
-                              "(the most recent verified wait was "
-                              + _wait_lost()
-                              + ") — heat and wait at the purge temperature first")
+            if pending_tool_temp is None:
+                if waited != nozzle_target:
+                    raise _refuse(f"the purge command {line[:40]!r} extrudes at a commanded "
+                                  f"nozzle target of {nozzle_target:g} °C that no M109 was ever "
+                                  "waited at (the most recent verified wait was "
+                                  + _wait_lost()
+                                  + ") — heat and wait at the purge temperature first")
+            elif waited is None:
+                raise _refuse(f"the purge command {line[:40]!r} runs mid-tool-change at a "
+                              f"pending {pending_tool_temp:g} °C setpoint with no verified wait "
+                              "standing (the most recent verified wait was "
+                              + _wait_lost() + ") — the purge retracts, cuts and channel-checks "
+                              "the outgoing filament behind that wait, so it must still stand")
             # the purge's own parameters, read the way this printer's firmware reads them: its T is
             # a filament switch and its Q, R and S are the setpoints it heats to (see _PURGE_FIELDS
-            # for the order the firmware commands them in). Q and S must be the temperature this
-            # file has already verified a wait at — an assignment under which the purge neither
-            # extrudes at an un-waited target nor moves the hot end the print continues at. R keeps
-            # the one exception the vendor's own change_filament_gcode relies on (design 3, below).
+            # for the order the firmware commands them in). Q must be the verified wait in force —
+            # the outgoing tool's own temperature, which the purge's first steps run behind. S is
+            # the temperature the print continues at (the firmware waits at it inside the purge),
+            # so it must be either that same wait — an equal-temperature change, today's shape — or
+            # the steady nozzle_temperature the file declares for the tool being switched in — a
+            # mixed-temperature change (design 3), where a pending wipe-tower setpoint retires
+            # here. R keeps the one exception the vendor's own change_filament_gcode relies on.
             purge = _purge_parameters(line, rest)
-            for letter, value in (("Q", purge.first), ("S", purge.final)):
-                if value != nozzle_target:
-                    raise _refuse(
-                        f"the purge command {line[:36]!r} sets {letter} to {value:g} °C while the "
-                        f"nozzle target verified by an M109 wait at this point is "
-                        f"{nozzle_target:g} °C, and {_PURGE_LETTER_WHY[letter]} — every extrusion "
-                        "must follow a verified M109 wait at the temperature it runs at")
-            if purge.flush != nozzle_target:
-                # R alone may stand off the verified target: the vendor's own change_filament_gcode
+            if purge.first != waited:
+                raise _refuse(
+                    f"the purge command {line[:36]!r} sets Q to {purge.first:g} °C while the "
+                    f"verified nozzle wait in force at this point in the file is {waited:g} °C, "
+                    f"and {_PURGE_LETTER_WHY['Q']} — the purge retracts, cuts and channel-checks "
+                    "the outgoing filament behind that wait, so Q must be the temperature that "
+                    "filament printed at")
+            steady_dest = _declared_for_tool(nozzles_pre, purge.tool)
+            if purge.final != waited and purge.final != steady_dest:
+                dest_text = "declared for it" if steady_dest is None else \
+                    f"{steady_dest:g} °C the file declares for tool {purge.tool}"
+                raise _refuse(
+                    f"the purge command {line[:36]!r} sets S to {purge.final:g} °C, which is "
+                    f"neither the verified nozzle wait in force here ({waited:g} °C) nor the "
+                    f"steady nozzle temperature {dest_text}, the tool it switches in; "
+                    f"{_PURGE_LETTER_WHY['S']} — every extrusion must follow a verified M109 "
+                    "wait at the temperature it runs at")
+            if purge.flush != waited:
+                # R alone may stand off the verified wait: the vendor's own change_filament_gcode
                 # writes R=[nozzle_temperature_range_high], so every real multi-colour file flushes
-                # hotter than it prints. The exception (design 3) is decided per tool, and that is
-                # only safely readable once the scan has seen the file's whole tool list, so this
-                # flush waits for the check below; R already sits inside the firmware's own
-                # 200–350 °C clamp (_PURGE_FIELDS), the sanity fence this file holds every nozzle
-                # number to. Any R that fails the check after the scan refuses the file.
-                flush_r.append((line[:36], purge.flush, nozzle_target, current_tool, purge.tool))
+                # hotter than it prints. The exception (design amendment 9) is decided per tool,
+                # and that is only safely readable once the scan has seen the file's whole tool
+                # list, so this flush waits for the check below; R already sits inside the
+                # firmware's own 200–350 °C clamp (_PURGE_FIELDS), the sanity fence this file
+                # holds every nozzle number to. Any R that fails the check after the scan refuses
+                # the file.
+                flush_r.append((line[:36], purge.flush, waited, current_tool, purge.tool))
             if purge.tool not in purge_tools:
                 purge_tools.append(purge.tool)
-            if nozzle_target not in extrusion_temps:
-                extrusion_temps.append(nozzle_target)
+            # design 3b: the purge's final extrusion runs behind the firmware's own M109 S (step 6
+            # of the _PURGE_FIELDS order), so after the purge S is both the target in force and
+            # the verified wait, and any pending wipe-tower setpoint is moot — the purge's own
+            # Q/R/S sequence replaced it. The filament being switched out ran its retract, cut
+            # and channel-check steps at Q, i.e. at the wait that was in force: that, not S, is
+            # the temperature recorded on the outgoing tool when a mixed-temperature change moves
+            # the print from one number to the other.
+            leaving_temp = waited
+            nozzle_target = waited = purge.final
+            pending_tool_temp = None
+            if purge.final not in extrusion_temps:
+                extrusion_temps.append(purge.final)
             # the purge's real extrusions run on the filament it switched in (its own flush and
             # final extrusion, step 3 of the _PURGE_FIELDS order), so the verified temperature is
             # that tool's; after the purge, that tool is the file's current one.
-            if nozzle_target not in per_tool_temps.setdefault(purge.tool, []):
-                per_tool_temps[purge.tool].append(nozzle_target)
-            # and the purge first retracts and cuts the filament it switches OUT at this same
-            # verified target (step 1 of the _PURGE_FIELDS order), so the outgoing tool ran at it
+            if purge.final not in per_tool_temps.setdefault(purge.tool, []):
+                per_tool_temps[purge.tool].append(purge.final)
+            # and the purge first retracts and cuts the filament it switches OUT at the wait that
+            # was in force (step 1 of the _PURGE_FIELDS order), so the outgoing tool ran at that
             # too: recorded on that tool as well, so a start compares its tray against it
-            # (review finding, PR #11; with Q and S pinned to the target this is the temperature
-            # the outgoing tool was already printing at, recorded now even when it never extruded)
-            if current_tool is not None and nozzle_target not in per_tool_temps.setdefault(
+            # (review finding, PR #11; with Q pinned to the wait and an equal-temperature change
+            # this is the same number S the incoming tool continues at — the temperature the
+            # outgoing tool was already printing at, recorded now even when it never extruded)
+            if current_tool is not None and leaving_temp not in per_tool_temps.setdefault(
                     current_tool, []):
-                per_tool_temps[current_tool].append(nozzle_target)
+                per_tool_temps[current_tool].append(leaving_temp)
+            if leaving_temp not in extrusion_temps:
+                extrusion_temps.append(leaving_temp)
             current_tool = purge.tool
             continue
         if head in _MOVE_HEADS:
@@ -1512,7 +1611,8 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                 raise _refuse(f"the move {line[:40]!r} carries a parameter this parser cannot "
                               "read, so it cannot rule out an extrusion hidden in it — refusing "
                               "rather than assuming a move it cannot tokenise does not extrude")
-            if any(letter == "E" for letter, _ in params):
+            e_values = [v for letter, v in params if letter == "E"]
+            if e_values:
                 where = f"the E move {line[:40]!r}"
                 if unload_seen:
                     raise _after_g180_unload(where)
@@ -1524,23 +1624,40 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                     raise _refuse(f"{where} extrudes at a nozzle target of {nozzle_target:g} °C — "
                                   "that is the heater off, and an extrusion there would be a cold one")
                 if waited != nozzle_target:
-                    raise _refuse(f"{where} extrudes at a commanded nozzle target of "
-                                  f"{nozzle_target:g} °C that no M109 was ever waited at (the most "
-                                  "recent verified wait was "
-                                  + _wait_lost()
-                                  + ") — every extrusion must follow a verified M109 wait at the "
-                                  "temperature it runs at, and a target changed after the wait "
-                                  "needs another M109 at the new value")
-                if nozzle_target not in extrusion_temps:
-                    extrusion_temps.append(nozzle_target)
-                if current_tool is None:
-                    raise _refuse(f"{where} extrudes before the file has selected any tool or "
-                                  "flushed one in with a purge, so this parse cannot say which "
-                                  "spool runs it — refusing rather than recording an extrusion "
-                                  "no tool's story can answer for")
-                if nozzle_target not in per_tool_temps.setdefault(current_tool, []):
-                    per_tool_temps[current_tool].append(nozzle_target)
-                last_extrusion_at = idx
+                    if (pending_tool_temp is not None and waited is not None
+                            and all(v < 0.0 for v in e_values)):
+                        # design 3a: the wipe-tower retract behind a pending tool-change setpoint.
+                        # The hot end still holds the verified wait (the M104 only moved the
+                        # target toward the incoming tool's declared temperature, which the
+                        # purge's own M109 waits at), and a negative-E move carries no material
+                        # forward onto it. The retraction passes, and joins neither temperature
+                        # story: the pending target is unverified until the purge retires it, and
+                        # the old wait was recorded by the extrusion or purge that proved it.
+                        last_extrusion_at = idx
+                    else:
+                        pending_says = ("" if pending_tool_temp is None else
+                                        f"; {pending_tool_temp:g} °C is a tool-change setpoint the "
+                                        "wipe tower commanded before its purge, and only "
+                                        "retractions (negative-E moves) may run before the M6211 "
+                                        "whose purge waits at it")
+                        raise _refuse(f"{where} extrudes at a commanded nozzle target of "
+                                      f"{nozzle_target:g} °C that no M109 was ever waited at (the "
+                                      "most recent verified wait was "
+                                      + _wait_lost()
+                                      + ") — every extrusion must follow a verified M109 wait at "
+                                      "the temperature it runs at, and a target changed after the "
+                                      "wait needs another M109 at the new value" + pending_says)
+                else:
+                    if nozzle_target not in extrusion_temps:
+                        extrusion_temps.append(nozzle_target)
+                    if current_tool is None:
+                        raise _refuse(f"{where} extrudes before the file has selected any tool or "
+                                      "flushed one in with a purge, so this parse cannot say which "
+                                      "spool runs it — refusing rather than recording an extrusion "
+                                      "no tool's story can answer for")
+                    if nozzle_target not in per_tool_temps.setdefault(current_tool, []):
+                        per_tool_temps[current_tool].append(nozzle_target)
+                    last_extrusion_at = idx
             # and a move with no E still has to be a command the list carries: the G38.x probe move
             # and the padded spellings are read here for their E parameter, but they are not commands
             # this workflow accepts, so a travel on one of them refuses rather than riding on "it was
