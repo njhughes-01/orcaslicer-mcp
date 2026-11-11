@@ -636,15 +636,45 @@ async def test_a_bad_destination_refuses_before_any_session(no_open, monkeypatch
     assert no_open == []
 
 
-@pytest.mark.parametrize("bad", [{"0": "3", "1": "2"}, {"a": "3"}, {"0": "x"}, {}, {"0": None},
-                                 {"0": True}, {"-1": "3"}],
-                         ids=["two-tools", "text-tool", "text-tray", "empty", "none", "bool",
-                              "negative"])
+@pytest.mark.parametrize("bad", [{"0": "1", "1": "2", "2": "3", "3": "4", "4": "5"}, {"a": "3"},
+                                 {"0": "x"}, {}, {"0": None},
+                                 {"0": True}, {"-1": "3"}, "0:3", ["0=3"], None],
+                         ids=["five-tools", "text-tool", "text-tray", "empty", "none",
+                              "bool", "negative", "text", "list", "missing"])
 async def test_a_ambiguous_mapping_refuses_before_any_session(bad, no_open, monkeypatch):
     out = await srv.cc2_start_print(filename=DEST, tool_to_tray=bad, bed_clear=True)
     assert out["error"] == "protocol_error" and out["reason"] == "tool_map"
     assert "Nothing was sent" in out["message"]
+    # the refusal teaches the shape it wants, example and all — a caller who guessed at one
+    # entry per file reads the two-entry example and sees exactly what a map is
+    assert '{"0": "1", "1": "2"}' in out["message"]
     assert no_open == []
+
+
+def test_cc2_tool_map_reads_one_entry_per_tool_up_to_four():
+    # whole numbers and digit strings alike read, spaces and a '#' are tolerated, and one to
+    # four entries are a mapping — what the start adapter expects, as ints
+    assert srv._cc2_tool_map({"0": "3"}) == {0: 3}
+    assert srv._cc2_tool_map({"0": "1", "1": "2"}) == {0: 1, 1: 2}
+    assert srv._cc2_tool_map({0: 1, " 1 ": " #2 "}) == {0: 1, 1: 2}
+    assert srv._cc2_tool_map({"0": "0", "1": "1", "2": "2", "3": "3"}) == {0: 0, 1: 1, 2: 2, 3: 3}
+    for bad, why in (
+            ({"0": "1", "1": "2", "2": "3", "3": "4", "4": "5"}, "five entries"),
+            ({"a": "3"}, "a text tool index"),
+            ({"0": "x"}, "a text tray id"),
+            ({}, "no entry at all"),
+            ({"0": None}, "a null tray"),
+            ({"0": True}, "a boolean"),
+            ({"-1": "3"}, "a negative tool"),
+            ({"0": "1", " 0 ": "2"}, "two spellings of one tool index"),
+            ("0:3", "text, not an object"),
+            (["0=3"], "a list"),
+            (None, "nothing at all")):
+        with pytest.raises(PrinterError) as raised:
+            srv._cc2_tool_map(bad)
+        assert raised.value.details.get("reason") == "tool_map", why
+        assert "Nothing was sent" in raised.value.message, why
+        assert '{"0": "1", "1": "2"}' in raised.value.message, why
 
 
 # --------------------------------------------------------------------------- 4. status and listing, end to end
@@ -1741,6 +1771,10 @@ async def test_upload_sends_parse_verifies_and_receipts_with_no_secrets(
     out = await srv.cc2_upload_gcode(path=str(gcode_file), destination=DEST)
     assert out["uploaded"] == DEST and out["size_bytes"] == size
     assert out["material"] == "PETG" and out["tool_index"] == 0
+    # the per-tool view rides beside the flat first-tool fields: one entry per tool the file
+    # selects — this slice selects one, and its entry is the flat material and nozzle pair
+    assert out["tools"] == [{"tool_index": 0, "material": "PETG",
+                             "nozzle_temp_c": {"first_layer": 260.0, "steady": 260.0}}]
     assert out["nozzle_temp_c"] == {"first_layer": 260.0, "steady": 260.0}
     assert out["bed_temp_c"] == {"first_layer": 80.0, "steady": 80.0}
     # the 140 °C non-extruding preheat rides as a commanded setpoint, never as an extrusion temp
@@ -1861,6 +1895,31 @@ async def test_start_levelling_true_and_string_tray_reach_the_wire(
     assert out["started_accepted"] is True
     assert transport.params_for(srv._cc2_start.METHOD_START)["config"] == {
         "slot_map": [{"t": 0, "canvas_id": 0, "tray_id": 3}], "printer_check": True}
+
+
+async def test_a_two_tool_start_maps_every_tool_and_sends_the_two_entry_slot_map(
+        monkeypatch, receipts_dir):
+    # the receipt this workflow would hold for a two-tool file: tools 0 and 1, both PETG at 260,
+    # the flat fields still the first tool's values (the store refuses it otherwise). The
+    # observed roster answers: tray A3 active (ELEGOO PETG, 230-260) and tray A2 present
+    # (Generic PETG, 230-260), so each tool has a spool of its own material rated for its heat.
+    cc2_receipts.Cc2ReceiptStore(receipts_dir).save(make_receipt(tools=(
+        cc2_receipts.ToolReceipt(tool_index=0, material="PETG", nozzle_first_layer_temp=260.0,
+                                 nozzle_temp=260.0, extrusion_nozzle_temps=(260.0,)),
+        cc2_receipts.ToolReceipt(tool_index=1, material="PETG", nozzle_first_layer_temp=260.0,
+                                 nozzle_temp=260.0, extrusion_nozzle_temps=(260.0,)))))
+    transport = open_fake(monkeypatch, start_transport())
+    out = await srv.cc2_start_print(filename=DEST, tool_to_tray={"0": "3", "1": "2"},
+                                    bed_clear=True)
+    assert out["started_accepted"] is True and out["observed_running"] is False
+    # one complete slot_map entry per tool on the single 1020, ordered by t, built from the
+    # trays that answered — not from numbers the caller retyped
+    assert transport.params_for(srv._cc2_start.METHOD_START)["config"]["slot_map"] == [
+        {"t": 0, "canvas_id": 0, "tray_id": 3}, {"t": 1, "canvas_id": 0, "tray_id": 2}]
+    assert transport.methods().count(srv._cc2_start.METHOD_START) == 1
+    # the adapter's own honesty note travels: a multi-entry slot_map has never been sent here
+    assert any("Multi-tool" in n and "never" in n for n in out["notes"]), out["notes"]
+    json.dumps(out)
 
 
 async def test_start_observes_running_as_a_separate_fact_and_strips_reply_noise(

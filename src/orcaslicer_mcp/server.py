@@ -2582,18 +2582,20 @@ async def _cc2_files_reply(transport, offset: int = 0, limit: int = _CC2_FILES_M
 
 
 def _cc2_tool_map(tool_to_tray):
-    """The one-tool mapping, as whole numbers. JSON objects carry string keys, so the tool index
-    and the tray number normally arrive as text like {"0": "3"}; surrounding spaces and an
-    optional '#' are tolerated, and any other spelling refuses with the exact words the caller
-    needs. Ambiguity is refused, never guessed at — silently falling back to tray 0 is the
-    measured failure mode this adapter documents, so no partial mapping ever reaches it."""
+    """The tool-to-tray mapping, as whole numbers, one entry per tool the file selects (a CC2
+    file selects at most four). JSON objects carry string keys, so tool indices and tray numbers
+    normally arrive as text like {"0": "1", "1": "2"}; surrounding spaces and an optional '#'
+    are tolerated, and any other spelling refuses with the exact words the caller needs.
+    Ambiguity is refused, never guessed at — silently falling back to tray 0 is the measured
+    failure mode this adapter documents, so no partial mapping ever reaches it."""
     err = PrinterError(
         "protocol_error",
-        'tool_to_tray must name exactly one tool and one tray, e.g. {"0": "3"} for tool 0 '
-        f"printing from tray 3 — got {str(tool_to_tray)[:120]!r}. Nothing was sent.",
-        hint="Pass one entry: the file's tool index (from cc2_upload_gcode) mapped to the tray "
-             "id (from cc2_status). Plain whole numbers or their decimal text both read; "
-             "nothing else does.", reason="tool_map")
+        'tool_to_tray must carry exactly one entry per tool the file selects, 1 to 4, e.g. '
+        '{"0": "1", "1": "2"} for tool 0 printing from tray 1 and tool 1 from tray 2 — got '
+        f"{str(tool_to_tray)[:120]!r}. Nothing was sent.",
+        hint="Pass one entry per tool: each tool index (from cc2_upload_gcode's tools list) "
+             "mapped to the tray id (from cc2_status) that must feed it. Plain whole numbers "
+             "or their decimal text both read; nothing else does.", reason="tool_map")
 
     def one(value) -> int | None:
         if isinstance(value, bool):
@@ -2606,13 +2608,17 @@ def _cc2_tool_map(tool_to_tray):
                 return int(s)
         return None
 
-    if not isinstance(tool_to_tray, dict) or len(tool_to_tray) != 1:
+    if not isinstance(tool_to_tray, dict) or not 1 <= len(tool_to_tray) <= 4:
         raise err
-    (raw_tool, raw_tray), = tool_to_tray.items()
-    tool, tray = one(raw_tool), one(raw_tray)
-    if tool is None or tray is None:
-        raise err
-    return {tool: tray}
+    mapping: dict[int, int] = {}
+    for raw_tool, raw_tray in tool_to_tray.items():
+        tool, tray = one(raw_tool), one(raw_tray)
+        if tool is None or tray is None:
+            raise err
+        if tool in mapping:
+            raise err  # two spellings of one tool index ("0" and " 0 ") is ambiguity, not a map
+        mapping[tool] = tray
+    return mapping
 
 
 @mcp.tool()
@@ -2965,12 +2971,14 @@ async def cc2_upload_gcode(
     proven to work on this printer, so this tool never deletes) — the error says so, and choosing a
     fresh name is a human decision.
 
-    The file is read as evidence: its material, first-layer and steady nozzle and bed
-    temperatures, and its single tool index come from the bytes actually sent (a non-extruding
-    preheat is fine; cold or unverified extrusion, multi-tool files, and files whose config and
-    commands disagree are refused before anything is sent). One file tool only. The reply lists
-    the verified name and size and what the file's own bytes said; tool_to_tray for
-    cc2_start_print maps the reported tool_index to the tray chosen from cc2_status."""
+    The file is read as evidence: each tool's material, first-layer and steady nozzle
+    temperatures, and the nozzle temperatures its extrusion was verified to run at come from
+    the bytes actually sent (a non-extruding preheat is fine; cold or unverified extrusion,
+    and files whose config and commands disagree, are refused before anything is sent). One
+    tool or several — every tool the file selects is parsed and reported. The reply lists
+    the verified name and size, what the file's own bytes said per tool in ``tools``, and the
+    first tool's values flat; tool_to_tray for cc2_start_print carries one entry per reported
+    tool index, each mapped to a tray chosen from cc2_status."""
     try:
         dest = _cc2_upload.validate_destination(destination)
     except PrinterError as e:
@@ -2992,6 +3000,11 @@ async def cc2_upload_gcode(
         "content_sha256": receipt.content_sha256,
         "material": receipt.material,
         "tool_index": receipt.tool_index,
+        "tools": [{"tool_index": tool.tool_index,
+                   "material": tool.material,
+                   "nozzle_temp_c": {"first_layer": tool.nozzle_first_layer_temp,
+                                     "steady": tool.nozzle_temp}}
+                  for tool in receipt.tools],
         "nozzle_temp_c": {"first_layer": receipt.nozzle_first_layer_temp,
                           "steady": receipt.nozzle_temp},
         "bed_temp_c": {"first_layer": receipt.bed_first_layer_temp,
@@ -3013,10 +3026,11 @@ async def cc2_start_print(
         "without this workflow's private receipt for that printer and name — a file that reached "
         "the printer any other way cannot be started from here."))],
     tool_to_tray: Annotated[dict[str, str], Field(description=(
-        'Exactly one entry mapping the file\'s single tool index to the tray that must feed it, '
-        'e.g. {"0": "3"} for tool 0 printing from tray 3. Tool index from cc2_upload_gcode, '
-        'tray id from cc2_status; the tray must report the same material the file was sliced '
-        'with. Multi-tool starts are not supported.'))],
+        'One entry per tool the file selects, mapping each tool index to the tray that must '
+        'feed it, e.g. {"0": "3"} for tool 0 printing from tray 3, or {"0": "1", "1": "2"} '
+        'for two tools. Tool indices from cc2_upload_gcode\'s tools list, tray ids from '
+        'cc2_status; each mapped tray must report the same material as the tool it feeds and '
+        'a rated nozzle range covering that tool\'s temperatures.'))],
     bed_clear: Annotated[bool, Field(description=(
         "Physical bed-clear assertion: true only after a human has looked at the build plate "
         "and taken anything off it. Only true starts a print; false refuses."))],
@@ -3038,11 +3052,17 @@ async def cc2_start_print(
     not_configured and sends nothing. A write, and not idempotent: an accepted start
     moves the machine, and a lost answer is reported as ambiguous, never resent.
 
+    tool_to_tray carries one entry per tool the file selects (cc2_upload_gcode reports them in
+    its ``tools`` list); every entry is checked against that tool's own receipt, and the
+    slot_map sent carries one complete entry per tool.
+
     Before the command leaves, re-read inside the per-printer lock: the private upload receipt,
     the printer's complete listing naming this file at the receipted size, idle with no error
-    and no file held, and the mapped tray present or active on a connected canvas carrying the
-    same material with a rated nozzle range covering every temperature the file extrudes at.
-    Any failed check refuses before the printer is asked, naming the check. Bed leveling is off
+    and no file held, and every mapped tray present or active on a connected canvas carrying the
+    same material as the tool it feeds, with a rated nozzle range covering every temperature
+    that tool extrudes at. Any failed check refuses before the printer is asked, naming the
+    check. A reply for a file with more than one tool carries a note that this adapter has
+    never sent or observed a multi-entry slot_map on this firmware. Bed leveling is off
     by default and sent explicitly either way; pass leveling=true only when it was requested
     for this print. The reply keeps accepted (the printer did not refuse) and observed_running
     (its status names this file as printing) strictly apart — acceptance alone never claims a
