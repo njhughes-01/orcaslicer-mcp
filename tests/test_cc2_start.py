@@ -211,15 +211,16 @@ def make_receipt(**over):
 def two_tool_over() -> dict:
     """Receipt kwargs for the two-tool PLA file the multi-tool change parses (the numbers of
     the real penelope-tag fixture): tools 0 and 1, both PLA printing at 210 °C, extrusion
-    verified at 210 with the vendor's 240 °C range-high flush carried by BOTH tools (design
-    3), so 240 sits in both tools' extrusion lists and in the file-wide union. The flat
-    fields describe the first tool, as version 3 requires."""
+    verified at 210 only, and the vendor's 240 °C range-high flush carried by BOTH tools in
+    their own ``flush_nozzle_temps`` (design amendment 9) — not an extrusion temperature and
+    not a commanded setpoint. The flat fields describe the first tool, as version 3 requires."""
     tools = tuple(ToolReceipt(tool_index=i, material="PLA",
                               nozzle_first_layer_temp=210.0, nozzle_temp=210.0,
-                              extrusion_nozzle_temps=(210.0, 240.0)) for i in (0, 1))
+                              extrusion_nozzle_temps=(210.0,),
+                              flush_nozzle_temps=(240.0,)) for i in (0, 1))
     return dict(material="PLA", nozzle_first_layer_temp=210.0, nozzle_temp=210.0,
                 commanded_nozzle_setpoints=(210.0,),
-                extrusion_nozzle_temps=(210.0, 240.0), tools=tools)
+                extrusion_nozzle_temps=(210.0,), tools=tools)
 
 
 def pla_roster(*, mx1: int = 250, mx2: int = 250) -> list[dict]:
@@ -291,6 +292,8 @@ async def test_accepted_start_sends_the_measured_1020_once(store):
     d = result.as_dict()
     assert d["started_accepted"] is True and d["observed_running"] is False
     assert d["status"] == "accepted" and d["filename"] == DEST
+    assert all("flush at" not in n for n in result.notes), "a one-tool file never flushes"
+    assert d["tools"] == [{"tool_index": 0, "flush_nozzle_temps_c": []}]
 
 
 async def test_leveling_off_is_sent_explicitly_as_false_never_omitted(store):
@@ -697,8 +700,7 @@ async def test_commanded_nozzle_target_above_tray_max_refuses_even_as_preheat(st
 async def test_two_tool_start_sends_the_design_slot_map_exactly(store):
     # design 7: one complete {t, canvas_id, tray_id} entry per tool, ordered by t, each built
     # from the tray that just answered for that tool — even when the caller's dict order says
-    # otherwise. The 240 °C flush sits in both tools' extrusion lists, so both mapped trays
-    # must be rated to cover it (these are rated to 250).
+    # otherwise. These trays are rated to 250, so the 240 °C flush is reported as within.
     save_receipt(store, **two_tool_over())
     tr = healthy({st.METHOD_CANVAS: canvas_replies(active_tray=2, trays=pla_roster())})
     result, _ = await begin(store, tr, tool_to_tray={1: 2, 0: 1})   # caller order reversed
@@ -711,6 +713,8 @@ async def test_two_tool_start_sends_the_design_slot_map_exactly(store):
                                  "printer_check": False}}
     # every reply of a multi-tool start carries the unverified-two-entry-slot_map note
     assert any("Multi-tool" in n and "never sent" in n for n in result.notes)
+    flush = [n for n in result.notes if "flush at" in n]
+    assert len(flush) == 2 and all("240 °C (within it)" in n and "250" in n for n in flush)
 
 
 async def test_missing_tool_in_the_mapping_refuses(store):
@@ -741,15 +745,60 @@ async def test_two_tools_on_one_tray_refuse(store):
     assert_never_started(tr)
 
 
-async def test_tray_rated_under_a_tools_extrusion_set_refuses_the_two_tool_start(store):
-    # tray 1 is rated to 230 but both tools' verified extrusion includes the 240 °C flush —
-    # a mapped tray under its own tool's verified temperatures stops before the wire.
+async def test_flush_above_the_tray_rating_is_reported_never_refused(store):
+    # design amendment 9, the vendor's own numbers: Elegoo's catalog rates both PLA trays
+    # 190-230 °C and Elegoo's own change_filament_gcode flushes PLA at its declared range-high
+    # 240 °C. Printing runs at 210, inside the rating, so the start goes out — with one note per
+    # tool naming the flush and the rating, saying both are the vendor's and nothing was refused.
     save_receipt(store, **two_tool_over())
     tr = healthy({st.METHOD_CANVAS: canvas_replies(
-        active_tray=2, trays=pla_roster(mx1=230))})
+        active_tray=2, trays=pla_roster(mx1=230, mx2=230))})
+    result, _ = await begin(store, tr, tool_to_tray={0: 1, 1: 2})
+    assert result.status is cs.StartStatus.ACCEPTED and result.accepted
+    assert tr.start_params()["config"]["slot_map"] == [
+        {"t": 0, "canvas_id": 0, "tray_id": 1}, {"t": 1, "canvas_id": 0, "tray_id": 2}]
+    flush = [n for n in result.notes if "flush at" in n]
+    assert len(flush) == 2, result.notes
+    for tool_index, tray_id, note in zip((0, 1), (1, 2), flush):
+        assert f"Tool {tool_index} on tray {tray_id}" in note
+        assert "240 °C" in note and "230 °C" in note and "10 °C above" in note
+        assert "vendor's own" in note and "slicer profile" in note and "catalog" in note
+        assert "not refused" in note
+        assert len(note) <= 255, "a tool reply caps each string at 255 characters"
+    assert result.flush_nozzle_temps_c == ((0, (240.0,)), (1, (240.0,)))
+    assert result.as_dict()["tools"] == [{"tool_index": 0, "flush_nozzle_temps_c": [240.0]},
+                                         {"tool_index": 1, "flush_nozzle_temps_c": [240.0]}]
+
+
+async def test_a_printing_temperature_above_the_tray_rating_still_refuses(store):
+    # the flush exception is the flush only: a tool that PRINTS at 240 (an M109-verified
+    # extrusion temperature and a commanded setpoint) against a tray rated to 230 refuses.
+    over = two_tool_over()
+    hot = ToolReceipt(tool_index=1, material="PLA", nozzle_first_layer_temp=240.0,
+                      nozzle_temp=240.0, extrusion_nozzle_temps=(240.0,),
+                      flush_nozzle_temps=(240.0,))
+    over.update(tools=(over["tools"][0], hot), commanded_nozzle_setpoints=(210.0, 240.0))
+    save_receipt(store, **over)
+    tr = healthy({st.METHOD_CANVAS: canvas_replies(
+        active_tray=2, trays=pla_roster(mx1=250, mx2=230))})
     with pytest.raises(cs.Cc2StartError) as ei:
         await begin(store, tr, tool_to_tray={0: 1, 1: 2})
     assert ei.value.details["reason"] == "range_violation"
+    assert "240" in ei.value.message and "230" in ei.value.message
+    assert_never_started(tr)
+
+
+async def test_a_commanded_setpoint_above_the_tray_rating_still_refuses_beside_a_flush(store):
+    # a non-extruding hold at 240 is not a flush: commanded setpoints over the rated maximum
+    # keep refusing even when the receipt also carries a 240 °C flush that is only reported.
+    over = two_tool_over()
+    over.update(commanded_nozzle_setpoints=(210.0, 240.0))
+    save_receipt(store, **over)
+    tr = healthy({st.METHOD_CANVAS: canvas_replies(
+        active_tray=2, trays=pla_roster(mx1=230, mx2=230))})
+    with pytest.raises(cs.Cc2StartError) as ei:
+        await begin(store, tr, tool_to_tray={0: 1, 1: 2})
+    assert ei.value.details["reason"] == "commanded_over_tray_max"
     assert "240" in ei.value.message and "230" in ei.value.message
     assert_never_started(tr)
 

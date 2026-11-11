@@ -25,8 +25,13 @@ temperature that tool's extrusion was verified to run at — the tool entry's
 ``extrusion_nozzle_temps``, which deliberately excludes non-extruding preheats like the mount
 file's real 140 °C flush hold before its ``M109 S260`` — and no commanded nozzle setpoint,
 preheat included, above any mapped tray's rated maximum, because a hold above what the spool is
-rated for is heat the spool cannot vouch for. Unknown, absent, half-a-range or contradictory
-reports refuse the start; nothing is ever assumed. The mapping sent carries one complete entry
+rated for is heat the spool cannot vouch for. A tool's flush temperatures — the entry's
+``flush_nozzle_temps``, the purge R of a tool change, which the upload accepts only when it equals
+the file's own declared range-high and keeps out of both lists above (design amendment 9) — are
+the one exception: each is compared with that tool's tray's rated maximum and reported in one
+note per tool, above or within, and never refuses, because both numbers are the vendor's own (its
+slicer profile flushes PLA at 240 °C, its catalog rates PLA trays to 230 °C). Unknown, absent,
+half-a-range or contradictory reports refuse the start; nothing is ever assumed. The mapping sent carries one complete entry
 per tool the receipt records, ordered by ``t``, each built from that tool and the tray identity
 of the fresh 2005 read that answered for it — the entries' ``canvas_id``/``tray_id`` are the
 ones that just answered, not numbers the caller retyped. A ``slot_map`` of more than one entry
@@ -131,7 +136,9 @@ class Cc2StartResult:
     ties the run to the private receipt that made it possible. ``notes`` carry what the caller
     must say out loud: the honesty notes on an ambiguous reply, and always the accepted-path
     limits — a 0 answer is 'the printer did not refuse', never proof the mapping was honoured or
-    that no other client replaced the file. ``as_dict()`` is the shape a tool reports."""
+    that no other client replaced the file. ``flush_nozzle_temps_c`` carries, per receipt tool in
+    tool order, the flush temperatures that tool was reported against its tray at (empty for a
+    tool that never flushed). ``as_dict()`` is the shape a tool reports."""
     status: StartStatus
     remote_filename: str
     accepted: bool = False
@@ -141,6 +148,7 @@ class Cc2StartResult:
     receipt_sha256: str = ""
     notes: tuple[str, ...] = ()
     bed_warning: str | None = None
+    flush_nozzle_temps_c: tuple[tuple[int, tuple[float, ...]], ...] = ()
 
     @property
     def observed_state(self) -> str | None:
@@ -162,6 +170,8 @@ class Cc2StartResult:
             "receipt_sha256": self.receipt_sha256,
             "notes": list(self.notes),
             "bed_warning": self.bed_warning,
+            "tools": [{"tool_index": tool_index, "flush_nozzle_temps_c": list(temps)}
+                      for tool_index, temps in self.flush_nozzle_temps_c],
         }
 
 
@@ -197,6 +207,18 @@ _NO_OBSERVE_NOTE = ("No read-only status was requested after the unanswered star
                     "state is unknown and nothing was resent.")
 _UNPARSEABLE_NOTE = ("The printer's answer to the start command carried no readable error code, "
                      "which is neither success nor refusal — nothing was resent.")
+
+
+def _flush_note(tool_index: int, tray_id: int, material: str, flush: tuple[float, ...],
+                hi: float) -> str:
+    """The one note per flushing tool (design amendment 9): every flush temperature against the
+    tray's rated maximum, above or within, said plainly and short enough to survive a tool reply
+    whole. It never refuses — both numbers are the vendor's own."""
+    parts = [f"{temp:g} °C ({temp - hi:g} °C above it)" if temp > hi else f"{temp:g} °C (within it)"
+             for temp in flush]
+    return (f"Tool {tool_index} on tray {tray_id} ({material}): flush at {' and '.join(parts)}, "
+            f"tray rated to {hi:g} °C. Both numbers are the vendor's own (its slicer profile and "
+            "its filament catalog); the start is not refused on it.")
 
 
 def _plain_int(value: Any) -> bool:
@@ -249,7 +271,9 @@ async def _observe_once(transport: Any, remote_filename: str
 def _build_result(status: StartStatus, remote_filename: str, receipt: Cc2UploadReceipt, *,
                   bed_warning: str | None, error_code: int | None = None,
                   note: str | None = None, observation: Cc2StartObservation | None = None,
-                  extra_notes: tuple[str, ...] = (), multi_tool: bool = False) -> Cc2StartResult:
+                  extra_notes: tuple[str, ...] = (), multi_tool: bool = False,
+                  flush_notes: tuple[str, ...] = (),
+                  flush_temps: tuple[tuple[int, tuple[float, ...]], ...] = ()) -> Cc2StartResult:
     notes: list[str] = []
     if status is StartStatus.ACCEPTED:
         notes.extend((_MAP_NOTE, _PROVENANCE_NOTE))
@@ -257,6 +281,7 @@ def _build_result(status: StartStatus, remote_filename: str, receipt: Cc2UploadR
         notes.append(note)
     if multi_tool:
         notes.append(_MULTI_SLOT_NOTE)
+    notes.extend(flush_notes)
     if observation is not None and observation.running:
         notes.append(_RUNNING_NOTE)
     notes.extend(extra_notes)
@@ -268,7 +293,7 @@ def _build_result(status: StartStatus, remote_filename: str, receipt: Cc2UploadR
         running=observation is not None and observation.running,
         error_code=error_code, observed=observation,
         receipt_sha256=receipt.content_sha256,
-        notes=tuple(notes), bed_warning=bed_warning)
+        notes=tuple(notes), bed_warning=bed_warning, flush_nozzle_temps_c=flush_temps)
 
 
 async def start_print(transport: Any, remote_filename: str, tool_to_tray: dict[int, int], *,
@@ -298,7 +323,9 @@ async def start_print(transport: Any, remote_filename: str, tool_to_tray: dict[i
     must carry a complete rated
     range covering every extrusion temperature verified for its own tool (non-extruding preheats
     are not extrusion targets and are not range-checked) with no commanded nozzle setpoint above
-    that tray's maximum.
+    that tray's maximum. A tool's flush temperatures are neither: each is compared with its tray's
+    rated maximum and reported in one note per tool, above or within, and never refuses (design
+    amendment 9 — the flush and the rating are both the vendor's numbers).
     Only then is the single 1020 sent — ``slot_map`` entries, one complete one per tool ordered
     by ``t``, each built from that receipt tool and its tray's fresh identity, ``printer_check``
     explicit, and nothing else in ``config``
@@ -463,6 +490,7 @@ async def start_print(transport: Any, remote_filename: str, tool_to_tray: dict[i
         # Iterated in tool order so the checked pairs arrive ordered by t — the order slot_map
         # must be sent in. Each entry runs the same gate against its own tool's ToolReceipt.
         chosen: list[tuple[int, Any]] = []      # (tool index, tray that just answered), by t
+        flush_notes: list[str] = []             # one per tool that flushes, by t; never a refusal
         for mapped_tool in sorted(tool_to_tray):
             mapped_tray = tool_to_tray[mapped_tool]
             tool_receipt = tools[mapped_tool]
@@ -533,7 +561,20 @@ async def start_print(transport: Any, remote_filename: str, tool_to_tray: dict[i
                                         "is rated for is heat the spool cannot vouch for, "
                                         "preheat or not. Nothing was sent.",
                                         reason="commanded_over_tray_max")
+            # Flush temperatures (design amendment 9) are reported, never refused: the upload
+            # already bounds them by the file's own declared range-high, and the tray's rating and
+            # the flush are both the vendor's numbers.
+            if tool_receipt.flush_nozzle_temps:
+                flush_notes.append(_flush_note(mapped_tool, mapped_tray, tray_entry.material,
+                                               tool_receipt.flush_nozzle_temps, hi))
             chosen.append((mapped_tool, tray_entry))
+        flush_temps = tuple((tool_index, tools[tool_index].flush_nozzle_temps)
+                            for tool_index in sorted(tools))
+
+        def _finish(status: StartStatus, **kw: Any) -> Cc2StartResult:
+            return _build_result(status, name, receipt, bed_warning=bed_warning,
+                                 multi_tool=multi_tool, flush_notes=tuple(flush_notes),
+                                 flush_temps=flush_temps, **kw)
 
         # ---- the one command: the measured shape, built from what just answered -----------------
         # Entry completeness is load-bearing: measured, a partial entry is acknowledged 0 and the
@@ -553,60 +594,51 @@ async def start_print(transport: Any, remote_filename: str, tool_to_tray: dict[i
             note = (f"The printer did not answer the one start command: {e.message} The command "
                     "was not resent.")
             if not read_only_status:
-                return _build_result(StartStatus.AMBIGUOUS, name, receipt,
-                                     bed_warning=bed_warning, note=note,
-                                     extra_notes=(_NO_OBSERVE_NOTE,), multi_tool=multi_tool)
+                return _finish(StartStatus.AMBIGUOUS, note=note,
+                               extra_notes=(_NO_OBSERVE_NOTE,))
             observation, lost_note = await _observe_once(transport, name)
             extra = (lost_note,) if observation is None else (
                 () if observation.running else (_NOT_PRINTING_NOTE,))
-            return _build_result(StartStatus.AMBIGUOUS, name, receipt, bed_warning=bed_warning,
-                                 note=note, observation=observation, extra_notes=extra,
-                                 multi_tool=multi_tool)
+            return _finish(StartStatus.AMBIGUOUS, note=note, observation=observation,
+                           extra_notes=extra)
         except PrinterError as e:
             # The session died (or was closed) — no answer, and by design the command is not
             # resent, not even once, not through a re-opened session: that decision is a human's.
-            return _build_result(
-                StartStatus.AMBIGUOUS, name, receipt, bed_warning=bed_warning,
+            return _finish(
+                StartStatus.AMBIGUOUS,
                 note=(f"The session ended without an answer to the start command ({e.message}) "
                       "— the job may have started or never been accepted, and nothing was "
                       "resent, not even a read-only status, because this session cannot carry "
-                      "one."), multi_tool=multi_tool)
+                      "one."))
 
         # ``error_code``: only an explicit integer 0 is the documented started. An absent field,
         # a non-integer, a bool (an int in Python and not a protocol code), or any other number
         # is never success: "no acknowledgement" is an ambiguity, and a real code is the printer
         # declining on record.
         if not isinstance(result, dict) or "error_code" not in result:
-            return _build_result(StartStatus.AMBIGUOUS, name, receipt, bed_warning=bed_warning,
-                                 note=("The printer's answer to the start command carried no "
-                                       f"error code at all. {_UNPARSEABLE_NOTE}"),
-                                 multi_tool=multi_tool)
+            return _finish(StartStatus.AMBIGUOUS,
+                           note=("The printer's answer to the start command carried no "
+                                 f"error code at all. {_UNPARSEABLE_NOTE}"))
         code = result["error_code"]
         if not _plain_int(code):
-            return _build_result(StartStatus.AMBIGUOUS, name, receipt, bed_warning=bed_warning,
-                                 note=(f"The printer's answer to the start command carried an "
-                                       f"error code that cannot be read ({type(code).__name__}), "
-                                       "which is neither success nor refusal. "
-                                       f"{_UNPARSEABLE_NOTE}"), multi_tool=multi_tool)
+            return _finish(StartStatus.AMBIGUOUS,
+                           note=(f"The printer's answer to the start command carried an "
+                                 f"error code that cannot be read ({type(code).__name__}), "
+                                 "which is neither success nor refusal. "
+                                 f"{_UNPARSEABLE_NOTE}"))
         if code != 0:
             note = (f"The printer refused the start command (error_code {code})."
                     + (" " + _BUSY_HINT if code == 1009 else ""))
-            return _build_result(StartStatus.REFUSED, name, receipt, bed_warning=bed_warning,
-                                 error_code=code, note=note, multi_tool=multi_tool)
+            return _finish(StartStatus.REFUSED, error_code=code, note=note)
 
         # error_code 0: the documented started — accepted, never running, until observed.
         if observe_running:
             observation, lost_note = await _observe_once(transport, name)
             extra = (lost_note,) if lost_note else (_NOT_PRINTING_NOTE,)
             if observation is None:
-                return _build_result(StartStatus.ACCEPTED, name, receipt,
-                                     bed_warning=bed_warning, extra_notes=(lost_note,),
-                                     multi_tool=multi_tool)
-            return _build_result(StartStatus.ACCEPTED, name, receipt, bed_warning=bed_warning,
-                                 observation=observation,
-                                 extra_notes=() if observation.running else extra,
-                                 multi_tool=multi_tool)
-        return _build_result(StartStatus.ACCEPTED, name, receipt, bed_warning=bed_warning,
-                             multi_tool=multi_tool)
+                return _finish(StartStatus.ACCEPTED, extra_notes=(lost_note,))
+            return _finish(StartStatus.ACCEPTED, observation=observation,
+                           extra_notes=() if observation.running else extra)
+        return _finish(StartStatus.ACCEPTED)
     finally:
         lock.__exit__(None, None, None)
