@@ -41,12 +41,14 @@ stops the operation before anything is sent: never overwrite, never while the fi
 incomplete, never after an ambiguous one.
 
 The file itself is read as evidence, not trusted metadata: ``parse_gcode_settings`` takes the
-material, the first-layer and steady nozzle and bed setpoints, and the tool index from the
-commands the file actually issues cross-checked against its own slicer config block — accepting
+material, the first-layer and steady nozzle and bed setpoints, and the tools the file actually
+selects from its own commands cross-checked against its own slicer config block — accepting
 the legitimate case of a first layer hotter than the rest, refusing a file whose config promises
-temperatures its G-code never commands, and refusing anything multi-tool until this adapter can
-speak multi-tool. Only the opened bytes are ever parsed; nothing about the file is inferred from
-its name.
+temperatures its G-code never commands, and reading a multi-tool file tool by tool: the material
+and nozzle setpoints are one per selected tool, every extrusion is attributed to the tool in
+force at that line (a purge switches the current tool to its own ``T``), and a purge may only
+flush a tool the file itself selects. Only the opened bytes are ever parsed; nothing about the
+file is inferred from its name.
 
 Heater commands are read in the order the file issues them, because what a purge runs at is a
 fact of order, not of contents. The parser carries the current nozzle target and the value of
@@ -72,7 +74,8 @@ extrusion. A nozzle cooldown (``S0``) before the file's last extrusion contradic
 filament path is cold while the file still means to extrude — and is refused; the end-block
 cooldown after the last extrusion is the normal ending it is. No printing-temperature range is
 checked here, at all: what a spool tolerates is the CANVAS tray's answer at start, and the
-verified extrusion temperatures ride on the receipt so that start can make that comparison. A
+verified extrusion temperatures — and, apart from them, each tool's flush temperatures — ride on
+the receipt so that start can make that comparison. A
 heater command this parser cannot pin to one unambiguous setpoint — no S, two S, a second numbered
 parameter like ``R200`` beside the S, a value no heater in this family could hold — is ambiguity
 about what the printer would do, and ambiguity is refused, never guessed at. A compact heater code
@@ -92,8 +95,10 @@ filament, in a body no file-level reader can see — and a G or M code this pars
 change a heater target or push filament just as well. So a command is accepted because it appears in
 ``_SAFE_CODE_COMMANDS`` / ``_SAFE_WORD_COMMANDS`` beside a reason it cannot alter heater or
 extrusion state, and everything else refuses the file before a byte is sent. The list holds G0, G1,
-G2, G3, G4, G21, G28, G90, G92, M104, M106, M107, M109, M140, M190, M204, M6211, M73, M83, M84, one
-``T<n>`` select, and the four Klipper words BED_MESH_CALIBRATE, SET_PRESSURE_ADVANCE,
+G2, G3, G4, G21, G28, G90, G92, M104, M106, M107, M109, M140, M190, M204, M220, M6211, M73, M83,
+M84, and the ``T<n>`` selects (several tools are legal; each extrusion is attributed to the tool
+in force), beside
+the four Klipper words BED_MESH_CALIBRATE, SET_PRESSURE_ADVANCE,
 SET_PRINT_STATS_INFO, SET_VELOCITY_LIMIT. Each was admitted the same way: a written reason it cannot
 change a heater target or push filament, and a test that says so. The four real Centauri Carbon 2
 slices this workflow has handled (2026-11-04) issued G1, G2, G21, G28, G90, G92, M104, M106, M109,
@@ -101,9 +106,10 @@ M140, M190, M204, M6211, M73, M83, M84, one ``T0`` and the four words — and no
 anywhere in 694,064 command lines of 18.7 MB of slice — so those four are listed for their semantics,
 not because a slicer was
 seen writing them. G0 and G3 were already read as moves here with their E parameter gated as an
-extrusion (see ``_MOVE_HEADS``), which is the only mechanism either has for heating cold, and G4 and
-M107 are admitted with their documented parameters enforced (see ``_PARAMETER_LETTERS``) so a dwell
-carrying an E, or a fan-off carrying anything else, still refuses the file. Ordinary elsewhere is
+extrusion (see ``_MOVE_HEADS``), which is the only mechanism either has for heating cold, and G4,
+M107 and M220 are admitted with their documented parameters enforced (see ``_PARAMETER_LETTERS``)
+so a dwell carrying an E, a fan-off carrying anything else, or a speed factor carrying anything
+but its S, still refuses the file. Ordinary elsewhere is
 still refused here — ``G_CODE_MACRO`` and every other macro name, G10/G11/G12 (what the CC2 firmware
 does with them is unverified, and in the dialects it derives from G10 can move filament and G12
 purges), M82, SET_FAN_SPEED and every word-form name the list does not hold. Command and parameter
@@ -139,7 +145,7 @@ from typing import Any
 import httpx
 
 from . import cc2_state
-from .cc2_receipts import Cc2ReceiptStore, Cc2UploadReceipt
+from .cc2_receipts import Cc2ReceiptStore, Cc2UploadReceipt, ToolReceipt
 from .cc2_transport import AccessCode, _refusal
 from .errors import PrinterError
 
@@ -329,6 +335,9 @@ _SAFE_CODE_COMMANDS: dict[str, str] = {
     "M140": "parsed as a bed setpoint",
     "M190": "parsed as a bed wait",
     "M204": "sets acceleration: a motion-tuning number, with no extruder and no heater in it",
+    "M220": "speed factor override: scales feedrates of moves already gated by the E rules "
+            "above; it commands no heater and no filament, and its parameters are read by "
+            "_PARAMETER_LETTERS (S only), so an M220 carrying anything else still refuses",
     "M6211": "Elegoo's flush/purge: read as an extrusion and gated by the order check, and read for "
               "its own facts too — its T switches a tool's filament in and its Q, R and S are the "
               "setpoints the purge heats to (see _PURGE_FIELDS)",
@@ -346,6 +355,7 @@ _SAFE_CODE_COMMANDS: dict[str, str] = {
 _PARAMETER_LETTERS: dict[str, frozenset[str]] = {
     "G4": frozenset({"P", "S", "D"}),      # a dwell's documented durations: P/S (ms), D (s)
     "M107": frozenset({"P", "S"}),         # a fan's index (P) and its speed (S); S0 is a fan off
+    "M220": frozenset({"S"}),              # a speed factor's one percent value; nothing else
 }
 
 _SAFE_WORD_COMMANDS: dict[str, str] = {
@@ -630,6 +640,25 @@ _PLATE_BED_KEYS = {
 
 
 @dataclass(frozen=True)
+class ToolSettings:
+    """What the file says about one of its own tools: the material it prints and the nozzle
+    setpoints it prints at — first layer may legitimately differ from the rest, and both are
+    kept — plus the nozzle temperatures that tool's extrusion was verified to run at, with the
+    same meaning ``Cc2GcodeSettings.extrusion_nozzle_temps`` has. Every tool the file selects
+    carries its own entry: its E moves and the purges that flushed it attribute their verified
+    temperatures to it. An accepted flush R — the vendor purge's declared range-high, which the
+    flush really extruded at but no M109 ever waited at — is not a printing temperature and is
+    kept apart in ``flush_nozzle_temps`` (design amendment 9), recorded for both the tool being
+    left and the tool switched to, distinct, in first order seen."""
+    tool_index: int
+    material: str
+    nozzle_first_layer_temp: float
+    nozzle_temp: float
+    extrusion_nozzle_temps: tuple[float, ...]
+    flush_nozzle_temps: tuple[float, ...] = ()
+
+
+@dataclass(frozen=True)
 class Cc2GcodeSettings:
     """What a file says about how it means to be printed, read only from the file's own bytes.
     The four print setpoints are what a start checks a spool against — first layer may
@@ -640,9 +669,13 @@ class Cc2GcodeSettings:
     setpoints instead of silently widening them. ``extrusion_nozzle_temps`` are the nozzle
     targets extrusion was verified to run at — each proven in command order by an M109 wait at
     that exact temperature, kept in first order seen, and every one of them also a commanded
-    setpoint — which is what a start compares against the loaded spool's range. Heater-off
-    commands (S0) are cooldowns, not setpoints, and read out. ``tool_index`` exists only because
-    exactly one tool was seen."""
+    setpoint — which is what a start compares against the loaded spool's range. An accepted
+    flush R (the purge's declared range-high, design amendment 9) is neither: it is no printing
+    temperature and no commanded setpoint, and it is carried per tool in
+    ``ToolSettings.flush_nozzle_temps`` instead. Heater-off commands (S0) are cooldowns, not
+    setpoints, and read out. ``tool_index`` is the first selected tool, the one the flat fields
+    describe; ``tools`` carries every selected tool with its own material, setpoints, verified
+    extrusion temperatures and flush temperatures."""
     material: str
     nozzle_first_layer_temp: float
     nozzle_temp: float
@@ -653,6 +686,11 @@ class Cc2GcodeSettings:
     bed_setpoints: tuple[float, ...]
     extrusion_nozzle_temps: tuple[float, ...]
     bed_plate: str
+    tools: tuple[ToolSettings, ...]
+
+
+_REFUSE_PREFIX = ("The G-code file cannot be uploaded through this workflow. Nothing was sent "
+                  "to the printer. ")
 
 
 def _refuse(what: str, hint: str | None = None) -> PrinterError:
@@ -662,18 +700,25 @@ def _refuse(what: str, hint: str | None = None) -> PrinterError:
     which two values disagree) that a human needs, and the parser's own command-policy refusals are
     written short enough to arrive whole. What a client that shows 255 characters loses is the advice at
     the end, which the hint repeats."""
-    prefix = "The G-code file cannot be uploaded through this workflow. Nothing was sent to the printer. "
-    return PrinterError("protocol_error", prefix + what[:1].upper() + what[1:],
+    return PrinterError("protocol_error", _REFUSE_PREFIX + what[:1].upper() + what[1:],
                         hint=hint, reason="gcode_unreadable")
 
 
 def _config_value(raw: str) -> list[str]:
-    """One config value, split the way the slicer writes multi-slot lists — comma separated. A
-    bracketed list is a slicer dump of the same list; read it the same way."""
+    """One config value, split the way the slicer writes multi-slot lists — comma **or**
+    semicolon separated (the real two-tool slice writes ``filament_type = PLA;PLA`` beside
+    comma lists like ``nozzle_temperature = 210,210``, so both delimiters are the slicer's
+    own, not a guess). A bracketed list is a slicer dump of the same list; read it the same
+    way. Positions are kept: an empty piece (``PLA;;PETG``) stays an empty string at its index,
+    because for a per-tool key position *is* the tool number and dropping it would hand tool 2's
+    material to tool 1 (review finding, PR #11). Callers decide what an empty entry means:
+    ``_config_single`` ignores them as a bare comma always was, ``_config_per_tool`` refuses."""
     text = raw.strip()
     if text.startswith("[") and text.endswith("]"):
         text = text[1:-1]
-    return [piece.strip() for piece in text.split(",") if piece.strip()]
+    if not text.strip():
+        return []
+    return [piece.strip() for piece in re.split(r"[,;]", text)]
 
 
 def _collect_config(lines: Iterable[str]) -> dict[str, list[str]]:
@@ -690,6 +735,7 @@ def _collect_config(lines: Iterable[str]) -> dict[str, list[str]]:
 
 
 _WANTED_KEYS = frozenset({"filament_type", "nozzle_temperature", "nozzle_temperature_initial_layer",
+                          "nozzle_temperature_range_high",
                           "curr_bed_type", "hot_plate_temp_initial_layer", "hot_plate_temp",
                           "cool_plate_temp_initial_layer", "cool_plate_temp",
                           "textured_plate_temp_initial_layer", "textured_plate_temp",
@@ -705,7 +751,7 @@ def _config_single(config: dict[str, list[str]], key: str, label: str) -> str:
                       "are read from the file, never guessed")
     values: list[str] = []
     for raw in occurrences:
-        pieces = _config_value(raw)
+        pieces = [piece for piece in _config_value(raw) if piece]
         if not pieces:
             raise _refuse(f"its '{key} =' config line carries no value")
         for piece in pieces:
@@ -713,8 +759,8 @@ def _config_single(config: dict[str, list[str]], key: str, label: str) -> str:
                 values.append(piece)
     if len(values) > 1:
         raise _refuse(f"its {label} is not one value but {values[:4]} — a file that lists more "
-                      "than one cannot be identified with a single setting, and this adapter "
-                      "supports exactly one tool")
+                      "than one cannot be identified with a single setting, and this is a plate "
+                      "key: every tool the file selects shares one bed")
     return values[0]
 
 
@@ -728,6 +774,81 @@ def _config_temp(config: dict[str, list[str]], key: str, label: str, *, maximum:
         raise _refuse(f"its {label} is {value}, outside the 0–{maximum:g} °C a printer of this "
                       "family could hold — refusing rather than trusting it")
     return value
+
+
+def _config_per_tool(config: dict[str, list[str]], key: str, label: str,
+                     tools: list[int]) -> list[str]:
+    """One value per tool index for one key, or a refusal naming the key. The slicer writes a
+    per-tool key as one list — comma or semicolon separated (``_config_value``) — and repeats the
+    line across config sections; repeats that disagree for the same tool index are the same
+    inconsistent file ``_config_single`` refuses for a single key. The result is indexable by
+    tool number: entry ``i`` is tool ``i``'s value, and every index up to the file's highest
+    selected tool must exist. A list shorter than the highest selected tool is a tool whose
+    value the file never says, refused with the key named; one value with one tool is the
+    ordinary single-tool case and works whatever that tool's number is (a T1-only file's
+    ``; filament_type = PLA`` is that tool's). More values than the file's highest tool are the
+    spare filaments of a larger project: tools the file never selects, read and left alone.
+    Callers pass the file's own selected tool numbers (non-empty)."""
+    occurrences = config.get(key)
+    if not occurrences:
+        raise _refuse(f"it carries no {label} (no '; {key} =' config line), and print settings "
+                      "are read from the file, never guessed")
+    values: list[str] = []
+    for raw in occurrences:
+        pieces = _config_value(raw)
+        if not pieces:
+            raise _refuse(f"its '{key} =' config line carries no value")
+        for i, piece in enumerate(pieces):
+            if not piece:
+                raise _refuse(f"its {label} (key '{key}') leaves position {i} empty, and for a "
+                              f"per-tool key position {i} is tool {i}'s value — a tool whose "
+                              "value the file leaves blank is refused, never filled from a "
+                              "neighbour")
+        if values and len(pieces) != len(values):
+            raise _refuse(f"its '{key} =' config lines disagree on how many tools there are "
+                          f"({len(values)} and {len(pieces)} values), and a file that disagrees "
+                          "with itself cannot be identified — every repeat must carry the same "
+                          "list in full, never a shorter one borrowing the other's tail")
+        for i, piece in enumerate(pieces):
+            if i >= len(values):
+                values.append(piece)
+            elif values[i] != piece:
+                raise _refuse(f"its {label} is not one value per tool: the '{key} =' config "
+                              f"lines name {values[i]!r} and {piece!r} for tool {i}, and a file "
+                              "that disagrees with itself cannot be identified")
+    highest = max(tools)
+    if len(tools) == 1 and len(values) == 1:
+        values = values * (highest + 1)  # the file's one tool, whatever its number, prints at it
+    elif len(values) < highest + 1:
+        raise _refuse(f"its {label} (key '{key}') lists {len(values)} value(s) ({values[:4]}) "
+                      f"while the file selects tool {highest}, so tool {highest}'s value is not "
+                      "in the file — refusing rather than guessing which listed value a tool "
+                      "prints at")
+    # A list LONGER than the highest selected tool is the ordinary shape of a project with spare
+    # filaments (a two-colour print from a four-filament project, a one-colour print from a
+    # two-filament one — the CANVAS sync fills all four slots): the extra entries belong to tools
+    # the file never selects, which never extrude and are never mapped, and a purge must still
+    # name a selected tool (checked below in the scan). So they are read and left in place,
+    # never refused (review finding, PR #11): the whole list is returned, callers index it by
+    # tool number, and the spare entries are only ever range-checked as numbers, never mapped.
+    return values
+
+
+def _config_temp_per_tool(config: dict[str, list[str]], key: str, label: str,
+                          tools: list[int], *, maximum: float) -> list[float]:
+    """``_config_per_tool`` with each value then held to the same temperature sanity
+    ``_config_temp`` applies to a single value."""
+    temps: list[float] = []
+    for raw in _config_per_tool(config, key, label, tools):
+        try:
+            value = float(raw)
+        except ValueError:
+            raise _refuse(f"its {label} is {raw!r}, which is not a temperature") from None
+        if not 0.0 < value <= maximum:
+            raise _refuse(f"its {label} is {value}, outside the 0–{maximum:g} °C a printer of "
+                          "this family could hold — refusing rather than trusting it")
+        temps.append(value)
+    return temps
 
 
 def _parse_S(token: str) -> float:
@@ -867,7 +988,10 @@ _PURGE_LETTER_WHY = {
     "Q": "the firmware commands Q first — an M109 wait when A=1, a bare M104 otherwise — so it moves "
          "the hot end off the verified temperature before the purge's filament switch runs",
     "R": "the firmware commands R with a bare M104 and never waits at it, and every flush extrusion "
-         "of the purge runs at it — an extrusion at a target no wait ever proved",
+         "of the purge runs at it — an extrusion at a target no wait ever proved, unless it is the "
+         "file's own declared range high (the one exception the vendor's change_filament_gcode "
+         "writes, and it is read per tool and recorded as a flush temperature — see the "
+         "flush-R rule in parse_gcode_settings)",
     "S": "S is the purge's own final M109 and its last extrusion runs at it, so the file's verified "
          "wait would no longer be the temperature the print continues at",
 }
@@ -970,17 +1094,34 @@ def _purge_tool_refusal(tool: int, tools: list[int]) -> PrinterError:
     """A purge whose ``T`` names a tool the file never selected. The firmware does not file that T
     away as a note about the flush: mid-purge it runs ``CANVAS_SWITCH_FILAMENT T=<n>``, which cuts,
     unloads and loads that tool's filament (mmu.cpp:3276, and CMD_canvas_switch_filament at 2811
-    setting ``feed_channel_request = get_T_channel(T)``). So the file has two tools."""
+    setting ``feed_channel_request = get_T_channel(T)``). Several tools are legal now, but every
+    tool whose filament the file switches must be one the file's own ``T<n>`` lines select — a
+    purge naming a tool none of them names runs a filament switch the file nowhere declares."""
     selects = ", ".join(f"T{t}" for t in tools[:4])
     return _refuse(
         f"it flushes tool {tool} (an M6211 T{tool}) while its own tool select reads {selects}; that "
         "T is not a comment about the flush — the firmware runs CANVAS_SWITCH_FILAMENT T="
-        f"{tool} inside the purge, cutting, unloading and loading that tool's filament — so the file "
-        "has a second tool, and this version supports exactly one")
+        f"{tool} inside the purge, cutting, unloading and loading that tool's filament — so the "
+        "file switches in a tool it never selects, and every tool a file flushes it must also "
+        "select")
+
+
+def _flush_range_refusal(quote: str, value: float, target: float, bad: PrinterError) -> PrinterError:
+    """A purge whose R leans on the declared-range-high exception, met by a file whose
+    ``nozzle_temperature_range_high`` lines cannot answer (missing, empty, self-contradictory or
+    unphysical). The inner refusal names the key; this wrapper adds the purge line that needed it,
+    so one message carries both which flush cannot be vouched for and which config failed it."""
+    inner = bad.message
+    if inner.startswith(_REFUSE_PREFIX):
+        inner = inner[len(_REFUSE_PREFIX):]
+        inner = inner[0].lower() + inner[1:]
+    return _refuse(f"the purge command {quote!r} sets R to {value:g} °C while the nozzle target "
+                   f"verified by an M109 wait at that point in the file is {target:g} °C, and the "
+                   f"file cannot establish the one exception this adapter reads for R: {inner}")
 
 
 def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
-    """Read one single-tool CC2 file's print settings from its own bytes, fail-closed.
+    """Read one CC2 file's print settings — single- or multi-tool — from its own bytes, fail-closed.
 
     Commands first: only comment-stripped, line-initial G-code counts (the file's config block
     quotes start G-code templates full of M-codes; none of those were ever issued). The nozzle
@@ -994,43 +1135,52 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     extrusion can slip through, and no printing-temperature range is hardcoded anywhere here.
     The purge is read for its own facts as well, against the published firmware (``_PURGE_FIELDS``):
     its ``Q``/``R``/``S`` are the three setpoints it heats to, in that order and with ``R`` never
-    waited at, so all three must equal the verified target, and its ``T`` is a filament switch, so a
-    purge naming a tool the file never selects is a second tool and refuses. Tool selects must use
-    exactly one tool number — none at all is missing tool metadata (a purge's ``T`` is not a
-    substitute for the file's own ``T<n>`` line), and more than one is multi-tool. ``G180`` is the CC2
+    waited at. ``Q`` and ``S`` must equal the verified target. ``R`` alone carries one exception,
+    because the vendor's own ``change_filament_gcode`` writes ``R=[nozzle_temperature_range_high]``:
+    an off-target R is allowed only when it equals the file's declared ``nozzle_temperature_range_high``
+    of **both** the tool being left and the tool switched to (read per tool, below), and that value
+    is then recorded as a flush temperature of both tools (``ToolSettings.flush_nozzle_temps``,
+    design amendment 9) — never as a printing temperature in ``extrusion_nozzle_temps`` and never
+    as a commanded setpoint, so a start can report it against each tray's rated maximum without
+    mistaking the vendor's flush for the print. A purge's ``T``
+    is a filament switch, so it must name a tool the file itself selects, and after a purge the
+    current tool is the purge's ``T``. Several ``T<n>`` selects are legal — the tools are the
+    distinct selects in first-seen order, and each extrusion is attributed to the tool in force at
+    its line; an extrusion before any select or purge cannot be attributed to a spool and refuses,
+    and none at all is missing tool metadata (a purge's ``T`` is not a substitute for the file's own
+    ``T<n>`` line). ``G180`` is the CC2
     firmware's own macro dispatcher and is decided
     one number at a time (``_G180_MACROS``): the numbers whose published ``[g180]`` bodies this
     adapter has read pass, every other number refuses the file, and the end-of-print unload (S9)
     drops the nozzle accounting it cannot carry across, so nothing extrudes after it.
 
-    Config second: material, the plate's first-layer and steady bed temperatures, and the nozzle
-    first-layer and steady setpoints, each refusing to be missing, ambiguous or unphysical.
+    Config second: the plate's first-layer and steady bed temperatures, then — once the file's
+    own tool selects are known — the material and the nozzle first-layer and steady setpoints
+    read per selected tool (``_config_per_tool``), each refusing to be missing, ambiguous or
+    unphysical; the same per-tool read decides any deferred flush-R exception, against the file's
+    declared ``nozzle_temperature_range_high`` list.
     Cross-check last: every one of the four print setpoints must also appear among the commands —
     a file whose config promises 260 while its G-code never heats to 260 is an inconsistent file,
     and inconsistency is exactly what this parse exists to catch. Command setpoints beyond the
-    print setpoints (the observed 140 °C flush hold) stay listed as evidence and never block:
-    what the printer holds during a purge step is its own business, and the start is what checks
-    print setpoints against spool ranges. The file's own declared filament ranges
-    (``nozzle_temperature_range_*``) are deliberately ignored — the authority for a spool is the
-    CANVAS tray the printer reports at start, not text in a file someone may have edited."""
+    print setpoints (the observed 140 °C flush hold) stay listed as
+    evidence and never block: what the printer holds during a purge step is its own business, and
+    the start is what checks them against spool ranges. The file's own declared filament ranges
+    (``nozzle_temperature_range_*``) are never used to accept a print temperature — the authority
+    for a spool is the CANVAS tray the printer reports at start, not text in a file someone may
+    have edited — with the single exception the flush-R rule above reads the declared range high
+    for, which ends up recorded as each tool's flush temperature for the start to report."""
     text_lines = list(lines)  # small files in tests, real files streamed by the upload; either way once
     config = _collect_config(text_lines)
 
-    material = _config_single(config, "filament_type", "filament type")
-    if (len(material) > 64 or not material.isascii()
-            or not material.isprintable() or any(c.isspace() for c in material)):
-        raise _refuse(f"its filament type {material[:20]!r} is not a plain printable word")
-
+    # the plate decides the bed keys and needs no tool knowledge, so it is read up front; the
+    # per-tool keys (material, the two nozzle setpoints) are read after the scan below, because
+    # "one value per tool" is only knowable once the file's own tool selects have been seen
     plate_word = _config_single(config, "curr_bed_type", "build-plate type").lower()
     if plate_word not in _PLATE_BED_KEYS:
         raise _refuse(f"it prints on plate {plate_word!r}, whose bed-temperature config keys this "
                       "adapter does not know, so its bed setpoints cannot be identified")
     first_key, steady_key = _PLATE_BED_KEYS[plate_word]
 
-    nozzle_first = _config_temp(config, "nozzle_temperature_initial_layer",
-                                "initial-layer nozzle temperature", maximum=_NOZZLE_MAX)
-    nozzle = _config_temp(config, "nozzle_temperature", "steady nozzle temperature",
-                          maximum=_NOZZLE_MAX)
     bed_first = _config_temp(config, first_key, "initial-layer bed temperature", maximum=_BED_MAX)
     bed = _config_temp(config, steady_key, "steady bed temperature", maximum=_BED_MAX)
 
@@ -1049,6 +1199,24 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     nozzle_target: float | None = None
     waited: float | None = None
     extrusion_temps: list[float] = []
+    # per-tool verified-extrusion story: tool index -> temperatures that tool's extrusion ran
+    # behind a verified wait, first order seen (the file-wide ``extrusion_temps`` stays the union
+    # of every tool's story, which is what the v2 receipt's flat field carries until receipt v3
+    # gives each tool its own)
+    per_tool_temps: dict[int, list[float]] = {}
+    # per-tool flush story (design amendment 9): tool index -> every accepted flush R that tool
+    # was left or entered at, distinct, first order seen. Kept apart from the extrusion story:
+    # a flush R was never waited at, so it is no printing temperature
+    per_tool_flush: dict[int, list[float]] = {}
+    # whose filament the file is running right now: a ``T<n>`` select sets it, and after a purge
+    # it is the purge's ``T`` (the firmware switches that filament mid-purge). An extrusion
+    # before either cannot be attributed to a spool and refuses.
+    current_tool: int | None = None
+    # design 3's flush-R exceptions held for after the scan: (quote, R, tool being left, tool
+    # switched to). Each tool's declared nozzle_temperature_range_high is read per tool through
+    # _config_per_tool, which needs the file's complete tool list — and a real slice's purge
+    # names its next tool one line before its own ``T<n>`` select reaches it.
+    flush_r: list[tuple[str, float, float, int | None, int]] = []
     cooldown_at: list[int] = []
     last_extrusion_at: int | None = None
     unload_seen = False   # a G180 S9 has run (or may have): nothing past it is knowable
@@ -1129,23 +1297,47 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                               "(the most recent verified wait was "
                               + (f"{waited:g} °C" if waited is not None else "no M109 at all")
                               + ") — heat and wait at the purge temperature first")
-            # the purge's own parameters, read the way this printer's firmware reads them: its T is a
-            # filament switch and its Q, R and S are the setpoints it heats to (see _PURGE_FIELDS for
-            # the order the firmware commands them in). Each must be the temperature this file has
-            # already verified a wait at — the one assignment under which the purge neither extrudes at
-            # an un-waited target nor moves the hot end the print continues at.
+            # the purge's own parameters, read the way this printer's firmware reads them: its T is
+            # a filament switch and its Q, R and S are the setpoints it heats to (see _PURGE_FIELDS
+            # for the order the firmware commands them in). Q and S must be the temperature this
+            # file has already verified a wait at — an assignment under which the purge neither
+            # extrudes at an un-waited target nor moves the hot end the print continues at. R keeps
+            # the one exception the vendor's own change_filament_gcode relies on (design 3, below).
             purge = _purge_parameters(line, rest)
-            for letter, value in (("Q", purge.first), ("R", purge.flush), ("S", purge.final)):
+            for letter, value in (("Q", purge.first), ("S", purge.final)):
                 if value != nozzle_target:
                     raise _refuse(
                         f"the purge command {line[:36]!r} sets {letter} to {value:g} °C while the "
                         f"nozzle target verified by an M109 wait at this point is "
                         f"{nozzle_target:g} °C, and {_PURGE_LETTER_WHY[letter]} — every extrusion "
                         "must follow a verified M109 wait at the temperature it runs at")
+            if purge.flush != nozzle_target:
+                # R alone may stand off the verified target: the vendor's own change_filament_gcode
+                # writes R=[nozzle_temperature_range_high], so every real multi-colour file flushes
+                # hotter than it prints. The exception (design 3) is decided per tool, and that is
+                # only safely readable once the scan has seen the file's whole tool list, so this
+                # flush waits for the check below; R already sits inside the firmware's own
+                # 200–350 °C clamp (_PURGE_FIELDS), the sanity fence this file holds every nozzle
+                # number to. Any R that fails the check after the scan refuses the file.
+                flush_r.append((line[:36], purge.flush, nozzle_target, current_tool, purge.tool))
             if purge.tool not in purge_tools:
                 purge_tools.append(purge.tool)
             if nozzle_target not in extrusion_temps:
                 extrusion_temps.append(nozzle_target)
+            # the purge's real extrusions run on the filament it switched in (its own flush and
+            # final extrusion, step 3 of the _PURGE_FIELDS order), so the verified temperature is
+            # that tool's; after the purge, that tool is the file's current one.
+            if nozzle_target not in per_tool_temps.setdefault(purge.tool, []):
+                per_tool_temps[purge.tool].append(nozzle_target)
+            # and the purge first retracts and cuts the filament it switches OUT at this same
+            # verified target (step 1 of the _PURGE_FIELDS order), so the outgoing tool ran at it
+            # too: recorded on that tool as well, so a start compares its tray against it
+            # (review finding, PR #11; with Q and S pinned to the target this is the temperature
+            # the outgoing tool was already printing at, recorded now even when it never extruded)
+            if current_tool is not None and nozzle_target not in per_tool_temps.setdefault(
+                    current_tool, []):
+                per_tool_temps[current_tool].append(nozzle_target)
+            current_tool = purge.tool
             continue
         if head in _MOVE_HEADS:
             # tokenise the parameters so a compact ``G1 X1E6`` (an E welded inside a token) reads
@@ -1177,6 +1369,13 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                                   "needs another M109 at the new value")
                 if nozzle_target not in extrusion_temps:
                     extrusion_temps.append(nozzle_target)
+                if current_tool is None:
+                    raise _refuse(f"{where} extrudes before the file has selected any tool or "
+                                  "flushed one in with a purge, so this parse cannot say which "
+                                  "spool runs it — refusing rather than recording an extrusion "
+                                  "no tool's story can answer for")
+                if nozzle_target not in per_tool_temps.setdefault(current_tool, []):
+                    per_tool_temps[current_tool].append(nozzle_target)
                 last_extrusion_at = idx
             # and a move with no E still has to be a command the list carries: the G38.x probe move
             # and the padded spellings are read here for their E parameter, but they are not commands
@@ -1188,8 +1387,25 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
         m = _TOOL_RE.match(line.upper())  # Klipper matches command words case-insensitively
         if m:
             tool = int(m.group(1))
+            if current_tool is not None and tool != current_tool:
+                # A bare T<n> that names a different tool than the one in force is a filament
+                # switch this parser has never read on this firmware: the vendor's own slicer
+                # only ever changes tool through M6211 (whose T switches the filament, then the
+                # T<n> line restates it). If a bare T<n> switches filament it is an unread
+                # filament command; if it does nothing, the old spool keeps extruding at a
+                # temperature only the new tool's tray is checked against. Either way refused
+                # (review finding, PR #11): a tool change arrives only through M6211 T<n>.
+                raise _refuse(f"the tool select {line[:20]!r} changes the tool from tool "
+                              f"{current_tool} (T{current_tool}) to tool {tool} (T{tool}) with no "
+                              "M6211 purge switching it first — a bare tool "
+                              "change is a filament switch this parser has not read on this "
+                              "firmware, and the vendor's own slicer only changes tool through "
+                              "its M6211 purge, so one without it is refused",
+                              hint="Re-slice with the stock Centauri Carbon 2 change_filament_gcode, "
+                                   "whose M6211 T<n> precedes every T<n>.")
             if tool not in tools:
                 tools.append(tool)
+            current_tool = tool
             continue
         # Nothing above consumed this line, so this is a command the parser does not read — and
         # unread is not inert. The allow list decides: an entry goes if it is justified, and
@@ -1202,33 +1418,99 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                       "non-extruding preheat below the printing temperature is fine; switching "
                       "the heater off mid-file is not)")
     if not tools:
-        raise _refuse("it selects no tool at all (no T<n> line), so its single tool cannot be "
-                      "identified — multi-tool and unattributed files are refused until this "
-                      "adapter supports them independently")
-    if len(tools) > 1:
-        raise _refuse(f"it selects {len(tools)} tools ({', '.join(f'T{t}' for t in tools[:4])}); "
-                      "this version supports exactly one file tool, mapped to one tray")
+        raise _refuse("it selects no tool at all (no T<n> line), so its tools cannot be "
+                      "identified — a file whose only tool mention sits inside an M6211 says "
+                      "nothing dependable about its spools")
     if any(tool not in tools for tool in purge_tools):
-        # a flush that switches in a tool the file never selected is a second tool by the firmware's
-        # own doing, whatever the file's own T<n> lines say
+        # a flush that switches in a tool the file never selected switches a spool the file
+        # itself never names, whatever else about it is multi-tool
         raise _purge_tool_refusal(next(t for t in purge_tools if t not in tools), tools)
 
-    for value, label in ((nozzle_first, "initial-layer nozzle temperature"),
-                         (nozzle, "steady nozzle temperature")):
-        if value not in nozzle_cmds:
-            raise _refuse(f"its config promises a {label} of {value:g} °C but no M104/M109 "
-                          "command ever sets it — the file's config and its commands disagree")
+    # per-tool config, read here because "one value per tool" is decided by the tool selects the
+    # scan above collected; a single tool's single value works whatever that tool's number is
+    materials = _config_per_tool(config, "filament_type", "filament type", tools)
+    for value in materials:
+        if (len(value) > 64 or not value.isascii()
+                or not value.isprintable() or any(c.isspace() for c in value)):
+            raise _refuse(f"its filament type {value[:20]!r} is not a plain printable word")
+    nozzle_firsts = _config_temp_per_tool(config, "nozzle_temperature_initial_layer",
+                                          "initial-layer nozzle temperature", tools,
+                                          maximum=_NOZZLE_MAX)
+    nozzles = _config_temp_per_tool(config, "nozzle_temperature", "steady nozzle temperature",
+                                    tools, maximum=_NOZZLE_MAX)
+
+    if flush_r:
+        # design 3, decided now that the tool list above is complete: an off-target flush R may
+        # stand only as the vendor's own change_filament_gcode writes it — equal to the declared
+        # nozzle_temperature_range_high of BOTH the tool being left and the tool switched to, the
+        # file's own numbers read the same per-tool way as every other per-filament key (missing,
+        # short, contradictory or unphysical lists refuse naming the key here). The purge's
+        # firmware clamp already holds R inside the sanity fence; the declared values, which R
+        # must equal, are fence-checked by the same read.
+        try:
+            ranges = _config_temp_per_tool(config, "nozzle_temperature_range_high",
+                                           "declared nozzle temperature range high", tools,
+                                           maximum=_NOZZLE_MAX)
+        except PrinterError as bad:
+            quote, value, target, _leaving, _dest = flush_r[0]
+            raise _flush_range_refusal(quote, value, target, bad) from None
+        for quote, value, target, leaving, dest in flush_r:
+            if leaving is None:
+                raise _refuse(
+                    f"the purge command {quote!r} sets R to {value:g} °C, which is not the "
+                    "verified wait in force there, and at that point the file had selected no "
+                    "tool and flushed in none, so there is no tool being left whose declared "
+                    "nozzle_temperature_range_high could authorise the flush — refusing rather "
+                    "than flushing hotter than any spool in this file is read for")
+            high_left, high_dest = ranges[leaving], ranges[dest]
+            if value != high_left or value != high_dest:
+                raise _refuse(
+                    f"the purge command {quote!r} sets R to {value:g} °C while the nozzle target "
+                    f"verified by an M109 wait at this point is {target:g} °C; R may differ from "
+                    "it only the way the vendor's own change_filament_gcode "
+                    "writes it — equal to the declared nozzle_temperature_range_high of BOTH the "
+                    f"tool being left (T{leaving}: {high_left:g} °C) and the tool switched to "
+                    f"(T{dest}: {high_dest:g} °C) — and the flush really extrudes at R, so any "
+                    "other R is an extrusion at a target no wait ever proved and no mapped "
+                    "spool is read for")
+            # accepted: the flush pushed both spools' filament at R, so R is recorded as a flush
+            # temperature of each tool (design amendment 9) — not as a printing temperature,
+            # because no M109 ever waited there, and not in the file-wide extrusion story either
+            for tool in (leaving, dest):
+                if value not in per_tool_flush.setdefault(tool, []):
+                    per_tool_flush[tool].append(value)
+
+    for index in tools:  # every selected tool's promises must appear among the commands
+        for value, label in ((nozzle_firsts[index], "initial-layer nozzle temperature"),
+                             (nozzles[index], "steady nozzle temperature")):
+            if value not in nozzle_cmds:
+                raise _refuse(f"its config promises a {label} of {value:g} °C but no M104/M109 "
+                              "command ever sets it — the file's config and its commands disagree")
     for value, label in ((bed_first, "initial-layer bed temperature"), (bed, "steady bed "
                                                                              "temperature")):
         if value not in bed_cmds:
             raise _refuse(f"its config promises a {label} of {value:g} °C but no M140/M190 "
                           "command ever sets it — the file's config and its commands disagree")
-    return Cc2GcodeSettings(material=material,
-                            nozzle_first_layer_temp=nozzle_first, nozzle_temp=nozzle,
-                            bed_first_layer_temp=bed_first, bed_temp=bed, tool_index=tools[0],
+    first_tool = tools[0]
+    # every selected tool carries its own verified-extrusion story — the temperatures its own E
+    # moves and its purges ran behind a verified wait — and, apart from it, its flush story: any
+    # accepted flush R (recorded for both tools that flush touched, because the flush extruded
+    # on both spools). The flat field stays the file-wide union of the verified-extrusion stories
+    # in first order seen, so a reader that knows only it still sees every printing temperature
+    tool_settings = tuple(
+        ToolSettings(tool_index=index, material=materials[index],
+                     nozzle_first_layer_temp=nozzle_firsts[index], nozzle_temp=nozzles[index],
+                     extrusion_nozzle_temps=tuple(per_tool_temps.get(index, [])),
+                     flush_nozzle_temps=tuple(per_tool_flush.get(index, [])))
+        for index in tools)
+    return Cc2GcodeSettings(material=materials[first_tool],
+                            nozzle_first_layer_temp=nozzle_firsts[first_tool],
+                            nozzle_temp=nozzles[first_tool],
+                            bed_first_layer_temp=bed_first, bed_temp=bed, tool_index=first_tool,
                             nozzle_setpoints=tuple(nozzle_cmds), bed_setpoints=tuple(bed_cmds),
                             extrusion_nozzle_temps=tuple(extrusion_temps),
-                            bed_plate=plate_word)
+                            bed_plate=plate_word,
+                            tools=tool_settings)
 
 
 def parse_gcode_text(text: str) -> Cc2GcodeSettings:
@@ -1622,6 +1904,17 @@ async def upload_gcode(transport: Any, path: str | os.PathLike[str], destination
                     commanded_bed_setpoints=settings.bed_setpoints,
                     extrusion_nozzle_temps=settings.extrusion_nozzle_temps,
                     tool_index=settings.tool_index,
+                    # every tool the file selected carries its own entry — its material, its own
+                    # setpoints, the temperatures its extrusion ran at, and apart from them any
+                    # accepted flush R both spools it touched were pushed through (design
+                    # amendment 9); the flat fields above stay the first tool's story beside them
+                    tools=tuple(
+                        ToolReceipt(tool_index=tool.tool_index, material=tool.material,
+                                    nozzle_first_layer_temp=tool.nozzle_first_layer_temp,
+                                    nozzle_temp=tool.nozzle_temp,
+                                    extrusion_nozzle_temps=tool.extrusion_nozzle_temps,
+                                    flush_nozzle_temps=tool.flush_nozzle_temps)
+                        for tool in settings.tools),
                     uploaded_at=datetime.now(UTC))
             except PrinterError as e:
                 raise Cc2UploadError(

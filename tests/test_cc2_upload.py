@@ -28,11 +28,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
+import re
+
 import pytest
 
 from orcaslicer_mcp.printer import cc2_state as st
 from orcaslicer_mcp.printer import cc2_upload as up
-from orcaslicer_mcp.printer.cc2_receipts import RECEIPT_VERSION, Cc2ReceiptStore, Cc2UploadReceipt
+from orcaslicer_mcp.printer.cc2_receipts import (RECEIPT_VERSION, Cc2ReceiptStore,
+                                                  Cc2UploadReceipt, ToolReceipt)
 from orcaslicer_mcp.printer.cc2_transport import AccessCode
 from orcaslicer_mcp.printer.errors import PrinterError
 
@@ -289,13 +292,255 @@ def test_the_template_traps_and_m6211_parameter_never_select_a_tool_or_heat_anyt
     assert all(v >= 0 for v in s.nozzle_setpoints)
 
 
-def test_a_multi_tool_file_is_refused_as_such():
-    with pytest.raises(PrinterError) as bad:
+def _two_tool_frame(*, r_flush=240.0, range_high="240,240", nozzle=210.0):
+    """The slicer's own multi-colour order, as the real grey/black Penelope-tag slice (and the
+    ``tests/fixtures/cc2_two_tool.gcode`` trim built from it) writes it: the start wait, the
+    start purge at T0, that tool's select and extrusions, then the change-filament purge —
+    ``M6211 T<next> ... Q<target> R<range high> S<target>`` — followed by the new tool's own
+    ``T<n>`` select, a re-wait and its extrusions, then the end block. Two PLA tools printing
+    at 210 °C; the flush R and the declared ``nozzle_temperature_range_high`` list are what the
+    test puts there, so the R rule is proven against exactly the vendor pattern above."""
+    n = f"{nozzle:g}"
+    cmds = ["M104 S140", "M140 S60", "M190 S60 A", f"M109 S{n}",
+            f"M6211 A1 L200 T0 Q{n} R{n} S{n}", "T0", f"M109 S{n}", "G1 E6 F251.567",
+            f"M6211 T1 L34.9 M523 N523 Q{n} R{r_flush:g} S{n}", "T1", f"M109 S{n}",
+            "G1 E3 F251.567", "M104 S0", "M140 S0"]
+    cfg = ("; curr_bed_type = High Temp Plate\n; filament_type = PLA;PLA\n"
+           f"; nozzle_temperature = {n},{n}\n"
+           f"; nozzle_temperature_initial_layer = {n},{n}\n"
+           f"; nozzle_temperature_range_high = {range_high}\n"
+           "; hot_plate_temp = 60,60\n; hot_plate_temp_initial_layer = 60,60\n")
+    return "\n".join(cmds) + "\n" + cfg
+
+
+def test_a_multi_tool_file_parses_and_one_that_cannot_say_what_each_tool_prints_at_refuses():
+    # multi-tool is spoken for now (change cc2-multi-tool-print, design 2/4): the tools are the
+    # distinct T<n> selects in first-seen order, each extrusion is attributed to the tool in
+    # force, and the file must write one value per tool for every per-filament key. A file that
+    # lists one material for two tools leaves a tool whose spool nobody read — that still
+    # refuses, naming the key.
+    s = up.parse_gcode_text(_two_tool_frame())
+    assert [t.tool_index for t in s.tools] == [0, 1]
+    with pytest.raises(PrinterError) as short:
         up.parse_gcode_text(gcode_text(tools=("T0", "T1")))
-    assert "tool" in bad.value.message.lower()
+    # a bare T1 after T0 with no M6211 switching it is refused as an unread filament switch
+    # before the config is ever read (review finding, PR #11 round 2)
+    assert "no M6211 purge" in short.value.message
+    assert "Nothing was sent" in short.value.message
     with pytest.raises(PrinterError) as none:
         up.parse_gcode_text(gcode_text(omit=("tools",)))
     assert "tool" in none.value.message.lower()
+
+
+def test_an_extrusion_before_any_select_or_purge_refuses_because_no_tool_owns_it():
+    # with several tools legal, an extrusion is only worth something if the parse can say
+    # whose filament ran it: before the first T<n> select and before any purge switched one
+    # in, there is no current tool, and the temperature would have to be recorded against
+    # every spool or none — either way a lie, so the file refuses instead
+    body = _two_tool_frame().replace("M6211 A1 L200 T0 Q210 R210 S210\nT0\n", "", 1)
+    assert body != _two_tool_frame()
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(body)
+    assert "before the file has selected any tool" in bad.value.message
+    assert "Nothing was sent" in bad.value.message
+
+
+def test_the_two_tool_fixture_parses_to_two_pla_tools_at_210_flushing_at_240_on_both(gcode_fixture):
+    # the real grey/black Penelope-tag slice, trimmed by task 1.1 to head + first T1 change
+    # block + tail: two PLA tools both printing at 210 °C, and the vendor's own change-filament
+    # purge flushing at R 240 — the declared nozzle_temperature_range_high of both tools. 240
+    # is therefore a flush temperature of BOTH spools, kept apart from the printing
+    # temperatures (design amendment 9): no M109 waits at it, so it is neither an extrusion
+    # temperature nor a commanded setpoint, and the start reports it against each tray's rated
+    # maximum instead of refusing on it. Stored compressed like every other fixture
+    # (tests/fixtures/cc2_two_tool.gcode.xz; raw .gcode is ignored by the repo rule).
+    text = gcode_fixture("cc2_two_tool")
+    s = up.parse_gcode_text(text)
+    assert [t.tool_index for t in s.tools] == [0, 1]
+    assert [t.material for t in s.tools] == ["PLA", "PLA"]
+    assert all((t.nozzle_first_layer_temp, t.nozzle_temp) == (210.0, 210.0) for t in s.tools)
+    assert [t.extrusion_nozzle_temps for t in s.tools] == [(210.0,), (210.0,)]
+    assert [t.flush_nozzle_temps for t in s.tools] == [(240.0,), (240.0,)]
+    # the flat fields stay the first tool's config story beside the file-wide verified one
+    assert (s.tool_index, s.material, s.nozzle_temp, s.nozzle_first_layer_temp) == (
+        0, "PLA", 210.0, 210.0)
+    assert s.extrusion_nozzle_temps == (210.0,)
+    # the 140 preheat stays evidence, not a print setpoint, and the flush R is no setpoint at all
+    assert s.nozzle_setpoints == (140.0, 210.0)
+    # and the real slice writes its speed overrides (M220 S100) — allowed by design 5, below
+    assert "M220 S100" in text
+
+
+def test_a_flush_r_may_stand_off_the_verified_target_only_as_both_tools_declared_range_high():
+    # design 3, and the vendor's reason: change_filament_gcode writes
+    # R=[nozzle_temperature_range_high], so every real multi-colour file flushes hotter than it
+    # prints. R equal to the verified target needs no exception at all; an R that equals the
+    # declared high of BOTH the tool being left and the tool switched to is accepted and
+    # recorded as a flush temperature of both spools (design amendment 9) — never as a
+    # printing temperature, and never as a commanded setpoint, while the purge's Q and S stay
+    # the verified waits they must be; an R that equals either one of them — or neither, one
+    # degree of difference included — refuses, because no wait ever proved that number and the
+    # file's own declared range does not bound it.
+    s = up.parse_gcode_text(_two_tool_frame(r_flush=240.0, range_high="240,240"))
+    assert [t.flush_nozzle_temps for t in s.tools] == [(240.0,), (240.0,)]
+    assert [t.extrusion_nozzle_temps for t in s.tools] == [(210.0,), (210.0,)]
+    assert s.extrusion_nozzle_temps == (210.0,)
+    assert 240.0 not in s.nozzle_setpoints and 210.0 in s.nozzle_setpoints
+    same = up.parse_gcode_text(_two_tool_frame(r_flush=210.0))   # R == target: no exception used
+    assert [t.extrusion_nozzle_temps for t in same.tools] == [(210.0,), (210.0,)]
+    assert [t.flush_nozzle_temps for t in same.tools] == [(), ()]
+    for bad_r, high in ((250.0, "240,240"),    # the acceptance's own number, moved by ten
+                        (239.0, "240,240"),    # one below the declared high is still a different
+                        (240.0, "240,250"),    # heat: both tools must declare it, and the
+                        (240.0, "250,240")):   # tool being left counts exactly as much
+        with pytest.raises(PrinterError) as bad:
+            up.parse_gcode_text(_two_tool_frame(r_flush=bad_r, range_high=high))
+        assert "R" in bad.value.message and f"{bad_r:g}" in bad.value.message
+        assert "Nothing was sent" in bad.value.message
+    # and a file whose declared list cannot answer at all refuses naming the key, not guessing
+    missing = _two_tool_frame().replace("; nozzle_temperature_range_high = 240,240\n", "", 1)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(missing)
+    assert "nozzle_temperature_range_high" in bad.value.message
+    assert "Nothing was sent" in bad.value.message
+
+
+def test_a_two_tool_flush_naming_a_tool_the_file_never_selects_still_refuses():
+    # the acceptance above is about tools the file itself selects: a purge's T is a real
+    # filament switch (CANVAS_SWITCH_FILAMENT), so a two-tool file whose flush switches a
+    # third tool the file's own lines never name is still an unread spool and refuses
+    body = _two_tool_frame().replace("M6211 T1 L34.9", "M6211 T2 L34.9", 1)
+    assert body != _two_tool_frame()
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(body)
+    msg = bad.value.message.lower()
+    assert "tool 2" in msg and "nothing was sent" in msg
+
+
+def test_config_lists_split_on_semicolons_as_well_as_commas():
+    # the real two-tool slice writes ``; filament_type = PLA;PLA`` beside comma lists
+    # (``; nozzle_temperature = 210,210``) in the same config block: both delimiters are the
+    # slicer's own way of writing one value per tool, and a comma-only split would read
+    # "PLA;PLA" as one filament word and call a two-tool file a single-tool one.
+    assert up._config_value("PLA;PLA") == ["PLA", "PLA"]
+    assert up._config_value("210,210") == ["210", "210"]
+    assert up._config_value("PLA; PETG,ABS") == ["PLA", "PETG", "ABS"]
+    assert up._config_value("[PLA;PLA]") == ["PLA", "PLA"]
+    assert up._config_value("PLA;") == ["PLA", ""]      # positions kept: the empty slot stays
+    assert up._config_value("PLA;;PETG") == ["PLA", "", "PETG"]   # tool 2 is PETG, tool 1 blank
+    assert up._config_value("") == [] and up._config_value("[]") == []
+    # and the split is not helper-only, it reaches a parse: a semicolon list on a one-tool file
+    # is the spare filament of a larger project (a one-colour print from a two-filament
+    # project) — tool 0 prints PLA, the PETG belongs to a tool the file never selects, and the
+    # file passes with the material read positionally, never as a word called "PLA;PETG"
+    s = up.parse_gcode_text(gcode_text(material="PLA;PETG"))
+    assert s.material == "PLA" and [t.material for t in s.tools] == ["PLA"]
+
+
+def test_a_bare_tool_change_with_no_purge_refuses_as_an_unread_filament_switch():
+    # review finding (PR #11 round 2): T0 prints PLA, the file then heats to 250 and writes a
+    # bare T1 with no M6211 T1 before it. Whether a bare T<n> switches filament on this
+    # firmware is unread — if it does, that is an unread filament command; if it does not, PLA
+    # extrudes at 250 while only tool 1's tray is checked against it. Refused either way, and
+    # the fixture (whose every T<n> restates the tool its purge just set) still passes.
+    frame = _two_tool_frame()
+    probe = re.sub(r"^M6211 T1 [^\n]*\n", "", frame, count=1, flags=re.M)
+    assert probe != frame and "\nT1\n" in probe
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "no M6211 purge" in bad.value.message and "tool 0 (T0) to tool 1 (T1)" in bad.value.message
+    assert "Nothing was sent" in bad.value.message
+    up.parse_gcode_text(frame)  # the vendor's own shape, purge then restated T, still passes
+
+
+def test_a_longer_per_tool_list_is_the_spare_filaments_of_a_larger_project():
+    # review finding (PR #11 round 2): a two-colour print from a four-filament project writes
+    # four values per key; the two extra belong to tools the file never selects, which never
+    # extrude and are never mapped — read and left alone, never refused
+    assert up._config_per_tool({"filament_type": ["PLA;PLA;PETG;ABS"]}, "filament_type",
+                               "material", [0, 1]) == ["PLA", "PLA", "PETG", "ABS"]
+    assert up._config_per_tool({"nozzle_temperature": ["210,210"]}, "nozzle_temperature",
+                               "steady nozzle temperature", [0]) == ["210", "210"]
+
+
+def test_an_empty_position_in_a_per_tool_list_refuses_instead_of_shifting_tool_numbers():
+    # review finding (PR #11): ``PLA;;PETG`` once collapsed to ["PLA", "PETG"], handing tool 2's
+    # PETG to tool 1 — for a per-tool key the position IS the tool number, so a blank is a tool
+    # whose value the file never says, refused with the position named, never filled in
+    with pytest.raises(PrinterError) as bad:
+        up._config_per_tool({"filament_type": ["PLA;;PETG"]}, "filament_type", "material",
+                            [0, 1, 2])
+    assert "position 1" in bad.value.message and "tool 1" in bad.value.message
+    assert "Nothing was sent" in bad.value.message
+    # a plate key still ignores a dangling delimiter the way a bare comma always was ignored
+    assert up._config_single({"hot_plate_temp": ["60,"]}, "hot_plate_temp", "bed") == "60"
+
+
+def test_repeated_per_tool_lines_must_carry_the_same_number_of_values():
+    # review finding (PR #11): a second ``; nozzle_temperature =`` line listing one value after
+    # a first listing two once borrowed the first line's tail and passed; repeats that disagree
+    # on how many tools there are refuse, naming both counts
+    with pytest.raises(PrinterError) as bad:
+        up._config_per_tool({"nozzle_temperature": ["210,230", "210"]}, "nozzle_temperature",
+                            "steady nozzle temperature", [0, 1])
+    assert "2 and 1 values" in bad.value.message
+    # identical repeats are the ordinary slicer habit and still pass
+    assert up._config_per_tool({"nozzle_temperature": ["210,230", "210,230"]},
+                               "nozzle_temperature", "steady nozzle temperature",
+                               [0, 1]) == ["210", "230"]
+
+
+def test_a_purge_records_the_verified_target_on_the_outgoing_tool_too():
+    # review finding (PR #11): the purge retracts and cuts the OUTGOING filament at the verified
+    # target before it flushes the incoming one, so that temperature is the outgoing tool's as
+    # well — the two-tool frame's T0 is left at 210 by the first purge and T1 by the next, and
+    # both tools carry 210 even on a frame where the parse sees the switch before any E move of
+    # the tool being left
+    s = up.parse_gcode_text(_two_tool_frame())
+    assert all(210.0 in t.extrusion_nozzle_temps for t in s.tools)
+    # and a purge whose Q or S strays from the verified target (a mixed-temperature switch, Q 260
+    # S 210 against a 210 wait) still refuses outright: the outgoing side is never run at a
+    # temperature no wait proved
+    body = _two_tool_frame().replace("Q210 R240 S210", "Q260 R240 S210", 1)
+    assert body != _two_tool_frame()
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(body)
+    assert "sets Q to 260" in bad.value.message
+
+
+def test_a_per_tool_config_list_shorter_than_the_highest_tool_refuses_naming_the_key():
+    # a key written for tools 0-1 only, in a file selecting tools 0-2, is a tool whose value
+    # the file never says; the refusal names the key so a human can find the line, and which
+    # of the written values the missing tool prints at is never a thing to guess.
+    with pytest.raises(PrinterError) as bad:
+        up._config_per_tool({"nozzle_temperature": ["210,210"]}, "nozzle_temperature",
+                            "steady nozzle temperature", [0, 1, 2])
+    assert "nozzle_temperature" in bad.value.message and "Nothing was sent" in bad.value.message
+    # a single value with one tool is the ordinary single-tool case and works whatever that
+    # tool's number is — a T1-only file's one ``; filament_type = PLA`` is that tool's value
+    assert up._config_per_tool({"filament_type": ["PLA"]}, "filament_type",
+                               "filament type", [1]) == ["PLA", "PLA"]
+
+
+def test_the_one_tool_reference_frame_parses_to_one_tool_settings_equal_to_its_flat_fields():
+    # the flat fields are the first selected tool's values, so for a one-tool file the tool
+    # entry and the flat story must be the same facts, and exactly one entry exists
+    s = up.parse_gcode_text(gcode_text())
+    assert len(s.tools) == 1
+    t = s.tools[0]
+    assert isinstance(t, up.ToolSettings)
+    assert t.tool_index == s.tool_index
+    assert t.material == s.material
+    assert t.nozzle_first_layer_temp == s.nozzle_first_layer_temp
+    assert t.nozzle_temp == s.nozzle_temp
+    assert t.extrusion_nozzle_temps == s.extrusion_nozzle_temps
+    # and that holds whatever the one tool's number is, not just for T0
+    t1 = up.parse_gcode_text(gcode_text(tools=("T1",)))
+    assert [x.tool_index for x in t1.tools] == [1]
+    assert t1.tools[0].nozzle_first_layer_temp == t1.nozzle_first_layer_temp
+    assert t1.tools[0].nozzle_temp == t1.nozzle_temp
+    assert t1.tools[0].material == t1.material
+    assert t1.tools[0].extrusion_nozzle_temps == t1.extrusion_nozzle_temps
 
 
 @pytest.mark.parametrize("text, needle", [
@@ -304,7 +549,7 @@ def test_a_multi_tool_file_is_refused_as_such():
     (gcode_text(omit=("nozzle_first",)), "nozzle_temperature_initial_layer"),
     (gcode_text(omit=("bed",)), "hot_plate_temp"),
     (gcode_text(omit=("bed_first",)), "hot_plate_temp_initial_layer"),
-    (gcode_text(material="PETG,PLA"), "one value"),
+    (gcode_text(material="PETG,"), "position 1"),  # a blank slot, never a borrowed neighbour
     (gcode_text(omit_nozzle_cmds=True), "no M109"),  # the purge-without-a-wait the missing waits
     (gcode_text(omit_bed_cmds=True), "no M140/M190"),  # leave behind — refused where it bites
     (gcode_text(nozzle_first=265.0, nozzle=255.0).replace("M109 S255\n", ""), "disagree"),
@@ -621,6 +866,7 @@ def test_the_allowed_commands_from_the_mount_fixture_still_parse(line):
     "G38.2 X100 F100",                       # a probe move: a code, and not one this list carries
     "G4 U255", "M107 R200",                  # a dwell and a fan-off carrying letters no dialect documents
     "G4 P100E6",                             # an E welded into a dwell is not a duration
+    "M220 X1", "m220 x1",                    # a speed factor carrying a letter that is not its S
     "g4 u255", "m107 r200",                  # and folding its case does not smuggle one past
 ])
 def test_commands_outside_the_allow_list_refuse_however_ordinary_they_look(line):
@@ -644,12 +890,14 @@ def test_commands_outside_the_allow_list_refuse_however_ordinary_they_look(line)
     "G4", "G4 P500", "G4 S2", "G4 D1.5",   # a dwell: a duration, and a duration moves nothing
     "g4 p500",
     "M107", "M107 S0", "m107",              # the part-cooling fan's own off-switch, M106 S0's equal
+    "M220 S100", "M220 S85", "m220 s100",   # the fixture file's own speed-factor override
 ])
 def test_the_commands_widened_onto_the_list_parse_and_change_no_accounting(line):
-    # G0/G3 are the moves G1/G2 already were (their E parameter is gated below), G4 waits and M107
-    # stops a fan: none of them may set a nozzle or bed target, and none may move the one recorded
-    # extrusion off the temperature its M109 proved. This is the widening rule in its positive form —
-    # an entry enters with a reason, and this test is that reason for these four.
+    # G0/G3 are the moves G1/G2 already were (their E parameter is gated below), G4 waits, M107
+    # stops a fan and M220 rescales feedrates of moves the E rules already gated: none of them may
+    # set a nozzle or bed target, and none may move the one recorded extrusion off the temperature
+    # its M109 proved. This is the widening rule in its positive form — an entry enters with a
+    # reason, and this test is that reason for these five.
     body = _heat_frame(*_PRE, line, "G1 E6 F131.773", "M104 S0", "M140 S0", nozzle=240.0)
     s = up.parse_gcode_text(body)
     assert s.extrusion_nozzle_temps == (240.0,)
@@ -997,7 +1245,7 @@ def test_the_allow_list_is_closed_and_every_entry_states_its_own_reason():
     # number at a time against the published [g180] body (see _G180_MACROS and its own tests).
     assert set(up._SAFE_CODE_COMMANDS) == {
         "G0", "G1", "G2", "G3", "G4", "G21", "G28", "G90", "G92", "M104", "M106", "M107", "M109",
-        "M140", "M190", "M204", "M6211", "M73", "M83", "M84"}
+        "M140", "M190", "M204", "M220", "M6211", "M73", "M83", "M84"}
     assert set(up._SAFE_WORD_COMMANDS) == {"BED_MESH_CALIBRATE", "SET_PRESSURE_ADVANCE",
                                             "SET_PRINT_STATS_INFO", "SET_VELOCITY_LIMIT"}
     assert {"G10", "G11", "G12"} <= set(up._BLOCKED_COMMANDS)
@@ -1009,20 +1257,22 @@ def test_the_allow_list_is_closed_and_every_entry_states_its_own_reason():
     assert "unverified" in up._BLOCKED_COMMANDS["G12"]
 
 
-def test_the_two_entries_that_depend_on_their_parameters_name_those_parameters():
+def test_the_three_entries_that_depend_on_their_parameters_name_those_parameters():
     # a move is inert whatever its parameters (its E, if any, is an extrusion and is gated), but a
-    # dwell and a fan-off are inert because of what their documented parameters mean — so an entry
-    # that leans on its parameters has to write down the letters it leans on, they may never include
-    # an E, and they are read by the tokenizer that reads a move so a compact E cannot hide
-    assert set(up._PARAMETER_LETTERS) == {"G4", "M107"}
+    # dwell, a fan-off and a speed-factor override are inert because of what their documented
+    # parameters mean — so an entry that leans on its parameters has to write down the letters it
+    # leans on, they may never include an E, and they are read by the tokenizer that reads a move
+    # so a compact E cannot hide
+    assert set(up._PARAMETER_LETTERS) == {"G4", "M107", "M220"}
     assert set(up._PARAMETER_LETTERS) <= set(up._SAFE_CODE_COMMANDS)
     for head, letters in up._PARAMETER_LETTERS.items():
         assert letters, head
         assert "E" not in letters, head
     assert up._command_policy("G4", "G4 P100", "P100") is None
     assert up._command_policy("M107", "M107 S0", "S0") is None
+    assert up._command_policy("M220", "M220 S100", "S100") is None
     for bad_line, bad_rest in (("G4 P100E6", "P100E6"), ("G4 U255", "U255"), ("M107 R200", "R200"),
-                               ("M107 E5", "E5")):
+                               ("M107 E5", "E5"), ("M220 X1", "X1"), ("M220 S100 E5", "S100 E5")):
         err = up._command_policy(bad_line.split()[0], bad_line, bad_rest)
         assert err is not None, bad_line
         assert "Nothing was sent" in err.message
@@ -1109,7 +1359,9 @@ def test_purge_setpoints_outside_the_verified_target_are_refused(purge, letter, 
     # then ``M109 S<S>`` before its final extrusion. So a purge writing 350 °C beside a file whose
     # only verified wait is 260 °C extrudes at 350 while the receipt — the thing a start compares
     # against the loaded spool's range — still says 260. The pre-fix parser read only S, and read
-    # this file as a purge at 260.
+    # this file as a purge at 260. Q and S keep that rule unchanged; R keeps one exception (the
+    # vendor's own range-high value, proven by its own test above) and 350 is not it: here the
+    # file declares no range high at all, so even the exception has nothing to stand on.
     with pytest.raises(PrinterError) as bad:
         up.parse_gcode_text(_purge_frame(purge))
     assert letter in bad.value.message and value in bad.value.message
@@ -1125,7 +1377,9 @@ def test_a_purge_flushing_another_tools_filament_is_a_second_tool_and_refuses(pu
     # ``T`` inside M6211 is not a note about the flush: the firmware runs
     # ``CANVAS_SWITCH_FILAMENT T=<n>`` in the middle of the purge, which cuts, unloads and loads that
     # tool's filament (mmu.cpp::CMD_canvas_switch_filament → feed_channel_request = get_T_channel(T)).
-    # A file selecting T0 whose purge switches T1 is a two-tool file, and this version serves one.
+    # Several tools are legal now, but every tool whose filament the file switches must be one the
+    # file's own ``T<n>`` lines select: a file selecting only T0 whose purge switches T1 runs a
+    # filament change for a spool the file never names, and refuses whatever multi-tool is legal.
     with pytest.raises(PrinterError) as bad:
         up.parse_gcode_text(_purge_frame(purge))
     msg = bad.value.message.lower()
@@ -1814,6 +2068,142 @@ def test_the_verified_extrusion_temps_survive_the_atomic_round_trip_through_disk
     cold = _sample_receipt(extrusion_nozzle_temps=())  # a file with no extrusion at all may
     assert Cc2UploadReceipt.from_dict(cold.to_dict()) == cold  # exist honestly; empty is allowed
 
+
+def _two_tool_receipt(**over):
+    """A receipt as the real grey/black slice's parse would write one: two PLA tools printing
+    at 210 °C, the vendor's change-filament flush R 240 recorded as a flush temperature of BOTH
+    spools (design amendment 9 — the flush pushed both through the hot end at it, but no wait
+    ever proved it, so it is no printing temperature), and the 140 preheat left as commanded
+    evidence, never as extrusion. ``flush_nozzle_temps`` is a field only version 3 carries."""
+    tools = tuple(
+        ToolReceipt(tool_index=index, material="PLA", nozzle_first_layer_temp=210.0,
+                    nozzle_temp=210.0, extrusion_nozzle_temps=(210.0,),
+                    flush_nozzle_temps=(240.0,))
+        for index in (0, 1))
+    base = dict(material="PLA", nozzle_first_layer_temp=210.0, nozzle_temp=210.0,
+                commanded_nozzle_setpoints=(140.0, 210.0), extrusion_nozzle_temps=(210.0,),
+                tool_index=0, tools=tools)
+    base.update(over)
+    return _sample_receipt(**base)
+
+
+def test_a_v3_receipt_round_trips_every_tool_and_the_flat_fields_stay_the_first_tools():
+    r = _two_tool_receipt()
+    assert Cc2UploadReceipt.from_dict(r.to_dict()) == r  # in memory, every tool survives
+    data = r.to_dict()
+    assert data["version"] == RECEIPT_VERSION == 3
+    assert [tool["tool_index"] for tool in data["tools"]] == [0, 1]
+    assert all(tool["material"] == "PLA" and tool["nozzle_temp"] == 210.0
+               and tool["extrusion_nozzle_temps"] == [210.0]
+               and tool["flush_nozzle_temps"] == [240.0]
+               for tool in data["tools"])  # the flush R is each tool's own, apart from printing
+    assert Cc2UploadReceipt.from_dict(data).tools[1].flush_nozzle_temps == (240.0,)
+    # the flat fields stay the first tool's story for readers that know only them
+    first = data["tools"][0]
+    assert (r.material, r.tool_index, r.nozzle_first_layer_temp, r.nozzle_temp) == (
+        first["material"], first["tool_index"], first["nozzle_first_layer_temp"],
+        first["nozzle_temp"])
+    # and the whole thing survives the atomic round trip through disk unchanged
+
+
+def test_the_tools_survive_the_atomic_round_trip_through_disk(tmp_path):
+    store = Cc2ReceiptStore(tmp_path / "s")
+    r = _two_tool_receipt()
+    store.save(r)
+    assert store.load(SN, DEST) == r
+    data = json.loads(store.path_for(SN, DEST).read_text(encoding="utf-8"))
+    assert data["version"] == 3 and len(data["tools"]) == 2
+    assert data["tools"][1]["extrusion_nozzle_temps"] == [210.0]
+    assert [tool["flush_nozzle_temps"] for tool in data["tools"]] == [[240.0], [240.0]]
+
+
+def test_a_version_2_receipt_reads_as_one_tool_built_from_the_flat_fields():
+    r = _sample_receipt(commanded_nozzle_setpoints=(140.0, 260.0, 220.0),
+                        extrusion_nozzle_temps=(260.0, 220.0))
+    v2 = r.to_dict()
+    del v2["tools"]  # a v2 file never wrote one
+    v2["version"] = 2
+    back = Cc2UploadReceipt.from_dict(v2)
+    assert back == r  # the same receipt, now honestly carrying its one tool …
+    assert back.tools == (ToolReceipt(tool_index=r.tool_index, material=r.material,
+                                      nozzle_first_layer_temp=r.nozzle_first_layer_temp,
+                                      nozzle_temp=r.nozzle_temp,
+                                      extrusion_nozzle_temps=r.extrusion_nozzle_temps),)  # … built
+    assert back.tools[0].flush_nozzle_temps == ()  # v2 knew no flush field: read as none
+    with pytest.raises(PrinterError):  # … and v2 knew no flush R that could explain an
+        Cc2UploadReceipt.from_dict(  # uncommanded extrusion, so reading v2 keeps enforcing it
+            dict(v2, extrusion_nozzle_temps=[300.0]))
+
+
+def test_a_v3_dict_with_a_malformed_tool_entry_is_refused():
+    base = _two_tool_receipt().to_dict()
+    entry = base["tools"][0]
+    for broken in [
+        [],  # a version-3 receipt must name its tools, not leave them to be guessed
+        "01",  # not a list at all
+        [entry, 1],  # an entry that is not an entry
+        [{k: v for k, v in entry.items() if k != "material"}],  # a half entry
+        [dict(entry, material=5)],  # a material that is not a word
+        [dict(entry, tool_index="0")],  # a tool that is not a number
+        [dict(entry, nozzle_temp=500.0)],  # a temperature outside the fence
+        [dict(entry, extrusion_nozzle_temps="210")],  # temperatures spelled as a string
+        [{k: v for k, v in entry.items() if k != "flush_nozzle_temps"}],  # v3 always writes it
+        [dict(entry, flush_nozzle_temps="240")],  # flush temperatures spelled as a string
+        [dict(entry, extrusion_nozzle_temps=None), base["tools"][1]],  # null is not an empty list
+        [dict(entry, flush_nozzle_temps=None), base["tools"][1]],      # (review finding, PR #11)
+        [dict(entry, extrusion_nozzle_temps=0), base["tools"][1]],     # nor is a number
+        [dict(entry, flush_nozzle_temps=[500.0])],  # a flush outside the fence
+        [dict(entry, extrusion_nozzle_temps=[210.0, 400.0]), base["tools"][1]],
+        # 400 °C is inside the fence but no commanded setpoint and no flush both flushing
+        # tools carried — a temperature the parser could not have written for that tool
+        [base["tools"][0], dict(base["tools"][1], tool_index=0)],  # the same tool named twice
+        [dict(entry, material="PETG"), base["tools"][1]],  # first entry that disagrees with
+    ]:  # the flat fields is not the receipt the parse wrote
+        data = dict(base, tools=broken)
+        with pytest.raises(PrinterError):
+            Cc2UploadReceipt.from_dict(data)
+
+
+async def test_an_uploaded_two_tool_file_records_every_tool_on_its_receipt(tmp_path, store):
+    # the writer, not just the reader: the two-tool frame — start purge at T0, the change-
+    # filament purge flushing at R 240 (both tools' declared range high), T1's own wait —
+    # uploads, and the receipt it writes carries both tools with the flush R recorded as each
+    # one's flush temperature (design amendment 9), apart from the printing temperatures the
+    # start's rated-range check reads
+    src = tmp_path / "two-colour.gcode"
+    src.write_text(_two_tool_frame(), encoding="utf-8")
+    body = src.read_bytes()
+    tr = FakeTransport([("other.gcode", 1)], [("other.gcode", 1), (DEST, len(body))])
+    receipt, http = await run(tr, src, store=store)
+    assert [(t.tool_index, t.material, t.nozzle_first_layer_temp, t.nozzle_temp,
+             t.extrusion_nozzle_temps, t.flush_nozzle_temps) for t in receipt.tools] == [
+        (0, "PLA", 210.0, 210.0, (210.0,), (240.0,)), (1, "PLA", 210.0, 210.0, (210.0,), (240.0,))]
+    assert (receipt.tool_index, receipt.material, receipt.nozzle_temp) == (0, "PLA", 210.0)
+    assert receipt.extrusion_nozzle_temps == (210.0,)  # flat union, first order seen
+    assert 240.0 not in receipt.commanded_nozzle_setpoints  # the flush R is no setpoint
+    assert store.load(SN, DEST) == receipt  # every tool of it survives the store too
+
+
+
+def test_a_tool_extrusion_temperature_the_flat_union_lacks_refuses_the_receipt():
+    # review finding (PR #11): the flat ``extrusion_nozzle_temps`` is the union over the tools,
+    # so a tool carrying 230 while the file-wide list says only 210 is a receipt that disagrees
+    # with itself — refused, never half-trusted (a start would compare the tray against the tool
+    # list while a reader of the flat field would see a cooler print than ran)
+    data = _two_tool_receipt().to_dict()
+    data["tools"][1]["extrusion_nozzle_temps"] = [210.0, 230.0]
+    data["commanded_nozzle_setpoints"] = [140.0, 210.0, 230.0]
+    with pytest.raises(PrinterError) as bad:
+        Cc2UploadReceipt.from_dict(data)
+    assert bad.value.details.get("reason") == "receipt_invalid"
+    # and the other direction (round 2): a flat temperature no tool ran at would never be
+    # checked against any tray, since the start reads the per-tool lists — refused too
+    data = _two_tool_receipt().to_dict()
+    data["extrusion_nozzle_temps"] = [210.0, 230.0]
+    data["commanded_nozzle_setpoints"] = [140.0, 210.0, 230.0]
+    with pytest.raises(PrinterError) as bad:
+        Cc2UploadReceipt.from_dict(data)
+    assert bad.value.details.get("reason") == "receipt_invalid"
 
 def test_store_paths_and_locks_are_keyed_by_printer_not_by_the_callers_imagination(tmp_path):
     store = Cc2ReceiptStore(tmp_path / "s")
