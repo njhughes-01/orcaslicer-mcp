@@ -2226,6 +2226,25 @@ _CC2_REPLY_KEYS = frozenset({
     "would_refuse", "xyz_size",
 })
 
+# The CANVAS tray filament write's reply names, declared as their own addition rather than woven into
+# the sorted block above, exactly as the camera block does: the rule is identical (a name this source
+# contains is a name this server or its cc2_tray adapter wrote, so the credential pass must not
+# rewrite it), and keeping them together is what makes the whole surface of cc2_set_tray_filament
+# answerable in one search. The nine write-side names are the frame design.md pins (filament_type,
+# filament_name, filament_code, filament_color, filament_min_temp, filament_max_temp beside the ids,
+# brand and colour the dialog also asks the human for); min_nozzle_temp and max_nozzle_temp are the
+# read side's different spelling of the same idea in tray_now and observed, and colour, observed and
+# tray_now are the preview and observation field names cc2_tray writes. catalog_names is not a
+# dictionary key of any reply builder: it is the PrinterError detail cc2_tray attaches to an unknown
+# material name, and as_dict() puts details at the top level, so it rides out as a key of the
+# refusal — exempted like every other name this source contains, and the one-letter-code walk meets
+# it the same way it meets the rest.
+_CC2_REPLY_KEYS = _CC2_REPLY_KEYS | frozenset({
+    "catalog_names", "colour", "filament_code", "filament_color", "filament_max_temp",
+    "filament_min_temp", "filament_name", "filament_type", "machine_now", "max_nozzle_temp",
+    "min_nozzle_temp", "observed", "tray_now",
+})
+
 # The camera snapshot's reply names, declared as their own addition rather than woven into the sorted
 # block above: the rule is identical (a name this source contains is a name this server wrote, so the
 # credential pass must not rewrite it), and keeping them together is what makes the whole surface of
