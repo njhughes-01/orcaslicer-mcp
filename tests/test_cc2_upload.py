@@ -422,13 +422,60 @@ def test_config_lists_split_on_semicolons_as_well_as_commas():
     assert up._config_value("210,210") == ["210", "210"]
     assert up._config_value("PLA; PETG,ABS") == ["PLA", "PETG", "ABS"]
     assert up._config_value("[PLA;PLA]") == ["PLA", "PLA"]
-    assert up._config_value("PLA;") == ["PLA"]
+    assert up._config_value("PLA;") == ["PLA", ""]      # positions kept: the empty slot stays
+    assert up._config_value("PLA;;PETG") == ["PLA", "", "PETG"]   # tool 2 is PETG, tool 1 blank
+    assert up._config_value("") == [] and up._config_value("[]") == []
     # and the split is not helper-only, it reaches a parse: a semicolon list names a second
     # material this one-tool file never selects, so it must refuse as more values than tools
     # rather than pass as a filament type called "PLA;PETG"
     with pytest.raises(PrinterError) as bad:
         up.parse_gcode_text(gcode_text(material="PLA;PETG"))
     assert "one value" in bad.value.message and "Nothing was sent" in bad.value.message
+
+
+def test_an_empty_position_in_a_per_tool_list_refuses_instead_of_shifting_tool_numbers():
+    # review finding (PR #11): ``PLA;;PETG`` once collapsed to ["PLA", "PETG"], handing tool 2's
+    # PETG to tool 1 — for a per-tool key the position IS the tool number, so a blank is a tool
+    # whose value the file never says, refused with the position named, never filled in
+    with pytest.raises(PrinterError) as bad:
+        up._config_per_tool({"filament_type": ["PLA;;PETG"]}, "filament_type", "material",
+                            [0, 1, 2])
+    assert "position 1" in bad.value.message and "tool 1" in bad.value.message
+    assert "Nothing was sent" in bad.value.message
+    # a plate key still ignores a dangling delimiter the way a bare comma always was ignored
+    assert up._config_single({"hot_plate_temp": ["60,"]}, "hot_plate_temp", "bed") == "60"
+
+
+def test_repeated_per_tool_lines_must_carry_the_same_number_of_values():
+    # review finding (PR #11): a second ``; nozzle_temperature =`` line listing one value after
+    # a first listing two once borrowed the first line's tail and passed; repeats that disagree
+    # on how many tools there are refuse, naming both counts
+    with pytest.raises(PrinterError) as bad:
+        up._config_per_tool({"nozzle_temperature": ["210,230", "210"]}, "nozzle_temperature",
+                            "steady nozzle temperature", [0, 1])
+    assert "2 and 1 values" in bad.value.message
+    # identical repeats are the ordinary slicer habit and still pass
+    assert up._config_per_tool({"nozzle_temperature": ["210,230", "210,230"]},
+                               "nozzle_temperature", "steady nozzle temperature",
+                               [0, 1]) == ["210", "230"]
+
+
+def test_a_purge_records_the_verified_target_on_the_outgoing_tool_too():
+    # review finding (PR #11): the purge retracts and cuts the OUTGOING filament at the verified
+    # target before it flushes the incoming one, so that temperature is the outgoing tool's as
+    # well — the two-tool frame's T0 is left at 210 by the first purge and T1 by the next, and
+    # both tools carry 210 even on a frame where the parse sees the switch before any E move of
+    # the tool being left
+    s = up.parse_gcode_text(_two_tool_frame())
+    assert all(210.0 in t.extrusion_nozzle_temps for t in s.tools)
+    # and a purge whose Q or S strays from the verified target (a mixed-temperature switch, Q 260
+    # S 210 against a 210 wait) still refuses outright: the outgoing side is never run at a
+    # temperature no wait proved
+    body = _two_tool_frame().replace("Q210 R240 S210", "Q260 R240 S210", 1)
+    assert body != _two_tool_frame()
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(body)
+    assert "sets Q to 260" in bad.value.message
 
 
 def test_a_per_tool_config_list_shorter_than_the_highest_tool_refuses_naming_the_key():
@@ -2072,6 +2119,9 @@ def test_a_v3_dict_with_a_malformed_tool_entry_is_refused():
         [dict(entry, extrusion_nozzle_temps="210")],  # temperatures spelled as a string
         [{k: v for k, v in entry.items() if k != "flush_nozzle_temps"}],  # v3 always writes it
         [dict(entry, flush_nozzle_temps="240")],  # flush temperatures spelled as a string
+        [dict(entry, extrusion_nozzle_temps=None), base["tools"][1]],  # null is not an empty list
+        [dict(entry, flush_nozzle_temps=None), base["tools"][1]],      # (review finding, PR #11)
+        [dict(entry, extrusion_nozzle_temps=0), base["tools"][1]],     # nor is a number
         [dict(entry, flush_nozzle_temps=[500.0])],  # a flush outside the fence
         [dict(entry, extrusion_nozzle_temps=[210.0, 400.0]), base["tools"][1]],
         # 400 °C is inside the fence but no commanded setpoint and no flush both flushing
@@ -2103,6 +2153,19 @@ async def test_an_uploaded_two_tool_file_records_every_tool_on_its_receipt(tmp_p
     assert 240.0 not in receipt.commanded_nozzle_setpoints  # the flush R is no setpoint
     assert store.load(SN, DEST) == receipt  # every tool of it survives the store too
 
+
+
+def test_a_tool_extrusion_temperature_the_flat_union_lacks_refuses_the_receipt():
+    # review finding (PR #11): the flat ``extrusion_nozzle_temps`` is the union over the tools,
+    # so a tool carrying 230 while the file-wide list says only 210 is a receipt that disagrees
+    # with itself — refused, never half-trusted (a start would compare the tray against the tool
+    # list while a reader of the flat field would see a cooler print than ran)
+    data = _two_tool_receipt().to_dict()
+    data["tools"][1]["extrusion_nozzle_temps"] = [210.0, 230.0]
+    data["commanded_nozzle_setpoints"] = [140.0, 210.0, 230.0]
+    with pytest.raises(PrinterError) as bad:
+        Cc2UploadReceipt.from_dict(data)
+    assert bad.value.details.get("reason") == "receipt_invalid"
 
 def test_store_paths_and_locks_are_keyed_by_printer_not_by_the_callers_imagination(tmp_path):
     store = Cc2ReceiptStore(tmp_path / "s")

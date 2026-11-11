@@ -709,11 +709,16 @@ def _config_value(raw: str) -> list[str]:
     semicolon separated (the real two-tool slice writes ``filament_type = PLA;PLA`` beside
     comma lists like ``nozzle_temperature = 210,210``, so both delimiters are the slicer's
     own, not a guess). A bracketed list is a slicer dump of the same list; read it the same
-    way. Empty pieces (``PLA;`` and friends) are dropped, as a bare comma always was."""
+    way. Positions are kept: an empty piece (``PLA;;PETG``) stays an empty string at its index,
+    because for a per-tool key position *is* the tool number and dropping it would hand tool 2's
+    material to tool 1 (review finding, PR #11). Callers decide what an empty entry means:
+    ``_config_single`` ignores them as a bare comma always was, ``_config_per_tool`` refuses."""
     text = raw.strip()
     if text.startswith("[") and text.endswith("]"):
         text = text[1:-1]
-    return [piece.strip() for piece in re.split(r"[,;]", text) if piece.strip()]
+    if not text.strip():
+        return []
+    return [piece.strip() for piece in re.split(r"[,;]", text)]
 
 
 def _collect_config(lines: Iterable[str]) -> dict[str, list[str]]:
@@ -746,7 +751,7 @@ def _config_single(config: dict[str, list[str]], key: str, label: str) -> str:
                       "are read from the file, never guessed")
     values: list[str] = []
     for raw in occurrences:
-        pieces = _config_value(raw)
+        pieces = [piece for piece in _config_value(raw) if piece]
         if not pieces:
             raise _refuse(f"its '{key} =' config line carries no value")
         for piece in pieces:
@@ -793,6 +798,17 @@ def _config_per_tool(config: dict[str, list[str]], key: str, label: str,
         pieces = _config_value(raw)
         if not pieces:
             raise _refuse(f"its '{key} =' config line carries no value")
+        for i, piece in enumerate(pieces):
+            if not piece:
+                raise _refuse(f"its {label} (key '{key}') leaves position {i} empty, and for a "
+                              f"per-tool key position {i} is tool {i}'s value — a tool whose "
+                              "value the file leaves blank is refused, never filled from a "
+                              "neighbour")
+        if values and len(pieces) != len(values):
+            raise _refuse(f"its '{key} =' config lines disagree on how many tools there are "
+                          f"({len(values)} and {len(pieces)} values), and a file that disagrees "
+                          "with itself cannot be identified — every repeat must carry the same "
+                          "list in full, never a shorter one borrowing the other's tail")
         for i, piece in enumerate(pieces):
             if i >= len(values):
                 values.append(piece)
@@ -1310,6 +1326,14 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
             # that tool's; after the purge, that tool is the file's current one.
             if nozzle_target not in per_tool_temps.setdefault(purge.tool, []):
                 per_tool_temps[purge.tool].append(nozzle_target)
+            # and the purge first retracts and cuts the filament it switches OUT at this same
+            # verified target (step 1 of the _PURGE_FIELDS order), so the outgoing tool ran at it
+            # too: recorded on that tool as well, so a start compares its tray against it
+            # (review finding, PR #11; with Q and S pinned to the target this is the temperature
+            # the outgoing tool was already printing at, recorded now even when it never extruded)
+            if current_tool is not None and nozzle_target not in per_tool_temps.setdefault(
+                    current_tool, []):
+                per_tool_temps[current_tool].append(nozzle_target)
             current_tool = purge.tool
             continue
         if head in _MOVE_HEADS:

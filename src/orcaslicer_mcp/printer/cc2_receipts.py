@@ -137,8 +137,12 @@ class ToolReceipt:
     def __post_init__(self) -> None:
         for field_name in ("extrusion_nozzle_temps", "flush_nozzle_temps"):
             value = getattr(self, field_name)
-            if not isinstance(value, (str, bytes)):  # a string is refused below, not split
-                object.__setattr__(self, field_name, tuple(value or ()))
+            # only a real list or tuple is normalised; None, a number, a string or anything
+            # else stays as it is so _checked_temps refuses it below — ``value or ()`` once
+            # turned a null into an empty list and let a receipt load with no temperatures at
+            # all, which no range check would ever catch (review finding, PR #11)
+            if isinstance(value, (list, tuple)):
+                object.__setattr__(self, field_name, tuple(value))
         if (isinstance(self.tool_index, bool) or not isinstance(self.tool_index, int)
                 or self.tool_index < 0):
             raise PrinterError("protocol_error",
@@ -295,6 +299,16 @@ class Cc2UploadReceipt:
         # verified waits here, so the second branch is kept for receipts written before it, and
         # the safe direction is stated in the docstring: extra extrusion temperatures only ever
         # make a start refuse more trays.
+        # the flat union must BE the union of the tools' lists — a tool list the flat field does
+        # not account for, or a flat temperature no tool ran at, is a receipt that disagrees with
+        # itself (review finding, PR #11); the one exception is the legacy second branch below
+        # (a version-2 receipt's flush temperature carried by no tool), handled by the same test
+        per_tool_union = {t for tool in self.tools for t in tool.extrusion_nozzle_temps}
+        if not per_tool_union <= set(extrusion):
+            raise PrinterError("protocol_error",
+                               "A receipt would record an extrusion temperature on one tool that "
+                               "its file-wide list does not carry, so it is refused rather than "
+                               "half-trusted.", reason="receipt_invalid")
         recorded = list(dict.fromkeys(
             list(extrusion) + [t for tool in self.tools for t in tool.extrusion_nozzle_temps]))
         unexplained: list[float] = []
