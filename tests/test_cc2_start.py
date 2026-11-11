@@ -34,7 +34,8 @@ import pytest
 
 from orcaslicer_mcp.printer import cc2_start as cs
 from orcaslicer_mcp.printer import cc2_state as st
-from orcaslicer_mcp.printer.cc2_receipts import Cc2ReceiptStore, Cc2UploadReceipt
+from orcaslicer_mcp.printer.cc2_receipts import (Cc2ReceiptStore, Cc2UploadReceipt,
+                                                 ToolReceipt)
 from orcaslicer_mcp.printer.errors import PrinterError
 
 # --------------------------------------------------------------------------- observed wire frames
@@ -207,6 +208,29 @@ def make_receipt(**over):
     return Cc2UploadReceipt(**d)
 
 
+def two_tool_over() -> dict:
+    """Receipt kwargs for the two-tool PLA file the multi-tool change parses (the numbers of
+    the real penelope-tag fixture): tools 0 and 1, both PLA printing at 210 °C, extrusion
+    verified at 210 with the vendor's 240 °C range-high flush carried by BOTH tools (design
+    3), so 240 sits in both tools' extrusion lists and in the file-wide union. The flat
+    fields describe the first tool, as version 3 requires."""
+    tools = tuple(ToolReceipt(tool_index=i, material="PLA",
+                              nozzle_first_layer_temp=210.0, nozzle_temp=210.0,
+                              extrusion_nozzle_temps=(210.0, 240.0)) for i in (0, 1))
+    return dict(material="PLA", nozzle_first_layer_temp=210.0, nozzle_temp=210.0,
+                commanded_nozzle_setpoints=(210.0,),
+                extrusion_nozzle_temps=(210.0, 240.0), tools=tools)
+
+
+def pla_roster(*, mx1: int = 250, mx2: int = 250) -> list[dict]:
+    """A four-tray canvas where trays 1 and 2 carry PLA (rated 190 to ``mx1``/``mx2``) and
+    trays 0 and 3 are empty — the roster a two-tool PLA start maps against."""
+    return [tray(0, 0, ftype="", brand="", mn=0, mx=0),
+            tray(1, 1, ftype="PLA", brand="Generic", mn=190, mx=mx1),
+            tray(2, 2, ftype="PLA", brand="ELEGOO", mn=190, mx=mx2),
+            tray(3, 0, ftype="", brand="", mn=0, mx=0)]
+
+
 @pytest.fixture
 def store(tmp_path) -> Cc2ReceiptStore:
     return Cc2ReceiptStore(tmp_path / "receipts")
@@ -262,6 +286,8 @@ async def test_accepted_start_sends_the_measured_1020_once(store):
     # the bytes' continued existence
     assert any("tray 0" in n for n in result.notes)
     assert any("cannot be detected" in n for n in result.notes)
+    assert all("Multi-tool" not in n for n in result.notes), \
+        "the multi-entry slot_map note belongs to multi-tool starts only"
     d = result.as_dict()
     assert d["started_accepted"] is True and d["observed_running"] is False
     assert d["status"] == "accepted" and d["filename"] == DEST
@@ -662,6 +688,83 @@ async def test_commanded_nozzle_target_above_tray_max_refuses_even_as_preheat(st
         await begin(store, tr)
     assert ei.value.details["reason"] == "commanded_over_tray_max"
     assert "300" in ei.value.message
+    assert_never_started(tr)
+
+
+# --------------------------------------------------------------------------- multi-tool starts
+
+
+async def test_two_tool_start_sends_the_design_slot_map_exactly(store):
+    # design 7: one complete {t, canvas_id, tray_id} entry per tool, ordered by t, each built
+    # from the tray that just answered for that tool — even when the caller's dict order says
+    # otherwise. The 240 °C flush sits in both tools' extrusion lists, so both mapped trays
+    # must be rated to cover it (these are rated to 250).
+    save_receipt(store, **two_tool_over())
+    tr = healthy({st.METHOD_CANVAS: canvas_replies(active_tray=2, trays=pla_roster())})
+    result, _ = await begin(store, tr, tool_to_tray={1: 2, 0: 1})   # caller order reversed
+    assert result.status is cs.StartStatus.ACCEPTED and result.accepted
+    assert len(tr.sent()) == 1
+    params = tr.start_params()
+    assert params == {"storage_media": "local", "filename": DEST,
+                      "config": {"slot_map": [{"t": 0, "canvas_id": 0, "tray_id": 1},
+                                              {"t": 1, "canvas_id": 0, "tray_id": 2}],
+                                 "printer_check": False}}
+    # every reply of a multi-tool start carries the unverified-two-entry-slot_map note
+    assert any("Multi-tool" in n and "never sent" in n for n in result.notes)
+
+
+async def test_missing_tool_in_the_mapping_refuses(store):
+    save_receipt(store, **two_tool_over())
+    tr = healthy({st.METHOD_CANVAS: canvas_replies(active_tray=2, trays=pla_roster())})
+    with pytest.raises(cs.Cc2StartError) as ei:
+        await begin(store, tr, tool_to_tray={0: 1})                # tool 1 has no tray
+    assert ei.value.details["reason"] == "tool_map_mismatch"
+    assert "missing" in ei.value.message
+    assert_never_started(tr)
+
+
+async def test_extra_tool_in_the_mapping_refuses(store):
+    save_receipt(store, **two_tool_over())
+    tr = healthy({st.METHOD_CANVAS: canvas_replies(active_tray=2, trays=pla_roster())})
+    with pytest.raises(cs.Cc2StartError) as ei:
+        await begin(store, tr, tool_to_tray={0: 1, 1: 2, 2: 3})    # tool 2 is not in the file
+    assert ei.value.details["reason"] == "tool_map_mismatch"
+    assert_never_started(tr)
+
+
+async def test_two_tools_on_one_tray_refuse(store):
+    save_receipt(store, **two_tool_over())
+    tr = healthy({st.METHOD_CANVAS: canvas_replies(active_tray=2, trays=pla_roster())})
+    with pytest.raises(cs.Cc2StartError) as ei:
+        await begin(store, tr, tool_to_tray={0: 1, 1: 1})          # one spool, two tools
+    assert ei.value.details["reason"] == "tool_map"
+    assert_never_started(tr)
+
+
+async def test_tray_rated_under_a_tools_extrusion_set_refuses_the_two_tool_start(store):
+    # tray 1 is rated to 230 but both tools' verified extrusion includes the 240 °C flush —
+    # a mapped tray under its own tool's verified temperatures stops before the wire.
+    save_receipt(store, **two_tool_over())
+    tr = healthy({st.METHOD_CANVAS: canvas_replies(
+        active_tray=2, trays=pla_roster(mx1=230))})
+    with pytest.raises(cs.Cc2StartError) as ei:
+        await begin(store, tr, tool_to_tray={0: 1, 1: 2})
+    assert ei.value.details["reason"] == "range_violation"
+    assert "240" in ei.value.message and "230" in ei.value.message
+    assert_never_started(tr)
+
+
+async def test_per_tool_material_mismatch_refuses_the_two_tool_start(store):
+    # the checks are per entry: tray 2 reporting PETG under tool 1's PLA refuses even though
+    # tray 1 matches tool 0 exactly.
+    save_receipt(store, **two_tool_over())
+    roster = pla_roster()
+    roster[2] = tray(2, 2, ftype="PETG", brand="ELEGOO", mn=190, mx=250)
+    tr = healthy({st.METHOD_CANVAS: canvas_replies(active_tray=2, trays=roster)})
+    with pytest.raises(cs.Cc2StartError) as ei:
+        await begin(store, tr, tool_to_tray={0: 1, 1: 2})
+    assert ei.value.details["reason"] == "material_mismatch"
+    assert "PLA" in ei.value.message and "PETG" in ei.value.message
     assert_never_started(tr)
 
 

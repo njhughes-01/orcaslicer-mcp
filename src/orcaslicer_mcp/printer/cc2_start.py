@@ -18,16 +18,20 @@ upload holds (the receipt store's lock — one operation at a time per printer, 
 queued): a receipt this very store wrote for this printer and this exact name, with the printer's
 listing today reporting that name at exactly the receipted size; an explicit ``bed_clear``
 assertion (this call starts a machine into motion above a bed nobody has looked at; ``True`` is
-the human looking); a fresh 1002/2005 read saying idle with no error and no file held; the chosen
-tray present (raw 1) or active (raw 2) on a connected canvas, reporting the same material the
-receipt parsed; the tray's rated nozzle range covering every temperature extrusion was verified
-to run at — the receipt's ``extrusion_nozzle_temps``, which deliberately excludes non-extruding
-preheats like the mount file's real 140 °C flush hold before its ``M109 S260`` — and no commanded
-nozzle setpoint, preheat included, above the tray's rated maximum, because a hold above what the
-spool is rated for is heat the spool cannot vouch for. Unknown, absent, half-a-range or
-contradictory reports refuse the start; nothing is ever assumed. The mapping sent is built from
-the receipt's recorded tool and the tray identity of the fresh 2005 read — the entry's
-``canvas_id``/``tray_id`` are the ones that just answered, not numbers the caller retyped.
+the human looking); a fresh 1002/2005 read saying idle with no error and no file held; every
+mapped tray present (raw 1) or active (raw 2) on a connected canvas, reporting the same material
+that tray's tool's ``ToolReceipt`` entry records; each tray's rated nozzle range covering every
+temperature that tool's extrusion was verified to run at — the tool entry's
+``extrusion_nozzle_temps``, which deliberately excludes non-extruding preheats like the mount
+file's real 140 °C flush hold before its ``M109 S260`` — and no commanded nozzle setpoint,
+preheat included, above any mapped tray's rated maximum, because a hold above what the spool is
+rated for is heat the spool cannot vouch for. Unknown, absent, half-a-range or contradictory
+reports refuse the start; nothing is ever assumed. The mapping sent carries one complete entry
+per tool the receipt records, ordered by ``t``, each built from that tool and the tray identity
+of the fresh 2005 read that answered for it — the entries' ``canvas_id``/``tray_id`` are the
+ones that just answered, not numbers the caller retyped. A ``slot_map`` of more than one entry
+is the shape Elegoo's own LAN client builds for a multi-colour print, but this adapter has never
+sent one: every reply of a multi-tool start carries a note saying so until a live test lands.
 
 Honesty about the reply: ``error_code`` 0 means the printer did not refuse the request — it is not
 proof the tray was honoured (a silently-downgraded mapping answers 0 too) and not proof the remote
@@ -173,6 +177,11 @@ _MAP_NOTE = ("An accepted start is the printer not refusing the request — meas
 _PROVENANCE_NOTE = ("The receipt and a matching listing size prove this adapter moved these bytes; "
                     "CC2 cannot read file content back, and other clients are not governed by this "
                     "lock, so a same-size replacement after the listing cannot be detected from here.")
+_MULTI_SLOT_NOTE = ("Multi-tool start: this slot_map carries one entry per tool, the shape "
+                    "Elegoo's own LAN client sends for a multi-colour print, but this adapter has "
+                    "never sent a multi-entry slot_map and has never observed this firmware's "
+                    "answer to one — until a live test, the reply proves nothing about whether "
+                    "each tool's tray was honoured.")
 _RUNNING_NOTE = ("Observed printing: the printer's status names this file with the lowercase "
                  "state word \"printing\" under machine status 2.")
 _BED_WARNING_NOTE = ("A bed warning was carried from the slice — a valid slice is not proof the "
@@ -240,12 +249,14 @@ async def _observe_once(transport: Any, remote_filename: str
 def _build_result(status: StartStatus, remote_filename: str, receipt: Cc2UploadReceipt, *,
                   bed_warning: str | None, error_code: int | None = None,
                   note: str | None = None, observation: Cc2StartObservation | None = None,
-                  extra_notes: tuple[str, ...] = ()) -> Cc2StartResult:
+                  extra_notes: tuple[str, ...] = (), multi_tool: bool = False) -> Cc2StartResult:
     notes: list[str] = []
     if status is StartStatus.ACCEPTED:
         notes.extend((_MAP_NOTE, _PROVENANCE_NOTE))
     elif note:
         notes.append(note)
+    if multi_tool:
+        notes.append(_MULTI_SLOT_NOTE)
     if observation is not None and observation.running:
         notes.append(_RUNNING_NOTE)
     notes.extend(extra_notes)
@@ -273,20 +284,27 @@ async def start_print(transport: Any, remote_filename: str, tool_to_tray: dict[i
 
     In order, with every failure named before the next step runs: validate the caller's
     assertions (the exact ``bed_clear is True`` that says a human looked at the bed, an explicit
-    single-tool mapping, a plain remote name, a plain bool for leveling sent as ``printer_check``
-    because the firmware remembers the last value); load the private receipt this store wrote for
-    this printer and name, and prove its recorded tool is the tool mapped; take the same
+    tool-to-tray mapping of one to four whole-number entries with no tray named twice, a plain
+    remote name, a plain bool for leveling sent as ``printer_check`` because the firmware
+    remembers the last value); load the private receipt this store wrote for this printer and
+    name, and prove the mapping names exactly the tools the receipt records — a missing tool or
+    an extra tool refuses (``tool_map_mismatch``); take the same
     per-printer lock the upload takes — held means somebody else is mid-operation and this call
     refuses rather than queueing; then, inside the lock, read afresh what the printer claims:
     status and canvas (1002/2005) and a complete file inventory (1044). The inventory must name
     this exact file at the receipted size or the start dies; the machine must be idle with no
-    error and no file held; the mapped tray must exist on the connected canvas and be present or
-    active; the tray's material must equal the receipt's; the tray must carry a complete rated
-    range covering every verified extrusion temperature (non-extruding preheats are not extrusion
-    targets and are not range-checked) with no commanded nozzle setpoint above the tray maximum.
-    Only then is the single 1020 sent — a complete ``slot_map`` entry built from the receipt's
-    tool and the fresh tray identity, ``printer_check`` explicit, and nothing else in ``config``
-    because nothing else has been verified to mean anything.
+    error and no file held; every mapped tray must exist on the connected canvas and be present
+    or active; each tray's material must equal its tool's ``ToolReceipt`` material; each tray
+    must carry a complete rated
+    range covering every extrusion temperature verified for its own tool (non-extruding preheats
+    are not extrusion targets and are not range-checked) with no commanded nozzle setpoint above
+    that tray's maximum.
+    Only then is the single 1020 sent — ``slot_map`` entries, one complete one per tool ordered
+    by ``t``, each built from that receipt tool and its tray's fresh identity, ``printer_check``
+    explicit, and nothing else in ``config``
+    because nothing else has been verified to mean anything. A start whose receipt carries more
+    than one tool carries an extra note: a multi-entry ``slot_map`` is what Elegoo's own client
+    sends, but this adapter has never sent one and the firmware's answer to one is unobserved.
 
     The answer decides the report, never the hope: explicit integer ``error_code`` 0 is accepted
     (with the honesty notes), any other number is a refusal with its code kept, and a lost,
@@ -317,19 +335,27 @@ async def start_print(transport: Any, remote_filename: str, tool_to_tray: dict[i
     name = _plain_name(remote_filename)        # the exact name, or a refusal that says why
     if not isinstance(tool_to_tray, dict) or not tool_to_tray:
         raise Cc2StartError("protocol_error",
-                            "A start needs an explicit tool-to-tray mapping like {0: 3} — the "
-                            "one tool this adapter can speak, mapped to the tray the caller "
-                            "chose. Nothing was sent.",
+                            "A start needs an explicit tool-to-tray mapping like {0: 3} — every "
+                            "tool the received file selects, each mapped to the tray the caller "
+                            "chose for it. Nothing was sent.",
                             reason="tool_map")
-    if len(tool_to_tray) != 1:
+    if len(tool_to_tray) > 4:
         raise Cc2StartError("protocol_error",
-                            f"The mapping names {len(tool_to_tray)} tools; this adapter speaks "
-                            "exactly one until multi-tool starts are independently supported. "
+                            f"The mapping names {len(tool_to_tray)} tools; a CC2 start maps one "
+                            "entry per tool and the canvas this adapter has verified carries at "
+                            "most four trays, so a mapping of more than four is never sent. "
                             "Nothing was sent.",
                             reason="tool_map")
-    (mapped_tool, mapped_tray), = tool_to_tray.items()
-    _int_or_refuse(mapped_tool, "tool index")
-    _int_or_refuse(mapped_tray, "tray id")
+    for mapped_tool, mapped_tray in tool_to_tray.items():
+        _int_or_refuse(mapped_tool, "tool index")
+        _int_or_refuse(mapped_tray, "tray id")
+    if len(set(tool_to_tray.values())) != len(tool_to_tray):
+        raise Cc2StartError("protocol_error",
+                            "The mapping puts two tools on one tray — one tray holds one spool, "
+                            "and a slot_map whose entries would feed one tray to two tools is "
+                            "exactly the silent fallback this adapter refuses to send. Nothing "
+                            "was sent.",
+                            reason="tool_map")
     if bed_warning is not None:
         ok_warning = False
         if isinstance(bed_warning, str):
@@ -348,13 +374,19 @@ async def start_print(transport: Any, remote_filename: str, tool_to_tray: dict[i
 
     # ---- the private proof, before the lock: no receipt, no start ------------------------------
     receipt = _load_receipt_or_refuse(store, printer_sn, name)
-    if receipt.tool_index != mapped_tool:
+    tools = {tool.tool_index: tool for tool in receipt.tools}
+    if set(tool_to_tray) != set(tools):
+        missing = sorted(set(tools) - set(tool_to_tray))
+        extra = sorted(set(tool_to_tray) - set(tools))
         raise Cc2StartError("protocol_error",
-                            f"The mapping maps tool {mapped_tool}, but the receipt for "
-                            f"'{name}' records tool {receipt.tool_index} — the mapping must "
-                            "match the tool that was received, not another one's. Nothing was "
-                            "sent.",
+                            f"The mapping names tools {sorted(tool_to_tray)}, but the receipt "
+                            f"for '{name}' records tools {sorted(tools)}" +
+                            (f" — the mapping is missing tool(s) {missing}" if missing else "") +
+                            (f" and names tool(s) {extra} the file does not select" if extra else "") +
+                            " — the mapping must name exactly the tools that were received, no "
+                            "more and no fewer. Nothing was sent.",
                             reason="tool_map_mismatch")
+    multi_tool = len(tools) > 1
 
     # ---- the shared per-printer lock; held means refused, never queued -------------------------
     try:
@@ -427,75 +459,89 @@ async def start_print(transport: Any, remote_filename: str, tool_to_tray: dict[i
                                 "being started. Nothing was sent.",
                                 reason="size_mismatch")
 
-        # ---- the chosen tray, as the fresh 2005 read reports it ---------------------------------
-        same_id = [t for t in canvas.trays if t.tray_id == mapped_tray]
-        if not same_id:
-            raise Cc2StartError("protocol_error",
-                                f"The printer reports no tray {mapped_tray} on its canvas, so "
-                                "the mapping points at nothing. Nothing was sent.",
-                                reason="tray_missing")
-        if len(same_id) > 1:
-            raise Cc2StartError("protocol_error",
-                                f"{len(same_id)} canvas units report a tray {mapped_tray}, and "
-                                "this adapter's canvas handling is verified for one unit only — "
-                                "a tray id that means two trays means no start. Nothing was "
-                                "sent.",
-                                reason="tray_missing")
-        chosen = same_id[0]
-        blocked = st.supply_decision(chosen, canvas=canvas, canvas_connected=canvas.connected)
-        if blocked:
-            raise Cc2StartError("protocol_error",
-                                f"'{name}' stays queued: {blocked}. Nothing was sent.",
-                                reason="tray_unavailable")
-        if chosen.material is None:
-            raise Cc2StartError("protocol_error",
-                                f"Tray {mapped_tray} reports no material, so the receipt's "
-                                f"{receipt.material!r} cannot be matched against what is "
-                                "actually loaded — an unmatched filament is the print the "
-                                "nozzle eats. Nothing was sent.",
-                                reason="material_unverified")
-        if chosen.material.casefold() != receipt.material.casefold():
-            raise Cc2StartError("protocol_error",
-                                f"Tray {mapped_tray} reports {chosen.material}, but the "
-                                f"received file is {receipt.material} — the mapping and the "
-                                "material must be the same decision, and the spool is the "
-                                "printer's word, not the caller's. Nothing was sent.",
-                                reason="material_mismatch")
-        if chosen.min_nozzle_temp is None or chosen.max_nozzle_temp is None:
-            raise Cc2StartError("protocol_error",
-                                f"Tray {mapped_tray} carries no usable rated nozzle range (it "
-                                f"reported {chosen.min_nozzle_temp!r}-{chosen.max_nozzle_temp!r}), "
-                                "so nothing about this spool vouches for the heat the file runs "
-                                "at. Nothing was sent.",
-                                reason="range_unverified")
-        lo, hi = float(chosen.min_nozzle_temp), float(chosen.max_nozzle_temp)
-        for temp in receipt.extrusion_nozzle_temps:
-            if not (lo <= temp <= hi):
+        # ---- every mapped tray, as the fresh 2005 read reports it, tool by tool -----------------
+        # Iterated in tool order so the checked pairs arrive ordered by t — the order slot_map
+        # must be sent in. Each entry runs the same gate against its own tool's ToolReceipt.
+        chosen: list[tuple[int, Any]] = []      # (tool index, tray that just answered), by t
+        for mapped_tool in sorted(tool_to_tray):
+            mapped_tray = tool_to_tray[mapped_tool]
+            tool_receipt = tools[mapped_tool]
+            same_id = [t for t in canvas.trays if t.tray_id == mapped_tray]
+            if not same_id:
                 raise Cc2StartError("protocol_error",
-                                    f"Extrusion was verified at {temp:g} °C, outside tray "
-                                    f"{mapped_tray}'s rated range {lo:g}-{hi:g} °C "
-                                    f"({chosen.material}) — printing this file from this spool "
-                                    "is refused before the fact. Nothing was sent.",
-                                    reason="range_violation")
-        # The non-extruding preheats among the commanded setpoints (the mount file's real 140 °C
-        # flush hold sits far below any PETG range) are NOT range-checked — they never extrude —
-        # but none of them may command more heat than the loaded spool is rated to hold.
-        for temp in receipt.commanded_nozzle_setpoints:
-            if temp > hi:
+                                    f"The printer reports no tray {mapped_tray} on its canvas, "
+                                    f"so tool {mapped_tool}'s mapping points at nothing. Nothing "
+                                    "was sent.",
+                                    reason="tray_missing")
+            if len(same_id) > 1:
                 raise Cc2StartError("protocol_error",
-                                    f"The file commands a nozzle target of {temp:g} °C, above "
-                                    f"tray {mapped_tray}'s rated maximum {hi:g} °C "
-                                    f"({chosen.material}) — a hold above what the spool is "
-                                    "rated for is heat the spool cannot vouch for, preheat or "
-                                    "not. Nothing was sent.",
-                                    reason="commanded_over_tray_max")
+                                    f"{len(same_id)} canvas units report a tray {mapped_tray}, "
+                                    "and this adapter's canvas handling is verified for one unit "
+                                    "only — a tray id that means two trays means no start. "
+                                    "Nothing was sent.",
+                                    reason="tray_missing")
+            tray_entry = same_id[0]
+            blocked = st.supply_decision(tray_entry, canvas=canvas,
+                                         canvas_connected=canvas.connected)
+            if blocked:
+                raise Cc2StartError("protocol_error",
+                                    f"'{name}' stays queued: {blocked}. Nothing was sent.",
+                                    reason="tray_unavailable")
+            if tray_entry.material is None:
+                raise Cc2StartError("protocol_error",
+                                    f"Tray {mapped_tray} reports no material, so tool "
+                                    f"{mapped_tool}'s {tool_receipt.material!r} cannot be "
+                                    "matched against what is actually loaded — an unmatched "
+                                    "filament is the print the nozzle eats. Nothing was sent.",
+                                    reason="material_unverified")
+            if tray_entry.material.casefold() != tool_receipt.material.casefold():
+                raise Cc2StartError("protocol_error",
+                                    f"Tray {mapped_tray} reports {tray_entry.material}, but "
+                                    f"tool {mapped_tool} of the received file is "
+                                    f"{tool_receipt.material} — the mapping and the material "
+                                    "must be the same decision, and the spool is the printer's "
+                                    "word, not the caller's. Nothing was sent.",
+                                    reason="material_mismatch")
+            if tray_entry.min_nozzle_temp is None or tray_entry.max_nozzle_temp is None:
+                raise Cc2StartError("protocol_error",
+                                    f"Tray {mapped_tray} carries no usable rated nozzle range (it "
+                                    f"reported {tray_entry.min_nozzle_temp!r}-"
+                                    f"{tray_entry.max_nozzle_temp!r}), so nothing about this "
+                                    "spool vouches for the heat its tool runs at. Nothing was "
+                                    "sent.",
+                                    reason="range_unverified")
+            lo, hi = float(tray_entry.min_nozzle_temp), float(tray_entry.max_nozzle_temp)
+            for temp in tool_receipt.extrusion_nozzle_temps:
+                if not (lo <= temp <= hi):
+                    raise Cc2StartError("protocol_error",
+                                        f"Tool {mapped_tool}'s extrusion was verified at "
+                                        f"{temp:g} °C, outside tray {mapped_tray}'s rated range "
+                                        f"{lo:g}-{hi:g} °C ({tray_entry.material}) — printing "
+                                        "this file from this spool is refused before the fact. "
+                                        "Nothing was sent.",
+                                        reason="range_violation")
+            # The non-extruding preheats among the commanded setpoints (the mount file's real
+            # 140 °C flush hold sits far below any PETG range) are NOT range-checked — they never
+            # extrude — but none of them may command more heat than a mapped spool is rated to
+            # hold, so every tray the file maps to is compared against the file-wide setpoints.
+            for temp in receipt.commanded_nozzle_setpoints:
+                if temp > hi:
+                    raise Cc2StartError("protocol_error",
+                                        f"The file commands a nozzle target of {temp:g} °C, "
+                                        f"above tray {mapped_tray}'s rated maximum {hi:g} °C "
+                                        f"({tray_entry.material}) — a hold above what the spool "
+                                        "is rated for is heat the spool cannot vouch for, "
+                                        "preheat or not. Nothing was sent.",
+                                        reason="commanded_over_tray_max")
+            chosen.append((mapped_tool, tray_entry))
 
         # ---- the one command: the measured shape, built from what just answered -----------------
         # Entry completeness is load-bearing: measured, a partial entry is acknowledged 0 and the
-        # printer prints silently from tray 0. canvas_id/tray_id come from the tray that just
-        # reported, never from the caller's re-typed numbers.
-        slot_map = [{"t": receipt.tool_index, "canvas_id": chosen.canvas_id,
-                     "tray_id": chosen.tray_id}]
+        # printer prints silently from tray 0. One complete entry per tool, ordered by t; the
+        # canvas_id/tray_id come from the tray that just reported for that tool, never from the
+        # caller's re-typed numbers.
+        slot_map = [{"t": tool_index, "canvas_id": answered.canvas_id,
+                     "tray_id": answered.tray_id} for tool_index, answered in chosen]
         params = {"storage_media": STORAGE_MEDIA, "filename": name,
                   "config": {"slot_map": slot_map, "printer_check": printer_check}}
 
@@ -509,12 +555,13 @@ async def start_print(transport: Any, remote_filename: str, tool_to_tray: dict[i
             if not read_only_status:
                 return _build_result(StartStatus.AMBIGUOUS, name, receipt,
                                      bed_warning=bed_warning, note=note,
-                                     extra_notes=(_NO_OBSERVE_NOTE,))
+                                     extra_notes=(_NO_OBSERVE_NOTE,), multi_tool=multi_tool)
             observation, lost_note = await _observe_once(transport, name)
             extra = (lost_note,) if observation is None else (
                 () if observation.running else (_NOT_PRINTING_NOTE,))
             return _build_result(StartStatus.AMBIGUOUS, name, receipt, bed_warning=bed_warning,
-                                 note=note, observation=observation, extra_notes=extra)
+                                 note=note, observation=observation, extra_notes=extra,
+                                 multi_tool=multi_tool)
         except PrinterError as e:
             # The session died (or was closed) — no answer, and by design the command is not
             # resent, not even once, not through a re-opened session: that decision is a human's.
@@ -523,7 +570,7 @@ async def start_print(transport: Any, remote_filename: str, tool_to_tray: dict[i
                 note=(f"The session ended without an answer to the start command ({e.message}) "
                       "— the job may have started or never been accepted, and nothing was "
                       "resent, not even a read-only status, because this session cannot carry "
-                      "one."))
+                      "one."), multi_tool=multi_tool)
 
         # ``error_code``: only an explicit integer 0 is the documented started. An absent field,
         # a non-integer, a bool (an int in Python and not a protocol code), or any other number
@@ -532,19 +579,20 @@ async def start_print(transport: Any, remote_filename: str, tool_to_tray: dict[i
         if not isinstance(result, dict) or "error_code" not in result:
             return _build_result(StartStatus.AMBIGUOUS, name, receipt, bed_warning=bed_warning,
                                  note=("The printer's answer to the start command carried no "
-                                       f"error code at all. {_UNPARSEABLE_NOTE}"))
+                                       f"error code at all. {_UNPARSEABLE_NOTE}"),
+                                 multi_tool=multi_tool)
         code = result["error_code"]
         if not _plain_int(code):
             return _build_result(StartStatus.AMBIGUOUS, name, receipt, bed_warning=bed_warning,
                                  note=(f"The printer's answer to the start command carried an "
                                        f"error code that cannot be read ({type(code).__name__}), "
                                        "which is neither success nor refusal. "
-                                       f"{_UNPARSEABLE_NOTE}"))
+                                       f"{_UNPARSEABLE_NOTE}"), multi_tool=multi_tool)
         if code != 0:
             note = (f"The printer refused the start command (error_code {code})."
                     + (" " + _BUSY_HINT if code == 1009 else ""))
             return _build_result(StartStatus.REFUSED, name, receipt, bed_warning=bed_warning,
-                                 error_code=code, note=note)
+                                 error_code=code, note=note, multi_tool=multi_tool)
 
         # error_code 0: the documented started — accepted, never running, until observed.
         if observe_running:
@@ -552,10 +600,13 @@ async def start_print(transport: Any, remote_filename: str, tool_to_tray: dict[i
             extra = (lost_note,) if lost_note else (_NOT_PRINTING_NOTE,)
             if observation is None:
                 return _build_result(StartStatus.ACCEPTED, name, receipt,
-                                     bed_warning=bed_warning, extra_notes=(lost_note,))
+                                     bed_warning=bed_warning, extra_notes=(lost_note,),
+                                     multi_tool=multi_tool)
             return _build_result(StartStatus.ACCEPTED, name, receipt, bed_warning=bed_warning,
                                  observation=observation,
-                                 extra_notes=() if observation.running else extra)
-        return _build_result(StartStatus.ACCEPTED, name, receipt, bed_warning=bed_warning)
+                                 extra_notes=() if observation.running else extra,
+                                 multi_tool=multi_tool)
+        return _build_result(StartStatus.ACCEPTED, name, receipt, bed_warning=bed_warning,
+                             multi_tool=multi_tool)
     finally:
         lock.__exit__(None, None, None)
