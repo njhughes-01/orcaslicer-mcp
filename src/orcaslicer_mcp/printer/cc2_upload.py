@@ -70,7 +70,10 @@ cannot tell which physical heater moves nor read a ``WAIT``, so a heater change 
 to one M109-verifiable setpoint is refused outright — a state change read as an inert line is
 precisely how a cold or unverified extrusion reaches the printer. A target changed after a wait
 (``M104`` to a new value) revives the requirement: only another matching ``M109`` re-arms
-extrusion. A nozzle cooldown (``S0``) before the file's last extrusion contradicts itself — the
+extrusion — with one exception (design 2): a bare ``M104`` that steps a verified wait at the
+current tool's declared ``nozzle_temperature_initial_layer`` up to that tool's declared
+``nozzle_temperature`` is the slicer's own layer-two transition, keeps the wait armed, and has
+its value recorded as one of that tool's verified extrusion temperatures. A nozzle cooldown (``S0``) before the file's last extrusion contradicts itself — the
 filament path is cold while the file still means to extrude — and is refused; the end-block
 cooldown after the last extrusion is the normal ending it is. No printing-temperature range is
 checked here, at all: what a spool tolerates is the CANVAS tray's answer at start, and the
@@ -815,19 +818,15 @@ def _config_temp(config: dict[str, list[str]], key: str, label: str, *, maximum:
     return value
 
 
-def _config_per_tool(config: dict[str, list[str]], key: str, label: str,
-                     tools: list[int]) -> list[str]:
-    """One value per tool index for one key, or a refusal naming the key. The slicer writes a
-    per-tool key as one list — comma or semicolon separated (``_config_value``) — and repeats the
-    line across config sections; repeats that disagree for the same tool index are the same
-    inconsistent file ``_config_single`` refuses for a single key. The result is indexable by
-    tool number: entry ``i`` is tool ``i``'s value, and every index up to the file's highest
-    selected tool must exist. A list shorter than the highest selected tool is a tool whose
-    value the file never says, refused with the key named; one value with one tool is the
-    ordinary single-tool case and works whatever that tool's number is (a T1-only file's
-    ``; filament_type = PLA`` is that tool's). More values than the file's highest tool are the
-    spare filaments of a larger project: tools the file never selects, read and left alone.
-    Callers pass the file's own selected tool numbers (non-empty)."""
+def _config_merged_values(config: dict[str, list[str]], key: str, label: str) -> list[str]:
+    """One key's values merged across its config-section repeats, position by position, before
+    any tool-number rule is applied: entry ``i`` is position ``i`` of the slicer's list. The
+    slicer writes a per-tool key as one list — comma or semicolon separated (``_config_value``)
+    — and repeats the line across config sections; a missing key, an empty value or position, or
+    repeats that disagree for the same position (on value or on length) are the same inconsistent
+    file ``_config_single`` refuses for a single key. ``_config_per_tool`` is this plus the
+    tool-aware tail; design 2's in-scan transition check reaches for this half alone, refusal-
+    free, through ``_declared_list_or_none``."""
     occurrences = config.get(key)
     if not occurrences:
         raise _refuse(f"it carries no {label} (no '; {key} =' config line), and print settings "
@@ -855,6 +854,19 @@ def _config_per_tool(config: dict[str, list[str]], key: str, label: str,
                 raise _refuse(f"its {label} is not one value per tool: the '{key} =' config "
                               f"lines name {values[i]!r} and {piece!r} for tool {i}, and a file "
                               "that disagrees with itself cannot be identified")
+    return values
+
+
+def _config_per_tool(config: dict[str, list[str]], key: str, label: str,
+                     tools: list[int]) -> list[str]:
+    """``_config_merged_values`` held to the file's own tool selects: the result is indexable by
+    tool number, every index up to the file's highest selected tool must exist (a list shorter
+    than that is a tool whose value the file never says, refused with the key named), and one
+    value with one tool is the ordinary single-tool case and works whatever that tool's number
+    is (a T1-only file's ``; filament_type = PLA`` is that tool's). More values than the file's
+    highest tool are the spare filaments of a larger project: tools the file never selects, read
+    and left alone. Callers pass the file's own selected tool numbers (non-empty)."""
+    values = _config_merged_values(config, key, label)
     highest = max(tools)
     if len(tools) == 1 and len(values) == 1:
         values = values * (highest + 1)  # the file's one tool, whatever its number, prints at it
@@ -888,6 +900,40 @@ def _config_temp_per_tool(config: dict[str, list[str]], key: str, label: str,
                           "this family could hold — refusing rather than trusting it")
         temps.append(value)
     return temps
+
+
+def _declared_list_or_none(config: dict[str, list[str]], key: str) -> list[str] | None:
+    """``_config_merged_values`` for the command scan, WITHOUT the refusal: a key the file does
+    not carry, leaves empty, or writes contradictorily is simply *no declared list* here, because
+    the refusing, tool-aware read stays after the scan exactly where it always was and refuses
+    such a file naming the key there. The scan only ever asks this list a question; a refusal
+    before the commands are read would move which refusal fires first for files that are
+    refused anyway, and that ordering is existing tested behaviour."""
+    try:
+        return _config_merged_values(config, key, key)
+    except PrinterError:
+        return None
+
+
+def _declared_for_tool(values: list[str] | None, tool: int) -> float | None:
+    """One position of a merged per-tool list as a temperature, or None when the file declares
+    nothing usable for this tool: position ``tool`` when the list reaches that far; a one-value
+    list stands for whatever tool the file selects, because the only files that pass the
+    after-scan ``_config_per_tool`` with one value select exactly one tool, and there that value
+    is replicated to it; a value that is not a number is no declared temperature (the after-scan
+    read refuses such a list anyway)."""
+    if values is None:
+        return None
+    if tool < len(values):
+        raw = values[tool]
+    elif len(values) == 1:
+        raw = values[0]
+    else:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
 
 
 def _parse_S(token: str) -> float:
@@ -1197,7 +1243,13 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     own tool selects are known — the material and the nozzle first-layer and steady setpoints
     read per selected tool (``_config_per_tool``), each refusing to be missing, ambiguous or
     unphysical; the same per-tool read decides any deferred flush-R exception, against the file's
-    declared ``nozzle_temperature_range_high`` list.
+    declared ``nozzle_temperature_range_high`` list. The one config read that reaches into the
+    scan is design 2's (the layer-two ``M104`` transition): its two nozzle-setpoint keys are
+    merged refusal-free before the scan (``_declared_list_or_none``) and indexed per tool lazily
+    (``_declared_for_tool``) — the choice over hoisting the refusing per-tool reads above the
+    scan, which would need a tool list the scan has not built yet and would move which refusal
+    fires first; a missing or broken list there simply means no transition fires, and the
+    unchanged after-scan read still refuses the file naming the key.
     Cross-check last: every one of the four print setpoints must also appear among the commands —
     a file whose config promises 260 while its G-code never heats to 260 is an inconsistent file,
     and inconsistency is exactly what this parse exists to catch. Command setpoints beyond the
@@ -1240,6 +1292,16 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
 
     bed_first = _config_temp(config, first_key, "initial-layer bed temperature", maximum=_BED_MAX)
     bed = _config_temp(config, steady_key, "steady bed temperature", maximum=_BED_MAX)
+
+    # design 2's transition check reads these two keys inside the scan below, where the tool in
+    # force is known but the refusing per-tool read still is not (the tool list is only complete
+    # when the scan ends): merged position lists, refusal-free, indexed by tool lazily — see
+    # _declared_list_or_none and _declared_for_tool for why neither the refusal nor the tool
+    # rules move up here. nozzle_temperature_range_high is not one of them: design 2 touches no
+    # flush rule, and reading it up front would make a file that never purges answer for a key
+    # it has never needed — the flush-R read stays the after-scan, only-when-used exception it is.
+    firsts_pre = _declared_list_or_none(config, "nozzle_temperature_initial_layer")
+    nozzles_pre = _declared_list_or_none(config, "nozzle_temperature")
 
     nozzle_cmds: list[float] = []
     bed_cmds: list[float] = []
@@ -1334,7 +1396,27 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                     cooldown_at.append(idx)  # mid-file-S0 rule after the loop is a nozzle rule
                     nozzle_target, waited = 0.0, (0.0 if head == "M109" else waited)
                 elif head == "M104":      # a setpoint without a wait — an allowed preheat, but
-                    nozzle_target = value  #            the wait must still come before extrusion
+                    if (waited is not None and current_tool is not None and value != waited
+                            and waited == _declared_for_tool(firsts_pre, current_tool)
+                            and value == _declared_for_tool(nozzles_pre, current_tool)):
+                        # design 2: the slicer's own layer-two transition on every Klipper
+                        # printer — from a verified wait at the current tool's declared
+                        # initial-layer temperature, a bare M104 up to that same tool's declared
+                        # steady temperature. Both numbers are this file's own per-tool config
+                        # (the after-scan read range-checks them) and the firmware's M109
+                        # tolerates ±5 °C, so the wait armed at the first carries to the second:
+                        # the target moves, the wait follows it, and the new temperature joins
+                        # this tool's verified-extrusion story and the file-wide one — recorded
+                        # here, not merely allowed, because both temperatures must then fit the
+                        # tray at start. Any other bare M104 keeps today's rule below.
+                        nozzle_target = waited = value
+                        if value not in extrusion_temps:
+                            extrusion_temps.append(value)
+                        if value not in per_tool_temps.setdefault(current_tool, []):
+                            per_tool_temps[current_tool].append(value)
+                    else:                  # any other bare M104: a target moved without a wait
+                        nozzle_target = value  # revives the requirement; only a matching M109
+                        # re-arms extrusion (the wait must still come before the extrusion)
                 else:                     # M109: the target, and a verified wait at exactly it
                     nozzle_target = waited = value
                 if head == "M109":

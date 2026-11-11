@@ -699,6 +699,69 @@ def test_a_matching_wait_at_the_changed_target_re_accepts_extrusion_and_records_
     assert s.nozzle_setpoints == (260.0, 220.0)
 
 
+def _transition_frame(*, initial=220.0, steady=225.0, step=None):
+    """Design 2's shape as the generator writes it, one tool: the start wait at the declared
+    initial-layer temperature, a purge and an extrusion behind it, then the layer-two step — a
+    bare ``M104 S<steady>`` and another extrusion, with **no M109** at the steady setpoint
+    anywhere. ``step`` overrides the M104 value (for the undeclared-setpoint refusal below)."""
+    step = steady if step is None else step
+    i, st = f"{initial:g}", f"{step:g}"
+    cmds = ["M140 S60", "M190 S60 A", f"M109 S{i}",
+            f"M6211 A1 L200 T0 Q{i} R{i} S{i}", "T0", "G1 E6 F251.567",
+            f"M104 S{st}", "G1 E3 F251.567", "M104 S0", "M140 S0"]
+    cfg = ("; printer_model = Elegoo Centauri Carbon 2\n"
+           "; curr_bed_type = High Temp Plate\n; filament_type = PLA\n"
+           f"; nozzle_temperature = {steady:g}\n"
+           f"; nozzle_temperature_initial_layer = {initial:g}\n"
+           "; hot_plate_temp = 60\n; hot_plate_temp_initial_layer = 60\n")
+    return "\n".join(cmds) + "\n" + cfg
+
+
+def test_the_layer_two_m104_to_the_declared_steady_temperature_keeps_the_wait_armed():
+    # design 2: the slicer's own layer-two transition — a verified wait at the tool's declared
+    # initial-layer temperature, extrusion, then a bare M104 up to that tool's declared steady
+    # temperature and more extrusion with no M109 between. Both numbers are this file's own
+    # per-tool config and the firmware's M109 tolerates ±5 °C, so the wait armed at 220 carries
+    # to 225 — and both are recorded as verified extrusion temperatures, because both must then
+    # fit the tray at start.
+    s = up.parse_gcode_text(_transition_frame())
+    assert s.extrusion_nozzle_temps == (220.0, 225.0)
+    assert [t.extrusion_nozzle_temps for t in s.tools] == [(220.0, 225.0)]
+    assert s.nozzle_setpoints == (220.0, 225.0)
+
+
+def test_a_layer_two_m104_to_an_undeclared_temperature_still_needs_a_matching_wait():
+    # the acceptance is for the file's OWN declared steady value and nothing else: 230 is
+    # neither the 220 wait it steps away from nor the 225 the config declares, so today's rule
+    # stands — the target moves, the wait does not follow, and the next extrusion refuses
+    # naming the target no M109 ever waited at
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(_transition_frame(step=230.0))
+    assert "230" in bad.value.message and "no M109 was ever waited at" in bad.value.message
+    assert "Nothing was sent" in bad.value.message
+
+
+def test_a_layer_two_transition_fires_only_for_the_tool_in_force():
+    # design 2 is read per tool: tool 0 declares 210/210 and tool 1 declares 210/220, the
+    # change-filament purge and reselect put tool 1's filament in force at a verified 210, and
+    # only THEN the layer-two M104 S220 arrives — it carries tool 1 to its own declared steady
+    # temperature (and 220 would be no tool-two number at all under tool 0's 210/210), while
+    # tool 0's verified story stays the 210 its own moves and purges ran behind
+    cmds = ["M104 S140", "M140 S60", "M190 S60 A", "M109 S210",
+            "M6211 A1 L200 T0 Q210 R210 S210", "T0", "G1 E6 F251.567",
+            "M6211 T1 L34.9 M523 N523 Q210 R210 S210", "T1", "G1 E3 F251.567",
+            "M104 S220", "G1 E2 F251.567", "M104 S0", "M140 S0"]
+    cfg = ("; printer_model = Elegoo Centauri Carbon 2\n"
+           "; curr_bed_type = High Temp Plate\n; filament_type = PLA;PLA\n"
+           "; nozzle_temperature = 210,220\n"
+           "; nozzle_temperature_initial_layer = 210,210\n"
+           "; nozzle_temperature_range_high = 240,250\n"
+           "; hot_plate_temp = 60,60\n; hot_plate_temp_initial_layer = 60,60\n")
+    s = up.parse_gcode_text("\n".join(cmds) + "\n" + cfg)
+    assert [t.extrusion_nozzle_temps for t in s.tools] == [(210.0,), (210.0, 220.0)]
+    assert s.extrusion_nozzle_temps == (210.0, 220.0)
+
+
 @pytest.mark.parametrize("mesh", ["BED_MESH_CALIBRATE",
                                   "bed_mesh_calibrate ADAPTIVE=0 FROM_SLICER=1"])
 def test_a_bed_mesh_resets_the_verified_wait_so_the_next_extrusion_needs_a_fresh_m109(mesh):
