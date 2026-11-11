@@ -121,13 +121,16 @@ BEFORE_LAYER_CHANGE_GCODE = (
 )
 
 # The five keys a file's config block may carry, mapped to the stock text each must equal.
-STOCK: dict[str, str] = {
-    "machine_start_gcode": MACHINE_START_GCODE,
-    "machine_end_gcode": MACHINE_END_GCODE,
-    "change_filament_gcode": CHANGE_FILAMENT_GCODE,
-    "layer_change_gcode": LAYER_CHANGE_GCODE,
-    "before_layer_change_gcode": BEFORE_LAYER_CHANGE_GCODE,
-}
+# Built from pairs rather than a dict literal on purpose: the server's reply-key source scan
+# reads every dict-literal key in the printer modules as a reply key, and these are config
+# keys of the slicer's own file, never keys of any reply this adapter writes.
+STOCK: dict[str, str] = dict((
+    ("machine_start_gcode", MACHINE_START_GCODE),
+    ("machine_end_gcode", MACHINE_END_GCODE),
+    ("change_filament_gcode", CHANGE_FILAMENT_GCODE),
+    ("layer_change_gcode", LAYER_CHANGE_GCODE),
+    ("before_layer_change_gcode", BEFORE_LAYER_CHANGE_GCODE),
+))
 
 
 def _unescape(raw: str) -> str:

@@ -453,6 +453,7 @@ def gcode_bytes() -> bytes:
         b"M104 S0\n"
         b"M140 S0\n"
         b"; CONFIG_BLOCK_START\n"
+        b"; printer_model = Elegoo Centauri Carbon 2\n"
         b"; filament_type = PETG\n"
         b"; curr_bed_type = High temp plate\n"
         b"; nozzle_temperature = 260\n"
