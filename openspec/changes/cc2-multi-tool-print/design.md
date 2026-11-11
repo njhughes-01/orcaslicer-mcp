@@ -66,3 +66,19 @@ of decision 3:
    note either way ("flush at 240 °C against tray rated to 230 °C: the vendor's own profile and
    catalog disagree by 10 °C; not refused"). Rationale: both numbers are Elegoo's; refusing their own
    default makes the feature useless for PLA, while the file's declared range already bounds the flush.
+
+## Amendment (2026-11-11, after Opus review round 1)
+10. **Flush margin.** The note-not-refuse rule of decision 9 holds only within `FLUSH_MARGIN_C`
+    = 10 °C of the tray's rated maximum (the measured vendor gap for PLA). A flush further above
+    the rating refuses (`flush_over_tray_max`), because the upload bounds R only by the file's
+    own declared range-high, which is file text, not a vendor number.
+11. **Tool changes only through the purge.** A bare `T<n>` naming a different tool than the one
+    in force refuses the file: the vendor's slicer changes tool only through `M6211 T<n>` (which
+    switches the filament, then restates `T<n>`), and what a bare `T<n>` does on this firmware
+    is unread.
+12. **Spare filaments.** A per-tool config list longer than the file's highest selected tool is
+    read and the extra entries ignored (tools the file never selects never extrude and are never
+    mapped); the plan's earlier "more values refuse" is withdrawn.
+13. **Receipt union.** The flat `extrusion_nozzle_temps` must equal the union of the tools'
+    lists in both directions, and every entry must be a commanded setpoint; the looser rule task
+    1.3 allowed is dropped.

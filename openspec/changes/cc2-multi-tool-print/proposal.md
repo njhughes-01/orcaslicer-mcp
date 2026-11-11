@@ -15,7 +15,8 @@ in the way.
   a purge whose `T` names any tool the file selects, admits `M220` (speed factor, S only) to the
   allow list with its reason, and admits a purge `R` that differs from the verified wait under the one
   rule design.md states (R equals the declared `nozzle_temperature_range_high` of both tools involved,
-  and R is recorded as an extrusion temperature the trays must cover at start).
+  and R is recorded as a flush temperature, apart from the printing temperatures; design amendment 9).
+  A bare `T<n>` tool change with no `M6211` purge before it refuses.
 - The upload receipt records every tool with its material and verified temperatures (version 3; a
   version-2 receipt is still read as a one-tool receipt).
 - `cc2_start_print` takes a mapping with one entry per tool the receipt names (1 to 4), checks each
@@ -33,13 +34,15 @@ in the way.
 - `uv run pytest -q` passes in full and `uv run python scripts/gen_lhm_tools.py --check` passes.
 - `parse_gcode_text` on `~/src/3d-printing/artifacts/penelope-tag/penelope-tag-grey-black-20261111-v2.gcode`
   (a copy of its first 300 and last 700 lines plus one tool-change block is the fixture; the real
-  file is not committed) returns two tools, both PLA at 210 °C, with 240 among the extrusion temps.
+  file is not committed) returns two tools, both PLA at 210 °C, extrusion temps (210,) and flush temps (240,).
 - A one-tool file parses exactly as before (every existing upload/start test still passes unchanged
   except where its text asserted the one-tool refusal).
 - Against a scripted transport, a two-tool start with `{0: 1, 1: 2}` sends one 1020 whose
   `config.slot_map` is `[{"t":0,"canvas_id":0,"tray_id":1},{"t":1,"canvas_id":0,"tray_id":2}]`; a
   mapping missing a tool, naming a tool the receipt lacks, or pointing two tools at one tray refuses
-  with nothing sent; a tray whose material or rated range does not fit its tool refuses.
+  with nothing sent; a tray whose material or rated range does not fit its tool's printing
+  temperatures refuses; a flush temperature up to 10 °C over the tray's rated maximum is noted,
+  beyond that it refuses.
 
 ## Open live test (Nathan's yes, after merge and install)
 Upload the Pēnelópē v2 G-code with `cc2_upload_gcode`, then `cc2_start_print` with

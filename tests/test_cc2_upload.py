@@ -28,6 +28,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
+import re
+
 import pytest
 
 from orcaslicer_mcp.printer import cc2_state as st
@@ -321,7 +323,9 @@ def test_a_multi_tool_file_parses_and_one_that_cannot_say_what_each_tool_prints_
     assert [t.tool_index for t in s.tools] == [0, 1]
     with pytest.raises(PrinterError) as short:
         up.parse_gcode_text(gcode_text(tools=("T0", "T1")))
-    assert "filament_type" in short.value.message
+    # a bare T1 after T0 with no M6211 switching it is refused as an unread filament switch
+    # before the config is ever read (review finding, PR #11 round 2)
+    assert "no M6211 purge" in short.value.message
     assert "Nothing was sent" in short.value.message
     with pytest.raises(PrinterError) as none:
         up.parse_gcode_text(gcode_text(omit=("tools",)))
@@ -425,12 +429,38 @@ def test_config_lists_split_on_semicolons_as_well_as_commas():
     assert up._config_value("PLA;") == ["PLA", ""]      # positions kept: the empty slot stays
     assert up._config_value("PLA;;PETG") == ["PLA", "", "PETG"]   # tool 2 is PETG, tool 1 blank
     assert up._config_value("") == [] and up._config_value("[]") == []
-    # and the split is not helper-only, it reaches a parse: a semicolon list names a second
-    # material this one-tool file never selects, so it must refuse as more values than tools
-    # rather than pass as a filament type called "PLA;PETG"
+    # and the split is not helper-only, it reaches a parse: a semicolon list on a one-tool file
+    # is the spare filament of a larger project (a one-colour print from a two-filament
+    # project) — tool 0 prints PLA, the PETG belongs to a tool the file never selects, and the
+    # file passes with the material read positionally, never as a word called "PLA;PETG"
+    s = up.parse_gcode_text(gcode_text(material="PLA;PETG"))
+    assert s.material == "PLA" and [t.material for t in s.tools] == ["PLA"]
+
+
+def test_a_bare_tool_change_with_no_purge_refuses_as_an_unread_filament_switch():
+    # review finding (PR #11 round 2): T0 prints PLA, the file then heats to 250 and writes a
+    # bare T1 with no M6211 T1 before it. Whether a bare T<n> switches filament on this
+    # firmware is unread — if it does, that is an unread filament command; if it does not, PLA
+    # extrudes at 250 while only tool 1's tray is checked against it. Refused either way, and
+    # the fixture (whose every T<n> restates the tool its purge just set) still passes.
+    frame = _two_tool_frame()
+    probe = re.sub(r"^M6211 T1 [^\n]*\n", "", frame, count=1, flags=re.M)
+    assert probe != frame and "\nT1\n" in probe
     with pytest.raises(PrinterError) as bad:
-        up.parse_gcode_text(gcode_text(material="PLA;PETG"))
-    assert "one value" in bad.value.message and "Nothing was sent" in bad.value.message
+        up.parse_gcode_text(probe)
+    assert "no M6211 purge" in bad.value.message and "tool 0 (T0) to tool 1 (T1)" in bad.value.message
+    assert "Nothing was sent" in bad.value.message
+    up.parse_gcode_text(frame)  # the vendor's own shape, purge then restated T, still passes
+
+
+def test_a_longer_per_tool_list_is_the_spare_filaments_of_a_larger_project():
+    # review finding (PR #11 round 2): a two-colour print from a four-filament project writes
+    # four values per key; the two extra belong to tools the file never selects, which never
+    # extrude and are never mapped — read and left alone, never refused
+    assert up._config_per_tool({"filament_type": ["PLA;PLA;PETG;ABS"]}, "filament_type",
+                               "material", [0, 1]) == ["PLA", "PLA", "PETG", "ABS"]
+    assert up._config_per_tool({"nozzle_temperature": ["210,210"]}, "nozzle_temperature",
+                               "steady nozzle temperature", [0]) == ["210", "210"]
 
 
 def test_an_empty_position_in_a_per_tool_list_refuses_instead_of_shifting_tool_numbers():
@@ -519,7 +549,7 @@ def test_the_one_tool_reference_frame_parses_to_one_tool_settings_equal_to_its_f
     (gcode_text(omit=("nozzle_first",)), "nozzle_temperature_initial_layer"),
     (gcode_text(omit=("bed",)), "hot_plate_temp"),
     (gcode_text(omit=("bed_first",)), "hot_plate_temp_initial_layer"),
-    (gcode_text(material="PETG,PLA"), "one value"),
+    (gcode_text(material="PETG,"), "position 1"),  # a blank slot, never a borrowed neighbour
     (gcode_text(omit_nozzle_cmds=True), "no M109"),  # the purge-without-a-wait the missing waits
     (gcode_text(omit_bed_cmds=True), "no M140/M190"),  # leave behind — refused where it bites
     (gcode_text(nozzle_first=265.0, nozzle=255.0).replace("M109 S255\n", ""), "disagree"),
@@ -2162,6 +2192,14 @@ def test_a_tool_extrusion_temperature_the_flat_union_lacks_refuses_the_receipt()
     # list while a reader of the flat field would see a cooler print than ran)
     data = _two_tool_receipt().to_dict()
     data["tools"][1]["extrusion_nozzle_temps"] = [210.0, 230.0]
+    data["commanded_nozzle_setpoints"] = [140.0, 210.0, 230.0]
+    with pytest.raises(PrinterError) as bad:
+        Cc2UploadReceipt.from_dict(data)
+    assert bad.value.details.get("reason") == "receipt_invalid"
+    # and the other direction (round 2): a flat temperature no tool ran at would never be
+    # checked against any tray, since the start reads the per-tool lists — refused too
+    data = _two_tool_receipt().to_dict()
+    data["extrusion_nozzle_temps"] = [210.0, 230.0]
     data["commanded_nozzle_setpoints"] = [140.0, 210.0, 230.0]
     with pytest.raises(PrinterError) as bad:
         Cc2UploadReceipt.from_dict(data)

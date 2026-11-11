@@ -209,16 +209,36 @@ _UNPARSEABLE_NOTE = ("The printer's answer to the start command carried no reada
                      "which is neither success nor refusal — nothing was resent.")
 
 
+# How far a flush temperature may stand above a tray's rated maximum and still be only noted:
+# the measured gap between Elegoo's own PLA profile (flushes at its range-high, 240 °C) and
+# Elegoo's own catalog (rates PLA trays to 230 °C). A flush further above the rating than the
+# vendor's own numbers disagree is a file's own claim, not the vendor's, and refuses — the
+# upload bounds R only by the file's declared range-high, which is file text (review finding,
+# PR #11). Both numbers travel in the note either way.
+FLUSH_MARGIN_C = 10.0
+
+
 def _flush_note(tool_index: int, tray_id: int, material: str, flush: tuple[float, ...],
                 hi: float) -> str:
     """The one note per flushing tool (design amendment 9): every flush temperature against the
     tray's rated maximum, above or within, said plainly and short enough to survive a tool reply
-    whole. It never refuses — both numbers are the vendor's own."""
+    whole. Within FLUSH_MARGIN_C of the rating it is noted and not refused; beyond it the start
+    refuses before this note is ever built (``_flush_refusal``)."""
     parts = [f"{temp:g} °C ({temp - hi:g} °C above it)" if temp > hi else f"{temp:g} °C (within it)"
              for temp in flush]
     return (f"Tool {tool_index} on tray {tray_id} ({material}): flush at {' and '.join(parts)}, "
-            f"tray rated to {hi:g} °C. Both numbers are the vendor's own (its slicer profile and "
-            "its filament catalog); the start is not refused on it.")
+            f"tray rated to {hi:g} °C. The flush is the file's declared range-high and the rating "
+            f"is the tray's own; within {FLUSH_MARGIN_C:g} °C of it the start is not refused.")
+
+
+def _flush_refusal(tool_index: int, tray_id: int, material: str, temp: float, hi: float) -> Cc2StartError:
+    return Cc2StartError("protocol_error",
+                         f"Tool {tool_index}'s colour-change flush runs at {temp:g} °C, "
+                         f"{temp - hi:g} °C above tray {tray_id}'s rated maximum {hi:g} °C "
+                         f"({material}) — more than the {FLUSH_MARGIN_C:g} °C by which the "
+                         "vendor's own profile and catalog disagree, so this is the file's own "
+                         "claim and the spool cannot vouch for it. Nothing was sent.",
+                         reason="flush_over_tray_max")
 
 
 def _plain_int(value: Any) -> bool:
@@ -324,8 +344,9 @@ async def start_print(transport: Any, remote_filename: str, tool_to_tray: dict[i
     range covering every extrusion temperature verified for its own tool (non-extruding preheats
     are not extrusion targets and are not range-checked) with no commanded nozzle setpoint above
     that tray's maximum. A tool's flush temperatures are neither: each is compared with its tray's
-    rated maximum and reported in one note per tool, above or within, and never refuses (design
-    amendment 9 — the flush and the rating are both the vendor's numbers).
+    rated maximum and, within FLUSH_MARGIN_C of it, reported in a note rather than refused (design
+    amendment 9 — the vendor's own PLA profile and catalog disagree by that much); further above
+    the rating it refuses, because the upload bounds a flush only by the file's own declared range.
     Only then is the single 1020 sent — ``slot_map`` entries, one complete one per tool ordered
     by ``t``, each built from that receipt tool and its tray's fresh identity, ``printer_check``
     explicit, and nothing else in ``config``
@@ -561,9 +582,13 @@ async def start_print(transport: Any, remote_filename: str, tool_to_tray: dict[i
                                         "is rated for is heat the spool cannot vouch for, "
                                         "preheat or not. Nothing was sent.",
                                         reason="commanded_over_tray_max")
-            # Flush temperatures (design amendment 9) are reported, never refused: the upload
-            # already bounds them by the file's own declared range-high, and the tray's rating and
-            # the flush are both the vendor's numbers.
+            # Flush temperatures (design amendment 9): within FLUSH_MARGIN_C of the tray's rated
+            # maximum they are reported, not refused (the vendor's own profile and catalog
+            # disagree by exactly that much for PLA); further above it they refuse, because the
+            # upload bounds R only by the file's own declared range-high, which is file text.
+            for temp in tool_receipt.flush_nozzle_temps:
+                if temp > hi + FLUSH_MARGIN_C:
+                    raise _flush_refusal(mapped_tool, mapped_tray, tray_entry.material, temp, hi)
             if tool_receipt.flush_nozzle_temps:
                 flush_notes.append(_flush_note(mapped_tool, mapped_tray, tray_entry.material,
                                                tool_receipt.flush_nozzle_temps, hi))

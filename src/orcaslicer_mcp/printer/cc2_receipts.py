@@ -291,37 +291,23 @@ class Cc2UploadReceipt:
                                    "A receipt's flat material and nozzle fields would not be "
                                    "its first tool's values, so it is refused rather than "
                                    "half-trusted.", reason="receipt_invalid")
-        # Every extrusion temperature — the file-wide union's or any one tool's — must be one
-        # the parse could have arrived at: a commanded M104/M109 setpoint, or (the rule task 1.3
-        # wrote while design 3 still recorded a flush R as an extrusion temperature) a
-        # temperature hotter than the print carried by every tool printing below it. Since
-        # design amendment 9 the parse keeps flush R in ``flush_nozzle_temps`` and writes only
-        # verified waits here, so the second branch is kept for receipts written before it, and
-        # the safe direction is stated in the docstring: extra extrusion temperatures only ever
-        # make a start refuse more trays.
-        # the flat union must BE the union of the tools' lists — a tool list the flat field does
-        # not account for, or a flat temperature no tool ran at, is a receipt that disagrees with
-        # itself (review finding, PR #11); the one exception is the legacy second branch below
-        # (a version-2 receipt's flush temperature carried by no tool), handled by the same test
+        # The flat ``extrusion_nozzle_temps`` IS the union of the tools' lists, in both directions
+        # (review finding, PR #11, both rounds): a tool temperature the flat list lacks, or a flat
+        # temperature no tool ran at, is a receipt that disagrees with itself — the start compares
+        # trays against the per-tool lists, so a flat-only temperature would never be checked.
+        # And every extrusion temperature must be a commanded M104/M109 setpoint: since design
+        # amendment 9 the parse keeps flush R in ``flush_nozzle_temps`` and writes only verified
+        # waits here, and a version-2 receipt reads as one tool with exactly the flat list, so
+        # no shipped receipt needs the looser rule task 1.3 once allowed.
         per_tool_union = {t for tool in self.tools for t in tool.extrusion_nozzle_temps}
-        if not per_tool_union <= set(extrusion):
+        if per_tool_union != set(extrusion):
             raise PrinterError("protocol_error",
-                               "A receipt would record an extrusion temperature on one tool that "
-                               "its file-wide list does not carry, so it is refused rather than "
+                               "A receipt's file-wide extrusion temperatures would not be the "
+                               "union of its tools' lists, so it is refused rather than "
                                "half-trusted.", reason="receipt_invalid")
         recorded = list(dict.fromkeys(
             list(extrusion) + [t for tool in self.tools for t in tool.extrusion_nozzle_temps]))
-        unexplained: list[float] = []
-        for temp in recorded:
-            if temp in nozzle_cmds:
-                continue
-            printing_below = [tool for tool in self.tools
-                              if temp > float(tool.nozzle_temp)
-                              or temp > float(tool.nozzle_first_layer_temp)]
-            if printing_below and all(temp in tool.extrusion_nozzle_temps
-                                      for tool in printing_below):
-                continue
-            unexplained.append(temp)
+        unexplained = [temp for temp in recorded if temp not in nozzle_cmds]
         if unexplained:
             raise PrinterError("protocol_error",
                                f"A receipt would claim extrusion at "

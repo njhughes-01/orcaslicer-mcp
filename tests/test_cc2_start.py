@@ -762,7 +762,7 @@ async def test_flush_above_the_tray_rating_is_reported_never_refused(store):
     for tool_index, tray_id, note in zip((0, 1), (1, 2), flush):
         assert f"Tool {tool_index} on tray {tray_id}" in note
         assert "240 °C" in note and "230 °C" in note and "10 °C above" in note
-        assert "vendor's own" in note and "slicer profile" in note and "catalog" in note
+        assert "declared range-high" in note and "tray's own" in note
         assert "not refused" in note
         assert len(note) <= 255, "a tool reply caps each string at 255 characters"
     assert result.flush_nozzle_temps_c == ((0, (240.0,)), (1, (240.0,)))
@@ -790,6 +790,28 @@ async def test_a_printing_temperature_above_the_tray_rating_still_refuses(store)
     assert ei.value.details["reason"] == "range_violation"
     assert "240" in ei.value.message and "230" in ei.value.message
     assert_never_started(tr)
+
+
+async def test_a_flush_more_than_the_vendor_margin_over_the_tray_rating_refuses(store):
+    # review finding (PR #11 round 2): the upload bounds R only by the file's own declared
+    # range-high, which is file text — a file declaring 350 flushes PLA at 350. Within 10 °C
+    # of the tray's rating (the vendor's own PLA gap) a flush is noted; further over it refuses
+    # before any command, naming both numbers.
+    over = two_tool_over()
+    hot = ToolReceipt(tool_index=1, material="PLA", nozzle_first_layer_temp=210.0,
+                      nozzle_temp=210.0, extrusion_nozzle_temps=(210.0,),
+                      flush_nozzle_temps=(250.0,))
+    over.update(tools=(over["tools"][0], hot))
+    save_receipt(store, **over)
+    tr = healthy({st.METHOD_CANVAS: canvas_replies(
+        active_tray=2, trays=pla_roster(mx1=250, mx2=230))})
+    with pytest.raises(cs.Cc2StartError) as ei:
+        await begin(store, tr, tool_to_tray={0: 1, 1: 2})
+    assert ei.value.details["reason"] == "flush_over_tray_max"
+    assert "250" in ei.value.message and "230" in ei.value.message
+    assert "Nothing was sent" in ei.value.message
+    assert_never_started(tr)
+    assert cs.FLUSH_MARGIN_C == 10.0
 
 
 async def test_a_commanded_setpoint_above_the_tray_rating_still_refuses_beside_a_flush(store):

@@ -786,9 +786,9 @@ def _config_per_tool(config: dict[str, list[str]], key: str, label: str,
     selected tool must exist. A list shorter than the highest selected tool is a tool whose
     value the file never says, refused with the key named; one value with one tool is the
     ordinary single-tool case and works whatever that tool's number is (a T1-only file's
-    ``; filament_type = PLA`` is that tool's). More values than the file has tools names tools
-    the file never selects, and refuses too: this reads one value per selected tool, never a
-    prefix of a longer claim. Callers pass the file's own selected tool numbers (non-empty)."""
+    ``; filament_type = PLA`` is that tool's). More values than the file's highest tool are the
+    spare filaments of a larger project: tools the file never selects, read and left alone.
+    Callers pass the file's own selected tool numbers (non-empty)."""
     occurrences = config.get(key)
     if not occurrences:
         raise _refuse(f"it carries no {label} (no '; {key} =' config line), and print settings "
@@ -824,10 +824,12 @@ def _config_per_tool(config: dict[str, list[str]], key: str, label: str,
                       f"while the file selects tool {highest}, so tool {highest}'s value is not "
                       "in the file — refusing rather than guessing which listed value a tool "
                       "prints at")
-    elif len(values) > highest + 1:
-        raise _refuse(f"its {label} is not one value per tool but {values[:4]} — the file names "
-                      f"{len(values)} values for '{key}' while its highest selected tool is "
-                      f"T{highest}, and this adapter reads one value per selected tool")
+    # A list LONGER than the highest selected tool is the ordinary shape of a project with spare
+    # filaments (a two-colour print from a four-filament project, a one-colour print from a
+    # two-filament one — the CANVAS sync fills all four slots): the extra entries belong to tools
+    # the file never selects, which never extrude and are never mapped, and a purge must still
+    # name a selected tool (checked below in the scan). So they are read and ignored, never
+    # refused (review finding, PR #11); only the selected tools' entries are returned.
     return values
 
 
@@ -1384,6 +1386,22 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
         m = _TOOL_RE.match(line.upper())  # Klipper matches command words case-insensitively
         if m:
             tool = int(m.group(1))
+            if current_tool is not None and tool != current_tool:
+                # A bare T<n> that names a different tool than the one in force is a filament
+                # switch this parser has never read on this firmware: the vendor's own slicer
+                # only ever changes tool through M6211 (whose T switches the filament, then the
+                # T<n> line restates it). If a bare T<n> switches filament it is an unread
+                # filament command; if it does nothing, the old spool keeps extruding at a
+                # temperature only the new tool's tray is checked against. Either way refused
+                # (review finding, PR #11): a tool change arrives only through M6211 T<n>.
+                raise _refuse(f"the tool select {line[:20]!r} changes the tool from tool "
+                              f"{current_tool} (T{current_tool}) to tool {tool} (T{tool}) with no "
+                              "M6211 purge switching it first — a bare tool "
+                              "change is a filament switch this parser has not read on this "
+                              "firmware, and the vendor's own slicer only changes tool through "
+                              "its M6211 purge, so one without it is refused",
+                              hint="Re-slice with the stock Centauri Carbon 2 change_filament_gcode, "
+                                   "whose M6211 T<n> precedes every T<n>.")
             if tool not in tools:
                 tools.append(tool)
             current_tool = tool
