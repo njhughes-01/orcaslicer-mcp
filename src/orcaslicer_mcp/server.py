@@ -2184,7 +2184,7 @@ _CC2_REPLY_KEYS = frozenset({
     "connected", "content_sha256", "created", "current_layer", "deletion_proved", "dir",
     "display", "distance", "driving_a_filament_operation", "duration_seconds", "empty",
     "end_time", "ended_at", "entries", "entries_in_reply", "entries_kept", "error", "error_code",
-    "est_filament_g", "est_print_s", "extruder", "extrusion_nozzle_temps",
+    "est_filament_g", "est_print_s", "extruder", "extrusion_nozzle_temps", "flush_nozzle_temps",
     "extrusion_nozzle_temps_c", "fans_now_raw", "field", "filament_grams", "filaments",
     "file_in_this_listing", "file_name", "file_now", "file_path", "file_size_bytes", "filename",
     "files", "firmware", "first_layer", "hardware", "hardware_version", "has_more", "heater",

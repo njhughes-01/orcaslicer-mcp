@@ -12,7 +12,7 @@ read, edit, write, bash, grep, find, ls
 - tests/test_cc2_upload.py
 - tests/test_cc2_start.py
 - tests/test_server_cc2.py
-- tests/fixtures/cc2_two_tool.gcode
+- tests/fixtures/cc2_two_tool.gcode.xz
 - README.md
 - CHANGELOG.md
 - lhm.plugin.json

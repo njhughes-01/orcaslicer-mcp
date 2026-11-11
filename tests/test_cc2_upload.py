@@ -341,19 +341,17 @@ def test_an_extrusion_before_any_select_or_purge_refuses_because_no_tool_owns_it
     assert "Nothing was sent" in bad.value.message
 
 
-def test_the_two_tool_fixture_parses_to_two_pla_tools_at_210_flushing_at_240_on_both():
+def test_the_two_tool_fixture_parses_to_two_pla_tools_at_210_flushing_at_240_on_both(gcode_fixture):
     # the real grey/black Penelope-tag slice, trimmed by task 1.1 to head + first T1 change
     # block + tail: two PLA tools both printing at 210 °C, and the vendor's own change-filament
     # purge flushing at R 240 — the declared nozzle_temperature_range_high of both tools. 240
     # is therefore a flush temperature of BOTH spools, kept apart from the printing
     # temperatures (design amendment 9): no M109 waits at it, so it is neither an extrusion
     # temperature nor a commanded setpoint, and the start reports it against each tray's rated
-    # maximum instead of refusing on it. The fixture lives beside the tests and is
-    # not committed (tests/fixtures/*.gcode is ignored — see the change's tasks.md, task 1.1).
-    fixture = Path(__file__).parent / "fixtures" / "cc2_two_tool.gcode"
-    if not fixture.is_file():
-        pytest.skip(f"{fixture} is built from the real slice on this machine and not committed")
-    s = up.parse_gcode_text(fixture.read_text(encoding="utf-8", errors="replace"))
+    # maximum instead of refusing on it. Stored compressed like every other fixture
+    # (tests/fixtures/cc2_two_tool.gcode.xz; raw .gcode is ignored by the repo rule).
+    text = gcode_fixture("cc2_two_tool")
+    s = up.parse_gcode_text(text)
     assert [t.tool_index for t in s.tools] == [0, 1]
     assert [t.material for t in s.tools] == ["PLA", "PLA"]
     assert all((t.nozzle_first_layer_temp, t.nozzle_temp) == (210.0, 210.0) for t in s.tools)
@@ -366,7 +364,7 @@ def test_the_two_tool_fixture_parses_to_two_pla_tools_at_210_flushing_at_240_on_
     # the 140 preheat stays evidence, not a print setpoint, and the flush R is no setpoint at all
     assert s.nozzle_setpoints == (140.0, 210.0)
     # and the real slice writes its speed overrides (M220 S100) — allowed by design 5, below
-    assert "M220 S100" in fixture.read_text(encoding="utf-8", errors="replace")
+    assert "M220 S100" in text
 
 
 def test_a_flush_r_may_stand_off_the_verified_target_only_as_both_tools_declared_range_high():
