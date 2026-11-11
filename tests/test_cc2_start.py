@@ -946,6 +946,43 @@ async def test_session_dead_before_the_command_stays_dead(store):
     assert_never_started(tr)
 
 
+# --------------------------------------------------------------------------- the tray-table note (design 6)
+
+
+def test_tray_table_note_fits_a_reply_string_and_says_what_it_must():
+    note = cs._TRAY_TABLE_NOTE
+    assert len(note) <= 255, len(note)   # the server caps reply strings at 255 characters
+    assert "T<n> is inert" in note and "M6211" in note
+    assert "persistent colour table" in note and "cannot read" in note
+    assert "slot_map" in note and "Elegoo's own client" in note and "may override" in note
+
+
+async def test_tray_table_note_rides_an_accepted_start(store):
+    save_receipt(store)
+    result, _ = await begin(store)
+    assert result.status is cs.StartStatus.ACCEPTED
+    assert result.notes.count(cs._TRAY_TABLE_NOTE) == 1
+    assert cs._TRAY_TABLE_NOTE in result.as_dict()["notes"]
+
+
+async def test_tray_table_note_rides_a_refusal_after_the_read(store):
+    save_receipt(store)
+    tr = healthy({cs.METHOD_START: {"error_code": 1009}})
+    result, _ = await begin(store, tr)
+    assert result.status is cs.StartStatus.REFUSED
+    assert result.notes.count(cs._TRAY_TABLE_NOTE) == 1
+
+
+@pytest.mark.parametrize("answer", [timeout(), {}],
+                         ids=["lost-reply", "no-error-code"])
+async def test_tray_table_note_rides_an_ambiguous_start(answer, store):
+    save_receipt(store)
+    tr = healthy({cs.METHOD_START: answer})
+    result, _ = await begin(store, tr)
+    assert result.status is cs.StartStatus.AMBIGUOUS
+    assert result.notes.count(cs._TRAY_TABLE_NOTE) == 1
+
+
 # --------------------------------------------------------------------------- the bed warning, passed along
 
 

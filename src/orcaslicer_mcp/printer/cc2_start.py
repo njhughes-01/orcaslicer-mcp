@@ -37,6 +37,9 @@ of the fresh 2005 read that answered for it — the entries' ``canvas_id``/``tra
 ones that just answered, not numbers the caller retyped. A ``slot_map`` of more than one entry
 is the shape Elegoo's own LAN client builds for a multi-colour print, but this adapter has never
 sent one: every reply of a multi-tool start carries a note saying so until a live test lands.
+Every result also carries the tray-table note: a bare ``T<n>`` is inert on this firmware and the
+physical tray is chosen inside ``M6211`` from the printer's persistent colour table, which this
+adapter cannot read, so the ``slot_map`` is a request the printer's table may override.
 
 Honesty about the reply: ``error_code`` 0 means the printer did not refuse the request — it is not
 proof the tray was honoured (a silently-downgraded mapping answers 0 too) and not proof the remote
@@ -192,6 +195,14 @@ _MULTI_SLOT_NOTE = ("Multi-tool start: this slot_map carries one entry per tool,
                     "never sent a multi-entry slot_map and has never observed this firmware's "
                     "answer to one — until a live test, the reply proves nothing about whether "
                     "each tool's tray was honoured.")
+# The tray-table note (design 6; firmware-macros.md §C, inventory.md E5): every result carries it,
+# accepted, refused or ambiguous, because it is a property of the firmware, not of one reply. A
+# bare T<n> has no handler on this firmware; M6211 picks the physical tray from the printer's own
+# persistent colour table, which no method this adapter speaks can read.
+_TRAY_TABLE_NOTE = ("The file's T<n> is inert on this firmware; the physical tray is chosen inside "
+                    "M6211 from the printer's persistent colour table, which this adapter cannot "
+                    "read. The slot_map sent is what Elegoo's own client sends, and the printer's "
+                    "table may override it.")
 _RUNNING_NOTE = ("Observed printing: the printer's status names this file with the lowercase "
                  "state word \"printing\" under machine status 2.")
 _BED_WARNING_NOTE = ("A bed warning was carried from the slice — a valid slice is not proof the "
@@ -307,6 +318,7 @@ def _build_result(status: StartStatus, remote_filename: str, receipt: Cc2UploadR
     notes.extend(extra_notes)
     if bed_warning:
         notes.append(_BED_WARNING_NOTE)
+    notes.append(_TRAY_TABLE_NOTE)
     return Cc2StartResult(
         status=status, remote_filename=remote_filename,
         accepted=status is StartStatus.ACCEPTED,
@@ -353,6 +365,9 @@ async def start_print(transport: Any, remote_filename: str, tool_to_tray: dict[i
     because nothing else has been verified to mean anything. A start whose receipt carries more
     than one tool carries an extra note: a multi-entry ``slot_map`` is what Elegoo's own client
     sends, but this adapter has never sent one and the firmware's answer to one is unobserved.
+    Every result, accepted, refused or ambiguous, carries the tray-table note: the file's ``T<n>``
+    is inert and ``M6211`` picks the tray from the printer's persistent colour table, unreadable
+    from here, so the ``slot_map`` sent is a request that table may override.
 
     The answer decides the report, never the hope: explicit integer ``error_code`` 0 is accepted
     (with the honesty notes), any other number is a refusal with its code kept, and a lost,

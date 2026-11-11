@@ -2228,6 +2228,13 @@ _CC2_REPLY_KEYS = frozenset({
     "would_refuse", "xyz_size",
 })
 
+# The stock-profile allow list's reply names (cc2-stock-profile-allowlist design 1, 5 and 6): the
+# file's printer_model, its stock-template verdict and how many templates were compared, all
+# written by cc2_upload_gcode's reply. Same rule as every block here.
+_CC2_REPLY_KEYS = _CC2_REPLY_KEYS | frozenset({
+    "printer_model", "templates_compared", "vendor_templates",
+})
+
 # The CANVAS tray filament write's reply names, declared as their own addition rather than woven into
 # the sorted block above, exactly as the camera block does: the rule is identical (a name this source
 # contains is a name this server or its cc2_tray adapter wrote, so the credential pass must not
@@ -3012,6 +3019,12 @@ async def cc2_upload_gcode(
         "extrusion_nozzle_temps_c": sorted(receipt.extrusion_nozzle_temps),
         "commanded_nozzle_setpoints_c": sorted(set(receipt.commanded_nozzle_setpoints)),
         "uploaded_at": receipt.uploaded_at,
+        # The parse's printer_model and stock-template verdict (design 1 and 5). read with getattr
+        # so this reply is the same shape before and after the parser carries them: None until
+        # the upload path hands them over on the object it returns.
+        "printer_model": getattr(receipt, "printer_model", None),
+        "vendor_templates": getattr(receipt, "vendor_templates", None),
+        "templates_compared": getattr(receipt, "templates_compared", None),
         "next": ("start it with cc2_start_print: filename exactly as uploaded, tool_to_tray "
                  "mapping the tool_index above to a tray from cc2_status, and bed_clear=true "
                  "only after a human has looked at the bed."),
@@ -3062,7 +3075,9 @@ async def cc2_start_print(
     same material as the tool it feeds, with a rated nozzle range covering every temperature
     that tool extrudes at. Any failed check refuses before the printer is asked, naming the
     check. A reply for a file with more than one tool carries a note that this adapter has
-    never sent or observed a multi-entry slot_map on this firmware. Bed leveling is off
+    never sent or observed a multi-entry slot_map on this firmware. Every reply notes that the
+    file's T<n> is inert: the physical tray is chosen inside M6211 from the printer's persistent
+    colour table, which this adapter cannot read, so the printer may override the slot_map sent. Bed leveling is off
     by default and sent explicitly either way; pass leveling=true only when it was requested
     for this print. The reply keeps accepted (the printer did not refuse) and observed_running
     (its status names this file as printing) strictly apart — acceptance alone never claims a

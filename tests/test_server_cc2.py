@@ -1781,6 +1781,8 @@ async def test_upload_sends_parse_verifies_and_receipts_with_no_secrets(
     assert out["extrusion_nozzle_temps_c"] == [260.0]
     assert out["commanded_nozzle_setpoints_c"] == [140.0, 260.0]
     assert "cc2_start_print" in out["next"]
+    # the stock-profile fields ride the reply whether or not the parse carries them yet
+    assert "printer_model" in out and "vendor_templates" in out and "templates_compared" in out
     json.dumps(out)
 
     assert transport.methods() == [srv._cc2_state.METHOD_FILES] * 2
@@ -1802,6 +1804,31 @@ async def test_upload_sends_parse_verifies_and_receipts_with_no_secrets(
     assert TOKEN not in dumped            # the credential never rides out
     assert str(gcode_file) not in dumped  # the local path is not echoed back
     assert "X-Token" not in dumped and "Content-Range" not in dumped
+
+
+async def test_upload_reply_carries_printer_model_and_vendor_templates_unredacted(
+        monkeypatch, tmp_path, receipts_dir, gcode_file):
+    size = gcode_file.stat().st_size
+    listing = Listing([[], [file_entry(size=size)]])
+    open_fake(monkeypatch, ScriptedTransport({srv._cc2_state.METHOD_FILES: listing}))
+    monkeypatch.setattr(srv, "_cc2_upload_http_factory", FakeHttp().factory)
+    real_upload = srv._cc2_upload.upload_gcode
+
+    async def upload_with_stock_fields(*args, **kwargs):
+        receipt = await real_upload(*args, **kwargs)
+        # what the upload path hands back once the parser carries these (tasks 1.1 and 1.5)
+        object.__setattr__(receipt, "printer_model", "Elegoo Centauri Carbon 2")
+        object.__setattr__(receipt, "vendor_templates", "modified: machine_end_gcode")
+        object.__setattr__(receipt, "templates_compared", 5)
+        return receipt
+
+    monkeypatch.setattr(srv._cc2_upload, "upload_gcode", upload_with_stock_fields)
+    out = await srv.cc2_upload_gcode(path=str(gcode_file), destination=DEST)
+    assert out["uploaded"] == DEST, out
+    assert out["printer_model"] == "Elegoo Centauri Carbon 2"
+    assert out["vendor_templates"] == "modified: machine_end_gcode"
+    assert out["templates_compared"] == 5
+    json.dumps(out)
 
 
 async def test_upload_refuses_a_collision_without_retrying_or_overwriting(
