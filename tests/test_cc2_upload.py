@@ -699,6 +699,34 @@ def test_a_matching_wait_at_the_changed_target_re_accepts_extrusion_and_records_
     assert s.nozzle_setpoints == (260.0, 220.0)
 
 
+@pytest.mark.parametrize("mesh", ["BED_MESH_CALIBRATE",
+                                  "bed_mesh_calibrate ADAPTIVE=0 FROM_SLICER=1"])
+def test_a_bed_mesh_resets_the_verified_wait_so_the_next_extrusion_needs_a_fresh_m109(mesh):
+    # design 4: the calibration body is a binary-only library whose strings carry heater
+    # commands, so no verified M109 wait is carried across the line — a mesh after the wait and
+    # an E move with no M109 between is an extrusion at a target nothing proved at that point,
+    # and the refusal must name the mesh as what dropped the wait
+    meshed = _heat_frame("M140 S60", "M190 S60 A", "M109 S240",
+                         "M6211 A1 L200 T0 Q240 R240 S240", "T0",
+                         mesh, "G1 E6 F131.773", "M104 S0", "M140 S0", nozzle=240.0)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(meshed)
+    assert "BED_MESH_CALIBRATE" in bad.value.message and "240" in bad.value.message
+    assert "Nothing was sent" in bad.value.message
+
+
+def test_the_stock_start_order_of_mesh_then_home_then_wait_still_parses():
+    # the reset above costs stock files nothing: the stock start template issues
+    # BED_MESH_CALIBRATE, G28, then M109 S[nozzle_temperature_initial_layer], so the wait its
+    # extrusions and purge run behind is built after the mesh, never carried across it
+    stock = _heat_frame("BED_MESH_CALIBRATE", "G28", "M140 S60", "M190 S60 A", "M109 S240",
+                        "M6211 A1 L200 T0 Q240 R240 S240", "T0", "G1 E6 F131.773",
+                        "M104 S0", "M140 S0", nozzle=240.0)
+    s = up.parse_gcode_text(stock)
+    assert s.extrusion_nozzle_temps == (240.0,)
+    assert s.nozzle_setpoints == (240.0,)
+
+
 def test_extrusion_before_any_nozzle_command_at_all_is_refused():
     body = _heat_frame("M140 S60", "M190 S60 A", "T0", "G1 E6 F131.773", "M109 S240",
                        "M104 S0", "M140 S0", nozzle=240.0)
@@ -881,11 +909,12 @@ def test_compact_e_is_counted_as_extrusion_and_recorded_by_a_verified_wait():
     "M204 S=1500 T=5000", "M73 P50", "M84",       # acceleration, progress display, steppers off
     "G1 X50 Y50 F6000", "G1 X127 Y-1.2 F20000",   # the two travel spellings the fixture writes
     "G2 X10 Y10 I5 J5",                            # a non-extruding arc
-    "BED_MESH_CALIBRATE",                          # a probe pass: Z moves, no filament, no nozzle
+    # BED_MESH_CALIBRATE left this list for design 4: it is still an allowed word, but it now
+    # drops the M109 wait in force, so it is tested with that rule (both case spellings) above
     "SET_PRESSURE_ADVANCE ADVANCE=0.04",           # a flow-tuning number
     "SET_PRINT_STATS_INFO TOTAL_LAYER=120 CURRENT_LAYER=3",
     "SET_VELOCITY_LIMIT VELOCITY=300",
-    "bed_mesh_calibrate", "set_velocity_limit velocity=300",   # Klipper matches words by case
+    "set_velocity_limit velocity=300",             # Klipper matches words by case
 ])
 def test_the_allowed_commands_from_the_mount_fixture_still_parse(line):
     # every one of these changes no heater target and moves no filament on its own — the file must

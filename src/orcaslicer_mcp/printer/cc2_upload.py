@@ -1277,6 +1277,19 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     cooldown_at: list[int] = []
     last_extrusion_at: int | None = None
     unload_seen = False   # a G180 S9 has run (or may have): nothing past it is knowable
+    mesh_seen = False     # a BED_MESH_CALIBRATE has dropped the wait since the last M109 (design 4)
+
+    def _wait_lost() -> str:
+        # how the two extrusion gates below name a missing wait: the value an M109 last proved,
+        # the mesh line that dropped it (design 4: the calibration body is a binary-only library
+        # that may heat, so no wait carries across it), or no M109 at all
+        if waited is not None:
+            return f"{waited:g} °C"
+        if mesh_seen:
+            return ("reset by the BED_MESH_CALIBRATE above it, whose binary-only calibration "
+                    "library may heat — no M109 wait is carried across that line")
+        return "no M109 at all"
+
     for idx, raw_line in enumerate(text_lines):
         line = raw_line.split(";", 1)[0].strip()
         if not line:
@@ -1324,6 +1337,8 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                     nozzle_target = value  #            the wait must still come before extrusion
                 else:                     # M109: the target, and a verified wait at exactly it
                     nozzle_target = waited = value
+                if head == "M109":
+                    mesh_seen = False     # a fresh wait now stands behind the target again
             continue
         if head == "G180":
             # The CC2's macro dispatcher, decided number by number: _g180_macro has already refused
@@ -1335,6 +1350,16 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
             if _g180_macro(line, rest).ends_print:
                 unload_seen = True
                 nozzle_target, waited = None, None
+            continue
+        if head == "BED_MESH_CALIBRATE":
+            # design 4 (and the rewritten reason on _SAFE_WORD_COMMANDS): no verified M109 wait
+            # is carried across this line — the calibration body is a binary-only library whose
+            # strings carry heater commands, so it may heat. The commanded target stands (the
+            # wait gates compare against it, not against None), but the wait in force is
+            # dropped: the next extrusion or purge needs a fresh M109 at the target, which the
+            # stock start template issues right after the mesh. Head-folded like every command
+            # word here, so the lowercase spelling resets it just the same.
+            waited, mesh_seen = None, True
             continue
         if head == "M6211":  # Elegoo's flush: its T selects filament and its Q/R/S heat the nozzle
             if unload_seen:
@@ -1352,7 +1377,7 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                 raise _refuse(f"the purge command {line[:40]!r} extrudes at a commanded nozzle "
                               f"target of {nozzle_target:g} °C that no M109 was ever waited at "
                               "(the most recent verified wait was "
-                              + (f"{waited:g} °C" if waited is not None else "no M109 at all")
+                              + _wait_lost()
                               + ") — heat and wait at the purge temperature first")
             # the purge's own parameters, read the way this printer's firmware reads them: its T is
             # a filament switch and its Q, R and S are the setpoints it heats to (see _PURGE_FIELDS
@@ -1420,7 +1445,7 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                     raise _refuse(f"{where} extrudes at a commanded nozzle target of "
                                   f"{nozzle_target:g} °C that no M109 was ever waited at (the most "
                                   "recent verified wait was "
-                                  + (f"{waited:g} °C" if waited is not None else "no M109 at all")
+                                  + _wait_lost()
                                   + ") — every extrusion must follow a verified M109 wait at the "
                                   "temperature it runs at, and a target changed after the wait "
                                   "needs another M109 at the new value")
