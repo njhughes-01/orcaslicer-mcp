@@ -1460,7 +1460,13 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                     nozzle_target, waited = 0.0, (0.0 if head == "M109" else waited)
                     pending_tool_temp = None  # a cooldown replaces any pending tool-change setpoint
                 elif head == "M104":      # a setpoint without a wait — an allowed preheat, but
-                    if (waited is not None and current_tool is not None and value != waited
+                    # both exceptions below stand on a wait that is IN FORCE, not merely the last
+                    # one recorded: after an intervening bare M104 (a cooldown to 100, say) the
+                    # target has moved off the wait and nothing verified has been re-armed, so a
+                    # later M104 back to a declared number is an ordinary unverified setpoint
+                    # (review finding, PR #13: a stale `waited` must never resurrect a wait)
+                    armed = waited is not None and nozzle_target == waited
+                    if (armed and current_tool is not None and value != waited
                             and waited == _declared_for_tool(firsts_pre, current_tool)
                             and value == _declared_for_tool(nozzles_pre, current_tool)):
                         # design 2: the slicer's own layer-two transition on every Klipper
@@ -1479,7 +1485,7 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                             extrusion_temps.append(value)
                         if value not in per_tool_temps.setdefault(current_tool, []):
                             per_tool_temps[current_tool].append(value)
-                    elif (waited is not None and current_tool is not None and value != waited
+                    elif (armed and current_tool is not None and value != waited
                             and _other_tool_declares(nozzles_pre, current_tool, value)):
                         # design 3a: the wipe-tower tool change as the slicer writes it — the
                         # observed order is M104 S<next>, a G1 E-2 retract, travel, then the
@@ -1567,6 +1573,32 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                     "the outgoing filament behind that wait, so Q must be the temperature that "
                     "filament printed at")
             steady_dest = _declared_for_tool(nozzles_pre, purge.tool)
+            if pending_tool_temp is not None and (purge.final != pending_tool_temp
+                                                  or pending_tool_temp != steady_dest
+                                                  or nozzle_target != pending_tool_temp):
+                # design 3a-b, exactly: the wipe tower's setpoint is the incoming tool's declared
+                # steady temperature and the purge's S is that very number — a purge whose S is
+                # something else would leave the pending setpoint silently consumed and the
+                # print continuing at a temperature the purge never waited at (review finding,
+                # PR #13)
+                raise _refuse(
+                    f"the purge command {line[:36]!r} sets S to {purge.final:g} °C while the "
+                    f"wipe tower commanded a tool-change setpoint of {pending_tool_temp:g} °C "
+                    "before it" + ("" if steady_dest is None or steady_dest == pending_tool_temp
+                                   else f" (and the file declares {steady_dest:g} °C for tool "
+                                        f"{purge.tool})")
+                    + " — a mixed-temperature change must end with the purge waiting at the "
+                    "incoming tool's declared steady temperature, the one the tower set")
+            if current_tool is not None and purge.tool == current_tool and purge.final != waited:
+                # a purge naming the channel already loaded is one the firmware may skip outright
+                # (M6211 step 0 returns early when the tray is the current one — firmware-macros.md),
+                # so its internal M109 at S may never run: such a purge can carry no wait of its
+                # own, and its S must be the wait already in force (review finding, PR #13)
+                raise _refuse(
+                    f"the purge command {line[:36]!r} switches to tool {purge.tool}, the tool "
+                    f"already in force, and sets S to {purge.final:g} °C while the verified wait "
+                    f"is {waited:g} °C — the firmware may skip a same-channel purge entirely, so "
+                    "its S is no wait; heat and wait at the new temperature with an M109 instead")
             if purge.final != waited and purge.final != steady_dest:
                 dest_text = "declared for it" if steady_dest is None else \
                     f"{steady_dest:g} °C the file declares for tool {purge.tool}"
@@ -1641,6 +1673,7 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                                   "that is the heater off, and an extrusion there would be a cold one")
                 if waited != nozzle_target:
                     if (pending_tool_temp is not None and waited is not None
+                            and nozzle_target == pending_tool_temp
                             and all(v < 0.0 for v in e_values)):
                         # design 3a: the wipe-tower retract behind a pending tool-change setpoint.
                         # The hot end still holds the verified wait (the M104 only moved the

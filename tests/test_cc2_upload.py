@@ -535,6 +535,52 @@ def test_a_longer_per_tool_list_is_the_spare_filaments_of_a_larger_project():
                                "steady nozzle temperature", [0]) == ["210", "210"]
 
 
+def test_a_same_channel_purge_cannot_carry_a_new_wait():
+    # review finding (PR #13): M6211 naming the tool already loaded may be skipped outright by
+    # the firmware (step 0 returns early), so its internal M109 at S may never run — a second
+    # same-tool purge claiming S 225 after a 220 wait must refuse, never be recorded as waited
+    base = gcode_text(nozzle_first=220.0, nozzle=225.0)
+    probe = base.replace("M109 S225\n", "M6211 T0 L0 M523 N523 Q220 R220 S225\nT0\n", 1)
+    assert probe != base
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "already in force" in bad.value.message and "Nothing was sent" in bad.value.message
+
+
+def test_a_stale_wait_never_resurrects_the_layer_two_exception():
+    # review finding (PR #13): after M109 S220 a bare M104 S100 moves the target off the wait;
+    # a later M104 S225 (the declared steady temperature) is then an ordinary unverified
+    # setpoint, not the layer-two transition — the wait must be IN FORCE for the exception
+    base = gcode_text(nozzle_first=220.0, nozzle=225.0)
+    probe = base.replace("M109 S225\n", "M104 S100\nG4 S600\nM104 S225\n", 1)
+    assert probe != base
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "no M109 was ever waited" in bad.value.message
+    # the genuine transition (wait in force at 220, M104 to the declared 225) still passes
+    ok = base.replace("M109 S225\n", "M104 S225\n", 1)
+    s = up.parse_gcode_text(ok)
+    assert s.tools[0].extrusion_nozzle_temps == (220.0, 225.0)
+
+
+def test_a_pending_tool_setpoint_must_be_the_purges_s():
+    # review finding (PR #13): the wipe tower commanded 220 for the incoming tool; a purge whose
+    # S is 210 (the old wait) must refuse rather than silently consume the pending setpoint
+    frame = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+    assert frame != _two_tool_frame()
+    change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
+    assert change in frame
+    bad_probe = frame.replace(change, "M104 S220\nG1 E-2 F1800\n" + change, 1)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(bad_probe)
+    assert "tool-change setpoint of 220" in bad.value.message
+    # and the honest mixed-temperature change (S 220) passes, with 220 on tool 1 only
+    good = frame.replace(change, "M104 S220\nG1 E-2 F1800\n"
+                         + change.replace("S210", "S220"), 1).replace("T1\nM109 S210", "T1\nM109 S220", 1)
+    s = up.parse_gcode_text(good)
+    assert 220.0 in s.tools[1].extrusion_nozzle_temps and 220.0 not in s.tools[0].extrusion_nozzle_temps
+
+
 def test_an_empty_position_in_a_per_tool_list_refuses_instead_of_shifting_tool_numbers():
     # review finding (PR #11): ``PLA;;PETG`` once collapsed to ["PLA", "PETG"], handing tool 2's
     # PETG to tool 1 — for a per-tool key the position IS the tool number, so a blank is a tool
