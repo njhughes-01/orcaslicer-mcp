@@ -3468,6 +3468,16 @@ async def cc2_set_auto_refill(
     return await _cc2_auto_refill_tool(_cc2_canvas.refill_params(want), confirm)
 
 
+def _cc2_tray_unverified(reply: dict) -> dict:
+    """The two labels the tray write promises on every reply, refusals included: method 2003 has
+    never been sent to a CC2 by anyone on this project, so a refusal from this tool is as unverified
+    as its acceptance would be, and the reply says so in the same two fields on every exit."""
+    reply = dict(reply)
+    reply.setdefault("verified_on_this_printer", False)
+    reply.setdefault("unverified", _cc2_tray.UNVERIFIED)
+    return reply
+
+
 async def _cc2_tray_filament_tool(params: dict, confirm: bool) -> dict:
     """The one body behind cc2_set_tray_filament, and the same two phases every other CC2 control
     runs. Like every direct tool it can only reach a printer once one is configured; with no address
@@ -3487,7 +3497,7 @@ async def _cc2_tray_filament_tool(params: dict, confirm: bool) -> dict:
     own."""
     async with _cc2_session() as sess:
         if sess.transport is None:
-            return sess.error
+            return _cc2_tray_unverified(sess.error)
         try:
             if confirm is True:
                 out = (await _cc2_tray.set_tray_filament(sess.transport,
@@ -3495,7 +3505,7 @@ async def _cc2_tray_filament_tool(params: dict, confirm: bool) -> dict:
             else:
                 out = await _cc2_tray.read_preview(sess.transport, params)
         except PrinterError as e:
-            return _cc2_err(e)
+            return _cc2_tray_unverified(_cc2_err(e))
         return _cc2_out(out)
 
 
@@ -3575,7 +3585,7 @@ async def cc2_set_tray_filament(
     try:
         params = _cc2_tray.parse_request(tray_id, filament_name, colour, brand, canvas_id)
     except PrinterError as e:
-        return _cc2_err(e)
+        return _cc2_tray_unverified(_cc2_err(e))
     return await _cc2_tray_filament_tool(params, confirm)
 
 

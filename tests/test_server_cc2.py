@@ -1706,6 +1706,28 @@ async def test_an_unknown_filament_name_refuses_the_tray_write_before_any_sessio
     json.dumps(out)
 
 
+async def test_every_tray_write_refusal_carries_the_two_unverified_labels(monkeypatch, no_network,
+                                                                           no_open):
+    # the spec's "every reply" includes the refusals: the catalog refusal (before any session), the
+    # no-address refusal (the seam's own error) and the gate refusal (a PrinterError from the module)
+    # all carry the same two labels the preview and the accepted write carry
+    monkeypatch.delenv("ORCA_CC2_URL", raising=False)
+    no_config = await srv.cc2_set_tray_filament(tray_id=3, filament_name="PLA", colour="#00B0F0")
+    assert no_config["error"] == "not_configured"
+    unknown = await srv.cc2_set_tray_filament(tray_id=3, filament_name="Unobtainium",
+                                              colour="#00B0F0")
+    assert unknown["reason"] == "filament_name"
+    transport = open_fake(monkeypatch, healthy_status(method_1002=copy.deepcopy(PRINTING_1002)))
+    busy = await srv.cc2_set_tray_filament(tray_id=3, filament_name="PLA", colour="#00B0F0",
+                                           confirm=True)
+    assert busy["reason"] == "machine_not_idle"
+    for out in (no_config, unknown, busy):
+        assert out["verified_on_this_printer"] is False, out
+        assert out["unverified"] == srv._cc2_tray.UNVERIFIED, out
+        json.dumps(out)
+    assert transport.methods() == [srv._cc2_state.METHOD_STATUS]
+
+
 # --------------------------------------------------------------------------- 5. upload, end to end through the real adapter
 
 async def test_upload_sends_parse_verifies_and_receipts_with_no_secrets(
