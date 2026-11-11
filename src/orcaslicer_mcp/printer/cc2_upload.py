@@ -828,8 +828,9 @@ def _config_per_tool(config: dict[str, list[str]], key: str, label: str,
     # filaments (a two-colour print from a four-filament project, a one-colour print from a
     # two-filament one — the CANVAS sync fills all four slots): the extra entries belong to tools
     # the file never selects, which never extrude and are never mapped, and a purge must still
-    # name a selected tool (checked below in the scan). So they are read and ignored, never
-    # refused (review finding, PR #11); only the selected tools' entries are returned.
+    # name a selected tool (checked below in the scan). So they are read and left in place,
+    # never refused (review finding, PR #11): the whole list is returned, callers index it by
+    # tool number, and the spare entries are only ever range-checked as numbers, never mapped.
     return values
 
 

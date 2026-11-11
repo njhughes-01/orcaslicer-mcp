@@ -82,3 +82,8 @@ of decision 3:
 13. **Receipt union.** The flat `extrusion_nozzle_temps` must equal the union of the tools'
     lists in both directions, and every entry must be a commanded setpoint; the looser rule task
     1.3 allowed is dropped.
+
+## Follow-up (Opus review round 2, not in this change)
+- Plate/bed keys are still read as one value (`_config_single`): a project whose spare filament
+  has a different bed temperature (`hot_plate_temp = 60,60,70,70`) refuses the file. Fails safe.
+  Next change: read bed keys per tool and require agreement only among the selected tools.
