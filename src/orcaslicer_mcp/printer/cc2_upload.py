@@ -362,8 +362,13 @@ _SAFE_WORD_COMMANDS: dict[str, str] = {
     # Klipper extended-G-code words the fixture issues. A word-form name not listed here is a macro
     # whose body this adapter cannot read, whatever it is called.
     "BED_MESH_CALIBRATE": "runs a bed-probe pass and applies mesh compensation. It can move the Z "
-                          "axis and probe the bed, which cannot make an extrusion cold: it sets no "
-                          "nozzle target (so every M109 rule still binds), and it pushes no filament",
+                          "axis and probe the bed, and it pushes no filament by itself. It is NOT "
+                          "read as setting no nozzle target: the calibration body is a binary-only "
+                          "library whose strings carry heater commands (M109 S140, M140/M190, G180 "
+                          "numbers that wait), so it may change nozzle targets, and no verified "
+                          "M109 wait is carried across this line — the next extrusion needs a "
+                          "fresh M109, which the stock start template issues before any "
+                          "extrusion",
     "SET_PRESSURE_ADVANCE": "sets the pressure-advance coefficient, a flow-tuning number: it "
                             "commands no temperature and extrudes nothing by itself",
     "SET_PRINT_STATS_INFO": "records layer/bookkeeping numbers for the display; no mechanism",
@@ -465,8 +470,10 @@ _G180_HINT = (
     "with its body, its accounting and a test, or re-slice without it.")
 
 # An S number the firmware could select: the letter, then at most three decimal digits (``S7``,
-# ``S07``). The firmware reads it with get_int, so leading zeros select the same macro, and it loads
-# S1..S998, so anything longer is not a number that table can hold. Everything else — ``S7.5``,
+# ``S07``). The firmware reads it with get_int, so leading zeros select the same macro. It loads
+# templates S1..S998, but its select runs only ``0 < S < tws.size()`` and tws.size() is 998, so
+# the usable range is S1–S997 (S998 is loaded but can never be selected); anything longer is not
+# a number that dispatcher can run. Everything else — ``S7.5``,
 # ``S-7``, ``S+7``, ``S0x7``, ``S{nozzle_temperature}`` (an unresolved template), a bare ``S`` or a
 # missing parameter — cannot be pinned to one macro and is refused.
 _G180_S_RE = re.compile(r"^S([0-9]{1,3})$")
@@ -495,7 +502,7 @@ def _g180_macro(line: str, rest: str) -> _G180Macro:
     m = _G180_S_RE.match(tokens[0])
     if not m:
         raise _refuse(f"the command {quote} selects G180 macro {raw[0]!r}, not an S<number> "
-                      "within the S1-S998 the firmware's [g180] table can hold", hint=_G180_HINT)
+                      "within the S1-S997 the firmware's [g180] dispatcher can select", hint=_G180_HINT)
     number = int(m.group(1))
     if macro := _G180_MACROS.get(number):
         return macro
@@ -526,6 +533,16 @@ _COMMAND_POLICY_HINT = (
     "Either re-slice without that command, or establish from the firmware what it does to heater and "
     "extrusion state and add it to the allow list in printer/cc2_upload.py with its reason and a "
     "test. Nothing outside that list is ever sent.")
+
+# M600 is not on the allow list and stays off it — the parser does not read it and the file is
+# refused — but "an unread code" alone under-sells what it is: the published firmware makes it a
+# filament-change pause that runs its load macro and an M109 whose temperature defaults to 250 °C
+# (CentauriCarbon2 firmware, filament_load_unload.cpp#L25,L45-L66; Orca's machine_pause_gcode).
+# The hint says so, so the human re-slicing knows what the pause would have done.
+_M600_HINT = (
+    "M600 is the CC2 firmware's filament-change pause: it runs its filament-load macro and an "
+    "M109 whose temperature defaults to 250 °C — a wait at a setpoint the file never commands. "
+    "It stays off the allow list; re-slice without a pause.")
 
 # The character cap server._cc2_out puts on every string of a reply, mirrored here because the parser
 # cannot import the server (the layering runs the other way). tests/test_cc2_upload.py pins the two
@@ -601,6 +618,10 @@ def _command_policy(head: str, line: str, rest: str | None = None) -> PrinterErr
             return _refuse(
                 f"the command {line[:32]!r} is a padded or welded spelling of {plain}; this parser "
                 "cannot track its state changes", hint=_COMMAND_POLICY_HINT)
+        if plain == "M600":
+            # unread and refused like any other off-list code; only the hint is more specific, so
+            # the refusal names what the pause really is (see _M600_HINT)
+            return _refuse(f"the command {line[:32]!r} {unread_code}", hint=_M600_HINT)
         # a code this parser simply does not read at all (M141's chamber heater, M82, a G38.2 probe
         # move, a padded G00)
         return _refuse(f"the command {line[:32]!r} {unread_code}", hint=_COMMAND_POLICY_HINT)
@@ -675,7 +696,10 @@ class Cc2GcodeSettings:
     ``ToolSettings.flush_nozzle_temps`` instead. Heater-off commands (S0) are cooldowns, not
     setpoints, and read out. ``tool_index`` is the first selected tool, the one the flat fields
     describe; ``tools`` carries every selected tool with its own material, setpoints, verified
-    extrusion temperatures and flush temperatures."""
+    extrusion temperatures and flush temperatures. ``printer_model`` is the file's own
+    ``; printer_model =`` config value, which the upload gate demands name this printer exactly —
+    an unequal or missing value refuses before this dataclass ever exists, so a value here is
+    always the accepted one."""
     material: str
     nozzle_first_layer_temp: float
     nozzle_temp: float
@@ -687,6 +711,7 @@ class Cc2GcodeSettings:
     extrusion_nozzle_temps: tuple[float, ...]
     bed_plate: str
     tools: tuple[ToolSettings, ...]
+    printer_model: str
 
 
 _REFUSE_PREFIX = ("The G-code file cannot be uploaded through this workflow. Nothing was sent "
@@ -702,6 +727,14 @@ def _refuse(what: str, hint: str | None = None) -> PrinterError:
     the end, which the hint repeats."""
     return PrinterError("protocol_error", _REFUSE_PREFIX + what[:1].upper() + what[1:],
                         hint=hint, reason="gcode_unreadable")
+
+
+def _model_refuse(what: str) -> PrinterError:
+    """A refusal whose reason is ``printer_model``: the file's own printer_model line says it was
+    not sliced for the one printer this workflow serves. Same promise-first ordering as every
+    refusal; a distinct reason so a caller can tell "wrong printer" from "unreadable file"."""
+    return PrinterError("protocol_error", _REFUSE_PREFIX + what[:1].upper() + what[1:],
+                        hint=_MODEL_HINT, reason="printer_model")
 
 
 def _config_value(raw: str) -> list[str]:
@@ -734,8 +767,14 @@ def _collect_config(lines: Iterable[str]) -> dict[str, list[str]]:
     return config
 
 
+# The one printer this adapter reads the published firmware of and uploads to (design 1): a
+# file's own printer_model config value must name it exactly, or the file is refused at upload.
+CC2_PRINTER_MODEL = "Elegoo Centauri Carbon 2"
+_MODEL_HINT = ("Re-slice with the stock Elegoo Centauri Carbon 2 printer profile: this workflow "
+               "reads that printer's published firmware and uploads only to it.")
+
 _WANTED_KEYS = frozenset({"filament_type", "nozzle_temperature", "nozzle_temperature_initial_layer",
-                          "nozzle_temperature_range_high",
+                          "nozzle_temperature_range_high", "printer_model",
                           "curr_bed_type", "hot_plate_temp_initial_layer", "hot_plate_temp",
                           "cool_plate_temp_initial_layer", "cool_plate_temp",
                           "textured_plate_temp_initial_layer", "textured_plate_temp",
@@ -978,9 +1017,9 @@ _PURGE_FIELDS: dict[str, tuple[str, float, float, bool]] = {
 # retract lengths. None commands a heater and none selects a tool, and the purge as a whole is already
 # counted as one gated extrusion, so these are read for being numbers and never for their values: the
 # receipt claims what the hot end provably ran at, never how much filament the purge pushed. These
-# thirteen letters and no others are what ``CMD_M6211`` looks up, so a fourteenth is refused rather
-# than assumed inert — unread is not inert, which is the rule every other command in this file is
-# held to.
+# nine beside the five setpoint letters of ``_PURGE_FIELDS`` are the fourteen letters and no others
+# that ``CMD_M6211`` looks up, so a fifteenth is refused rather than assumed inert — unread is not
+# inert, which is the rule every other command in this file is held to.
 _PURGE_OTHERS = frozenset({"K", "L", "M", "N", "I", "J", "P", "C", "D"})
 
 # Why each setpoint letter matters, in the refusal that names it.
@@ -1051,7 +1090,7 @@ def _purge_parameters(line: str, rest: str) -> _Purge:
                           if letter not in _PURGE_FIELDS and letter not in _PURGE_OTHERS}):
         raise _refuse(
             f"the purge command {line[:36]!r} carries {unknown[0]}, a parameter letter "
-            "CMD_M6211 never looks up; it may be inert and it may be a typo for one of the thirteen "
+            "CMD_M6211 never looks up; it may be inert and it may be a typo for one of the fourteen "
             "that are not, and this parser does not guess which about a hot end that is about to "
             "extrude")
     letters = [letter for letter, _ in pairs]
@@ -1171,6 +1210,24 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     for, which ends up recorded as each tool's flush temperature for the start to report."""
     text_lines = list(lines)  # small files in tests, real files streamed by the upload; either way once
     config = _collect_config(text_lines)
+
+    # The printer-model gate (design 1) reads first, before any other setting: this workflow
+    # judges every command against one printer's published firmware and uploads to the one
+    # printer it is configured to reach, so a file sliced for any other machine is refused for
+    # the fact that matters whatever its other settings would have said. A missing line refuses
+    # naming the absence, a list that disagrees with itself refuses naming the values, and a
+    # value that is not the one model refuses naming what the file said. The gate lives at the
+    # upload; the receipt is unchanged.
+    try:
+        printer_model = _config_single(config, "printer_model", "printer model")
+    except PrinterError as bad:
+        raise PrinterError("protocol_error", bad.message, hint=_MODEL_HINT,
+                           reason="printer_model") from None
+    if printer_model != CC2_PRINTER_MODEL:
+        raise _model_refuse(f"its printer model is {printer_model!r}, not {CC2_PRINTER_MODEL!r}: "
+                            "this workflow reads one printer's published firmware and uploads to "
+                            "that one printer, so a file sliced for another machine refuses no "
+                            "matter how sane its other settings are")
 
     # the plate decides the bed keys and needs no tool knowledge, so it is read up front; the
     # per-tool keys (material, the two nozzle setpoints) are read after the scan below, because
@@ -1510,7 +1567,8 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                             nozzle_setpoints=tuple(nozzle_cmds), bed_setpoints=tuple(bed_cmds),
                             extrusion_nozzle_temps=tuple(extrusion_temps),
                             bed_plate=plate_word,
-                            tools=tool_settings)
+                            tools=tool_settings,
+                            printer_model=printer_model)
 
 
 def parse_gcode_text(text: str) -> Cc2GcodeSettings:

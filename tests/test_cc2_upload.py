@@ -69,7 +69,9 @@ def gcode_text(*, material="PETG", plate="High Temp Plate",
     as on its own, a repeat ``M109`` before the purge move, one mid-print ``M140`` carrying the
     layer-apply temperature, the end block's S0 cooldowns, then the tail config block. The traps
     are load-bearing: ``M6211`` carries a T parameter, and the template config lines quote whole
-    start-G-code programs — a parser that reads comments or substrings as commands fails here."""
+    start-G-code programs — a parser that reads comments or substrings as commands fails here.
+    Every frame it writes declares the CC2 printer model (design 1's gate): omit it with
+    ``omit=("model",)``."""
     o = set(omit)
 
     def cmd(line, key):
@@ -101,6 +103,8 @@ def gcode_text(*, material="PETG", plate="High Temp Plate",
     if tail_cool:
         text += "M104 S0\nM140 S0 ;Turn-off bed\n"
     text += "; CONFIG_BLOCK_START\n"
+    if "model" not in o:
+        text += "; printer_model = Elegoo Centauri Carbon 2\n"
     if plate is not None and "plate" not in o:
         text += f"; curr_bed_type = {plate}\n"
     if material is not None and "material" not in o:
@@ -305,7 +309,8 @@ def _two_tool_frame(*, r_flush=240.0, range_high="240,240", nozzle=210.0):
             f"M6211 A1 L200 T0 Q{n} R{n} S{n}", "T0", f"M109 S{n}", "G1 E6 F251.567",
             f"M6211 T1 L34.9 M523 N523 Q{n} R{r_flush:g} S{n}", "T1", f"M109 S{n}",
             "G1 E3 F251.567", "M104 S0", "M140 S0"]
-    cfg = ("; curr_bed_type = High Temp Plate\n; filament_type = PLA;PLA\n"
+    cfg = ("; printer_model = Elegoo Centauri Carbon 2\n"
+           "; curr_bed_type = High Temp Plate\n; filament_type = PLA;PLA\n"
            f"; nozzle_temperature = {n},{n}\n"
            f"; nozzle_temperature_initial_layer = {n},{n}\n"
            f"; nozzle_temperature_range_high = {range_high}\n"
@@ -356,6 +361,8 @@ def test_the_two_tool_fixture_parses_to_two_pla_tools_at_210_flushing_at_240_on_
     # (tests/fixtures/cc2_two_tool.gcode.xz; raw .gcode is ignored by the repo rule).
     text = gcode_fixture("cc2_two_tool")
     s = up.parse_gcode_text(text)
+    # design 1: the real slice names the one printer this workflow serves, and the parse says so
+    assert s.printer_model == "Elegoo Centauri Carbon 2"
     assert [t.tool_index for t in s.tools] == [0, 1]
     assert [t.material for t in s.tools] == ["PLA", "PLA"]
     assert all((t.nozzle_first_layer_temp, t.nozzle_temp) == (210.0, 210.0) for t in s.tools)
@@ -369,6 +376,31 @@ def test_the_two_tool_fixture_parses_to_two_pla_tools_at_210_flushing_at_240_on_
     assert s.nozzle_setpoints == (140.0, 210.0)
     # and the real slice writes its speed overrides (M220 S100) — allowed by design 5, below
     assert "M220 S100" in text
+
+
+def test_a_file_not_sliced_for_the_centauri_carbon_2_refuses_naming_what_it_said():
+    # design 1's gate: this workflow judges every command against one printer's published
+    # firmware and uploads to that one printer, so the file's own printer_model must name it
+    # exactly. A near-miss name refuses and quotes it back; the accepted frame carries it.
+    near = gcode_text().replace("; printer_model = Elegoo Centauri Carbon 2",
+                                "; printer_model = Elegoo Centauri 2", 1)
+    assert near != gcode_text()
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(near)
+    assert bad.value.details["reason"] == "printer_model"
+    assert "'Elegoo Centauri 2'" in bad.value.message and "Nothing was sent" in bad.value.message
+
+
+def test_a_file_with_no_printer_model_line_refuses_naming_its_absence():
+    # a file that never says what it was sliced for is a file sliced for an unknown machine —
+    # refused for the same reason as a wrong name, with the missing key on the record
+    missing = gcode_text(omit=("model",))
+    assert "printer_model" not in missing
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(missing)
+    assert bad.value.details["reason"] == "printer_model"
+    assert "no '; printer_model =' config line" in bad.value.message
+    assert "Nothing was sent" in bad.value.message
 
 
 def test_a_flush_r_may_stand_off_the_verified_target_only_as_both_tools_declared_range_high():
@@ -581,6 +613,7 @@ def test_the_plate_decides_which_bed_keys_count():
     cool = (
         "M104 S140\nM140 S50\nM190 S50 A\nM109 S240\nT0\nM109 S240\n"
         "M140 S45\nM104 S0\nM140 S0\n"
+        "; printer_model = Elegoo Centauri Carbon 2\n"
         "; curr_bed_type = Cool Plate\n; filament_type = PLA\n"
         "; nozzle_temperature = 240\n; nozzle_temperature_initial_layer = 240\n"
         "; hot_plate_temp = 60\n; hot_plate_temp_initial_layer = 60\n"
@@ -607,7 +640,8 @@ def test_a_file_naming_no_plate_is_refused():
 def _heat_frame(*lines, material="PLA", plate="High Temp Plate", nozzle=240.0, bed=60.0):
     """A minimal single-tool file with these command lines and this config block, the commands
     kept verbatim and in the order given — so an order test tests exactly its own order."""
-    cfg = (f"; curr_bed_type = {plate}\n; filament_type = {material}\n"
+    cfg = ("; printer_model = Elegoo Centauri Carbon 2\n"
+           f"; curr_bed_type = {plate}\n; filament_type = {material}\n"
            f"; nozzle_temperature = {nozzle:g}\n"
            f"; nozzle_temperature_initial_layer = {nozzle:g}\n"
            f"; hot_plate_temp = {bed:g}\n; hot_plate_temp_initial_layer = {bed:g}\n")
@@ -706,6 +740,7 @@ def test_a_bed_cooldown_mid_file_is_not_the_nozzle_rule():
     text = ("M104 S140\nM140 S60\nM190 S60 A\nM109 S240\nT0\nG1 E6 F131.773\n"
             "M140 S0 ; bed off for a moment\nM140 S60\nG1 E3 F120\n"
             "M104 S0\nM140 S0\n"
+            "; printer_model = Elegoo Centauri Carbon 2\n"
             "; curr_bed_type = High Temp Plate\n; filament_type = PLA\n"
             "; nozzle_temperature = 240\n; nozzle_temperature_initial_layer = 240\n"
             "; hot_plate_temp = 60\n; hot_plate_temp_initial_layer = 60\n")
@@ -723,13 +758,15 @@ def test_no_printing_temperature_range_is_hardcoded_anywhere(preheat, first, lat
     # (no verified wait), never by any threshold it hardcodes — 90 or 120 for a preheat, 315 or
     # 235 for the print — because the printing range belongs to the CANVAS spool at start
     if plate == "cool plate":
-        cfg = (f"; curr_bed_type = Cool Plate\n; filament_type = PLA\n"
+        cfg = ("; printer_model = Elegoo Centauri Carbon 2\n"
+               f"; curr_bed_type = Cool Plate\n; filament_type = PLA\n"
                f"; nozzle_temperature = {later:g}\n"
                f"; nozzle_temperature_initial_layer = {first:g}\n"
                f"; cool_plate_temp = 45\n; cool_plate_temp_initial_layer = 50\n")
         bed_cmds = "M140 S50\nM190 S50 A\nM140 S45\n"
     else:
-        cfg = (f"; curr_bed_type = High Temp Plate\n; filament_type = PETG\n"
+        cfg = ("; printer_model = Elegoo Centauri Carbon 2\n"
+               f"; curr_bed_type = High Temp Plate\n; filament_type = PETG\n"
                f"; nozzle_temperature = {later:g}\n"
                f"; nozzle_temperature_initial_layer = {first:g}\n"
                f"; hot_plate_temp = 70\n; hot_plate_temp_initial_layer = 70\n")
@@ -751,7 +788,7 @@ def test_no_printing_temperature_range_is_hardcoded_anywhere(preheat, first, lat
 # M140/M104 before it ever reaches the reproduction; to test the reproductions' *own* case-
 # insensitivity we fold just their command words and leave the config and the rest as written.
 _CONFIG_PREFIXES = ("; curr_bed_type", "; filament_type", "; nozzle_temp", "; hot_plate",
-                    "; cool_plate", "; eng_plate", "; textured_plate")
+                    "; cool_plate", "; eng_plate", "; textured_plate", "; printer_model")
 
 
 def _fold(text: str, *, upper: bool) -> str:
@@ -1417,7 +1454,7 @@ def test_the_purges_tool_may_be_the_files_only_tool_while_a_frame_with_no_select
     ("M6211 A L200 T0 Q260 R260 S260", "A"),             # a bare flag: stoi reads an uninitialised int
     ("M6211 A1 L200 T0 Q2o0 R260 S260", "Q"),            # not a number at all
     ("M6211 A1 L200 T0 Q=260 R260 S260", "Q"),           # an = where a digit belongs
-    ("M6211 A1 L200 T0 Q260 R260 S260 Z5", "Z"),         # a fourteenth letter: CMD_M6211 reads thirteen
+    ("M6211 A1 L200 T0 Q260 R260 S260 Z5", "Z"),         # a fifteenth letter: CMD_M6211 reads fourteen
     ("M6211 A1 L200 T0 Q260 R260 S260 E5", "E"),         # even an E, whose meaning nobody would guess
 ])
 def test_a_purge_value_the_firmware_would_not_read_as_written_refuses(purge, letter):
