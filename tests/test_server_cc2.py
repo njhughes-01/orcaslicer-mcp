@@ -1,5 +1,5 @@
-"""The sixteen direct CC2 tools exactly as the server wires them, against scripted fakes: the
-adapters, the reply sanitiser, and what happens before a printer is ever configured. The sixteen are
+"""The seventeen direct CC2 tools exactly as the server wires them, against scripted fakes: the
+adapters, the reply sanitiser, and what happens before a printer is ever configured. The seventeen are
 declared the way every other tool on this server is, so the default posture is proven first: with no
 ORCA_CC2_URL set — the fixture clears it, every credential variable and every receipt store for the
 whole module — each tool answers not_configured with printer_contacted=false, and NOTHING touches the
@@ -43,7 +43,14 @@ a confirmed reply each have to carry `verified_on_this_printer: false` and its s
 by the reply cap), and its read-back is the 2005 `canvas_info` rather than the 1002 status frame, so
 the tests script 2005 and hold that an absent flag stays unknown instead of becoming the status
 reader's default of off — while the one field on the wire is Elegoo's own client's `auto_refill` and
-the older manual's `enable` is proven never to appear in any recorded request.
+the older manual's `enable` is proven never to appear in any recorded request. The CANVAS tray
+filament write (2003) is proven the same way a fourth time, with one gate the other controls do not
+have: the (canvas_id, tray_id) pair must appear in the printer's own 2005 roster, in a unit reporting
+itself connected, on both phases — so these tests script 2005 as well, a preview sends [2005] and
+changes nothing, a confirmed call sends [2005, 2003, 2005] exactly once with the nine derived fields,
+and an unknown material name refuses before a session is even opened, carrying all 50 vendor catalog
+names whole because a name outside the catalog is the type-less, code-less, zero-temperature label
+the vendor's own lookup would build.
 The three information reads (1001 what the printer is, 1046 one file's detail, 1045 one file's
 thumbnail) are proven at the tool layer too, and in the same shapes: the wire carries the parameter
 spelling that method actually wants (1046 filename, 1045 file_name — they are not the same word), a
@@ -58,7 +65,7 @@ had to be cut for size is reported as cut rather than as the whole history, a re
 shape refuses instead of being read as a LAN answer, and a time-lapse link carrying a login never
 leaves the reply.
 
-Fourteen of the sixteen tools share the process's one registered session (printer/cc2_pool.py), because
+Fifteen of the seventeen tools share the process's one registered session (printer/cc2_pool.py), because
 the printer's own broker takes about four clients and reaps a departed one slowly: proven here at the
 layer the calls arrive at — a run of four ordinary calls registers once, two calls at the same moment
 wait for one open instead of each registering, a session the transport reported dead is closed and
@@ -68,12 +75,12 @@ that session was met with, a cancelled call gives its hold back and leaves the s
 next, and the server's own exit closes it (including the exit where stdio failed). The pool's own
 corner cases — the idle window, a configuration change while a call is in flight, a double release —
 are tests/test_cc2_pool.py, and the real-client proof that one registration answers two requests is
-the loopback test in tests/test_cc2_transport_mqtt.py. The sixteenth, `cc2_camera_snapshot`, borrows no
+the loopback test in tests/test_cc2_transport_mqtt.py. The one exception, `cc2_camera_snapshot`, borrows no
 session by design: its picture is one bounded HTTP GET of the printer's own camera stream, so it spends
 none of the printer's client slots — what it shares with the transport is the configuration and the
 address pinning, and its own guards and refusal paths are tests/test_cc2_snapshot.py.
 Discovery is proven last, in fresh interpreters whose environment the test builds from PATH, HOME and
-the variables it names: all sixteen direct tools are listed with no printer config at all, the list is
+the variables it names: all seventeen direct tools are listed with no printer config at all, the list is
 identical when a printer address is configured, the server's other tools come back identical in
 every one of them, and in a child that raises the moment any socket, name lookup, MQTT link or HTTP
 request is attempted, every direct tool still answers not_configured. No live printer, no Home
@@ -506,11 +513,14 @@ ALL_TOOLS = (
     lambda: srv.cc2_set_temperature(heater="bed", target=0, confirm=True),
     lambda: srv.cc2_set_auto_refill(auto_refill=True),
     lambda: srv.cc2_set_auto_refill(auto_refill=False, confirm=True),
+    lambda: srv.cc2_set_tray_filament(tray_id=3, filament_name="PLA", colour="#00B0F0"),
+    lambda: srv.cc2_set_tray_filament(tray_id=3, filament_name="PLA", colour="#00B0F0",
+                                      confirm=True),
 )
 
 
 async def test_with_no_printer_address_every_tool_refuses_with_zero_network(no_network, no_open):
-    # the whole default posture in one place: sixteen tools a client can see and call, no printer
+    # the whole default posture in one place: seventeen tools a client can see and call, no printer
     # configured, and an honest refusal whose every field is plain JSON and whose every promise holds
     for call in ALL_TOOLS:
         out = await call()
@@ -1597,6 +1607,105 @@ async def test_an_auto_refill_value_that_is_not_a_boolean_refuses_before_any_ses
     assert not no_open                              # no session, so nothing could have been sent
 
 
+# ------------------------------------------------- the CANVAS tray filament write (2003) — proven at
+# ------------------------------------------------- the tool layer, roster gate and all
+#
+# The two phases a fourth time, with one gate the other controls do not have: the (canvas_id,
+# tray_id) pair has to appear in the printer's own 2005 roster, in a unit reporting itself connected,
+# on BOTH phases — so the frames below script 2005 too (the observed four-tray roster: A3 active,
+# ELEGOO PETG). The gate's own refusals (unknown tray, disconnected unit, unreadable roster) and the
+# contradiction note are tests/test_cc2_tray.py; what is pinned here is the tool layer's wire: a
+# preview is [2005] with the exact nine-field frame it offers to send, a confirmed call is
+# [2005, 2003, 2005] with that same frame sent once, and an unknown material name refuses before a
+# session opens at all — the vendor lookup is the gate before the gate, and its 50 names ride out
+# whole in the refusal because a name outside it is the type-less, code-less, 0-0 label the vendor's
+# own lookup would build for the tray.
+
+def canvas_tray3(name: str, brand: str, colour: str, mn: int, mx: int) -> dict:
+    """The observed 2005 roster with tray A3 restated as if the printer already showed this write."""
+    frame = copy.deepcopy(CANVAS)
+    entry = frame["canvas_info"]["canvas_list"][0]["tray_list"][3]
+    entry.update({"filament_type": name, "filament_name": name, "brand": brand,
+                  "filament_color": colour, "min_nozzle_temp": mn, "max_nozzle_temp": mx})
+    return frame
+
+
+TRAY_PLA_PARAMS = {"canvas_id": 0, "tray_id": 3, "brand": "ELEGOO", "filament_type": "PLA",
+                   "filament_name": "PLA", "filament_code": "0x0000", "filament_color": "#00B0F0",
+                   "filament_min_temp": 190, "filament_max_temp": 230}
+
+
+async def test_the_tray_filament_preview_reads_state_and_roster_and_never_sends_the_command(monkeypatch):
+    transport = open_fake(monkeypatch, healthy_status())     # 2003 unscripted on purpose:
+    out = await srv.cc2_set_tray_filament(tray_id=3, filament_name="PLA", colour="#00b0f0",
+                                          brand="ELEGOO")    # reaching one would still be recorded
+    assert out["confirm_required"] is True and out["action"] == "set_tray_filament"
+    p = out["preview"]
+    # four values from the call, five derived by the vendor catalog; the colour normalised upper-case
+    assert p["will_send"] == {"method": 2003, "params": TRAY_PLA_PARAMS}
+    assert p["waits_up_to_s"] == 10.0
+    assert p["tray_now"]["tray_id"] == 3 and p["tray_now"]["material"] == "PETG"
+    assert p["tray_now"]["name"] == "ELEGOO PETG"        # the printer's words for the tray, kept
+    # the state the idle gate stood on, in its own field: the printer's number and the doc's word
+    assert p["machine_now"] == {"machine_status": 1, "state": "idle"}
+    # the idle gate's state read, then the roster read — two reads, no command
+    assert transport.methods() == [srv._cc2_state.METHOD_STATUS, srv._cc2_state.METHOD_CANVAS]
+    assert out["verified_on_this_printer"] is False
+    assert out["unverified"] == srv._cc2_tray.UNVERIFIED   # the cap leaves it whole
+    json.dumps(out)
+
+
+async def test_a_confirmed_tray_write_sends_one_2003_with_the_nine_derived_fields(monkeypatch):
+    # the roster is scripted to read back exactly what was sent, so this test pins the wire and the
+    # reply; the contradiction note the disagreeing read earns is tests/test_cc2_tray.py's
+    transport = open_fake(monkeypatch, healthy_status(method_2005=canvas_tray3("PLA", "ELEGOO",
+                                                                               "00B0F0", 190, 230),
+                                                      method_2003={"error_code": 0}))
+    out = await srv.cc2_set_tray_filament(tray_id=3, filament_name="PLA", colour="#00B0F0",
+                                          brand="ELEGOO", confirm=True)
+    assert out["status"] == "accepted" and out["accepted"] is True
+    assert out["method"] == 2003 and out["sent"] == TRAY_PLA_PARAMS
+    assert out["waited_s"] == 10.0 and out["error_code"] is None
+    assert out["observed"]["filament_name"] == "PLA"        # the quiet look agrees, nothing to flag
+    assert out["verified_on_this_printer"] is False         # agreement is not the command's behaviour
+    # the idle gate's state read, the roster read, one command, one look — in that order, and the
+    # 2003 carries the nine fields whole
+    assert transport.methods() == [srv._cc2_state.METHOD_STATUS, srv._cc2_state.METHOD_CANVAS,
+                                   2003, srv._cc2_state.METHOD_CANVAS]
+    assert transport.params_for(2003) == TRAY_PLA_PARAMS
+    assert transport.methods().count(2003) == 1
+    json.dumps(out)
+
+
+async def test_a_printing_machine_refuses_the_tray_write_before_any_2003(monkeypatch):
+    # the 2003 is scripted on purpose: the idle gate runs before the roster read and before the
+    # command, so a machine that calls itself printing refuses having asked nothing at all —
+    # not even the roster — and a command that did leave would show up on the recorded wire
+    transport = open_fake(monkeypatch, healthy_status(method_1002=copy.deepcopy(PRINTING_1002),
+                                                      method_2003={"error_code": 0}))
+    out = await srv.cc2_set_tray_filament(tray_id=3, filament_name="PLA", colour="#00B0F0",
+                                          brand="ELEGOO", confirm=True)
+    assert out["error"] == "protocol_error" and out["reason"] == "machine_not_idle"
+    assert "Nothing was sent" in out["message"] + str(out.get("hint", ""))
+    assert out["printer_says"]                       # the printer's own sentence, in its own field
+    assert transport.methods() == [srv._cc2_state.METHOD_STATUS]   # one read, nothing after it
+    json.dumps(out)
+
+
+async def test_an_unknown_filament_name_refuses_the_tray_write_before_any_session_opens(monkeypatch):
+    # the catalog refusal is the one refusal that never reaches the seam: parse first, session after,
+    # so even a standing scripted printer is never borrowed and no method — not even the roster read
+    # — goes out, and the full 50-name list arrives as its own field rather than a capped sentence
+    transport = open_fake(monkeypatch, healthy_status())
+    out = await srv.cc2_set_tray_filament(tray_id=3, filament_name="Unobtainium", colour="#00B0F0")
+    assert out["error"] == "protocol_error" and out["reason"] == "filament_name"
+    assert "Nothing was sent" in out["message"]
+    assert out["catalog_names"] == srv._cc2_tray.catalog_names()   # whole, in the catalog's order
+    assert len(out["catalog_names"]) == 50
+    assert transport.opens == [] and transport.methods() == []
+    json.dumps(out)
+
+
 # --------------------------------------------------------------------------- 5. upload, end to end through the real adapter
 
 async def test_upload_sends_parse_verifies_and_receipts_with_no_secrets(
@@ -1929,10 +2038,17 @@ async def test_under_a_one_letter_code_every_key_a_tool_answers_is_a_name_the_se
     monkeypatch.setattr(srv, "_cc2_configured_code", lambda: "e")
     _stub_certified_shelf(monkeypatch, 3)
     open_fake(monkeypatch, healthy_status(method_1001=ATTRS_1001, method_1046=DETAIL_1046,
-                                          method_1036=HISTORY_1036))
+                                          method_1036=HISTORY_1036, method_2003={"error_code": 0}))
     replies = [await srv.cc2_status(), await srv.cc2_list_files(), await srv.cc2_printer_info(),
                await srv.cc2_file_detail(filename=DEST), await srv.cc2_print_history(),
                await srv.cc2_pause_print(), await srv.cc2_set_light(on=True)]
+    # the tray write's three answers join the walk: the preview's names, the confirmed reply's names,
+    # and the unknown-name refusal, whose catalog_names rides out as a top-level key of the refusal
+    replies += [await srv.cc2_set_tray_filament(tray_id=3, filament_name="PLA", colour="#00b0f0"),
+                await srv.cc2_set_tray_filament(tray_id=3, filament_name="PLA", colour="#00B0F0",
+                                                brand="ELEGOO", confirm=True),
+                await srv.cc2_set_tray_filament(tray_id=3, filament_name="Unobtainium",
+                                                colour="#00B0F0")]
     replies.append(srv._cc2_err(srv.PrinterError("protocol_error", "simulated refusal",
                                                  reason="gate")))
     seen: set[str] = set()
@@ -2197,11 +2313,26 @@ def test_json_schema_is_mcp_compatible_and_documented():
     assert all(p.get("description") for p in refill["properties"].values())
     assert "plain boolean" in refill["properties"]["auto_refill"]["description"]
     assert "Second-call only" in refill["properties"]["confirm"]["description"]
+    # the tray write is typed the same plain way: the printer's two ids, the vendor catalog's own
+    # material name and a #RRGGBB colour, with brand, canvas_id and confirm defaulted. No type, code
+    # or temperature is an argument and no schema range appears — whether a (canvas_id, tray_id) pair
+    # exists is the printer's roster's answer, which a schema cannot say.
+    tray = tools["cc2_set_tray_filament"].input_schema
+    assert set(tray["required"]) == {"tray_id", "filament_name", "colour"}
+    assert tray["properties"]["tray_id"]["type"] == "integer"
+    assert tray["properties"]["filament_name"]["type"] == "string"
+    assert tray["properties"]["colour"]["type"] == "string"
+    assert tray["properties"]["brand"]["default"] == "Generic"
+    assert tray["properties"]["canvas_id"]["default"] == 0
+    assert tray["properties"]["confirm"]["default"] is False
+    assert not ({"filament_type", "filament_code", "filament_min_temp", "filament_max_temp"}
+                & set(tray["properties"]))      # derived by the catalog, never arguments
+    assert all(p.get("description") for p in tray["properties"].values())
 
 
-def test_annotations_classify_the_sixteen_cc2_tools():
+def test_annotations_classify_the_seventeen_cc2_tools():
     tools = srv.mcp._tool_manager._tools
-    # the whole tool list is the annotation table: sixteen direct tools and everything that predates
+    # the whole tool list is the annotation table: seventeen direct tools and everything that predates
     # them, each with its title and hints, nothing registered that the table does not speak for
     assert set(srv._TOOL_ANNOTATIONS) == set(tools)
     for name in ("cc2_status", "cc2_list_files", "cc2_printer_info", "cc2_file_detail",
@@ -2211,7 +2342,7 @@ def test_annotations_classify_the_sixteen_cc2_tools():
         assert ann.open_world_hint is True and ann.idempotent_hint is None
     for name in ("cc2_upload_gcode", "cc2_start_print", "cc2_pause_print", "cc2_resume_print",
                  "cc2_set_light", "cc2_set_print_speed", "cc2_set_temperature",
-                 "cc2_set_auto_refill"):
+                 "cc2_set_auto_refill", "cc2_set_tray_filament"):
         ann = tools[name].annotations
         assert ann.read_only_hint is False and ann.destructive_hint is False
         assert ann.open_world_hint is True
@@ -2226,7 +2357,7 @@ def test_annotations_classify_the_sixteen_cc2_tools():
 # interpreter. Each child gets a hand-built environment — PATH, HOME and exactly the variables the
 # test names — so it is proven by construction that no credential, printer address or receipt store
 # was present for it to read, let alone echo. What the new posture has to buy is exactly this: the
-# sixteen direct tools are listed by default, a printer address changes nothing about that list, and
+# seventeen direct tools are listed by default, a printer address changes nothing about that list, and
 # the server's other tools come back identical in every case.
 
 BASELINE_TOOLS = frozenset(srv.mcp._tool_manager._tools) - CC2_NAMES
@@ -2261,6 +2392,10 @@ PROBE_CALLS = [
     ("cc2_auto_refill_preview", "cc2_set_auto_refill", {"auto_refill": True}),
     ("cc2_auto_refill_confirmed", "cc2_set_auto_refill",
      {"auto_refill": False, "confirm": True}),
+    ("cc2_tray_filament_preview", "cc2_set_tray_filament",
+     {"tray_id": 3, "filament_name": "PLA", "colour": "#00B0F0"}),
+    ("cc2_tray_filament_confirmed", "cc2_set_tray_filament",
+     {"tray_id": 3, "filament_name": "PLA", "colour": "#00B0F0", "confirm": True}),
 ]
 
 # Every guard in this child is installed before the server is imported, so a name lookup, a socket,
@@ -2326,9 +2461,9 @@ def child(argv: str, env_overrides: dict[str, str], *, home: str | None = None,
     return done.stderr
 
 
-def test_all_sixteen_direct_tools_are_listed_with_no_printer_config(tmp_path):
+def test_all_seventeen_direct_tools_are_listed_with_no_printer_config(tmp_path):
     # the posture Nathan asked for: no read/write switch, no hidden tools. A client pointed at a
-    # server with no printer configured is still shown all sixteen — in an empty HOME, with no
+    # server with no printer configured is still shown all seventeen — in an empty HOME, with no
     # credential anywhere in the child's environment — and every other tool is untouched by it
     names = set(json.loads(child(LIST_TOOLS, {}, home=str(tmp_path))))
     assert CC2_NAMES == frozenset(srv.CC2_TOOL_NAMES)
@@ -2343,7 +2478,7 @@ def test_a_configured_address_changes_nothing_about_what_is_listed(tmp_path):
     assert configured == plain == BASELINE_TOOLS | CC2_NAMES
 
 
-def test_a_child_that_forbids_the_network_lists_all_sixteen_and_refuses_all_sixteen(tmp_path):
+def test_a_child_that_forbids_the_network_lists_all_seventeen_and_refuses_all_seventeen(tmp_path):
     # discovery needs nothing, and a call with nothing configured answers honestly instead of
     # reaching out: the guards in the child raise on the first socket, name lookup, MQTT link or
     # HTTP request, so this test passing IS the zero-network proof
@@ -2373,6 +2508,6 @@ def test_the_probe_child_is_armed_and_fails_when_a_tool_reaches_the_network(tmp_
 
 def test_this_module_leaves_the_direct_tools_listed_as_it_found_them():
     # a hygiene check on the module itself, last by file order: the tests above patch, fake and
-    # restore freely, and this is where a leak would surface. The sixteen are declared at import, so
-    # what a later module must see is exactly those sixteen plus everything that predates them
+    # restore freely, and this is where a leak would surface. The seventeen are declared at import, so
+    # what a later module must see is exactly those seventeen plus everything that predates them
     assert frozenset(srv.mcp._tool_manager._tools) == BASELINE_TOOLS | CC2_NAMES

@@ -348,6 +348,10 @@
     {
       "name": "cc2_set_auto_refill",
       "description": "Turn the configured CC2 printer's CANVAS auto-refill switch on or off with one boolean, and read this before calling it: the setting was changed and restored on one CC2, but automatic refill during a print remains unverified."
+    },
+    {
+      "name": "cc2_set_tray_filament",
+      "description": "Rewrite what one CANVAS tray of the configured CC2 printer says it holds, and read this before calling it: method 2003 has never been sent to a CC2 by anyone on this project, so every reply carries verified_on_this_printer false beside the sentence saying why."
     }
   ],
   "prompts": [
