@@ -49,6 +49,7 @@ from .printer import cc2_snapshot as _cc2_snapshot
 from .printer import cc2_start as _cc2_start
 from .printer import cc2_state as _cc2_state
 from .printer import cc2_temperature as _cc2_temperature
+from .printer import cc2_tray as _cc2_tray
 from .printer import cc2_transport as _cc2_transport
 from .printer import cc2_upload as _cc2_upload
 
@@ -2085,17 +2086,17 @@ async def check_printer_match() -> dict:
 
 
 # --- Direct Elegoo Centauri Carbon 2 printing (configured, never switched on) ----------------
-# Sixteen tools — the reads cc2_status, cc2_list_files, cc2_printer_info, cc2_file_detail,
+# Seventeen tools — the reads cc2_status, cc2_list_files, cc2_printer_info, cc2_file_detail,
 # cc2_file_thumbnail, cc2_print_history and cc2_camera_snapshot, then cc2_upload_gcode,
 # cc2_start_print, the job
 # controls cc2_pause_print, cc2_resume_print and cc2_stop_print, then the peripheral controls
-# cc2_set_light, cc2_set_print_speed and cc2_set_temperature, and the CANVAS switch
-# cc2_set_auto_refill — speak to the
+# cc2_set_light, cc2_set_print_speed and cc2_set_temperature, the CANVAS switch
+# cc2_set_auto_refill and the CANVAS tray filament write cc2_set_tray_filament — speak to the
 # printer directly (LAN discovery, MQTT, HTTP upload, one HTTP camera stream, one start command, one
 # control command) through
 # the printer/cc2_* adapters, with no OrcaSlicer and no Home Assistant in the path.
 #
-# They are declared the way every other tool on this server is: a client sees all sixteen in
+# They are declared the way every other tool on this server is: a client sees all seventeen in
 # tools/list whether or not a printer has been configured. What makes them safe is not hiding them.
 # With no address set (ORCA_CC2_URL empty) every one of them refuses in-process and says so —
 # not_configured, with printer_contacted=false — before any address is resolved and before any
@@ -2108,7 +2109,7 @@ async def check_printer_match() -> dict:
 # One session, not one per call. The printer's own MQTT broker takes about four clients and reaps a
 # departed one on its own clock, so when every tool call registered, used and closed its own session
 # the fourth ordinary call in a row met "too many clients" (reason=client_limit) from an idle,
-# healthy printer. So fourteen of the sixteen tools borrow the process's one registered session through
+# healthy printer. So fifteen of the seventeen tools borrow the process's one registered session through
 # printer/cc2_pool.py: opens are serialised so two simultaneous calls cannot register twice, while
 # requests on an established session run concurrently because the transport matches every answer to
 # the request id it stamped. A session that reports itself dead, or that the configuration left
@@ -2135,11 +2136,11 @@ async def check_printer_match() -> dict:
 # built field by field from the adapters' parsed, fail-closed state, and everything passes through
 # _cc2_out(): strings capped, control characters stripped, non-JSON-safe numbers turned to None.
 
-# The sixteen direct tools, in declaration order: the seven reads first (the live state, the file
+# The seventeen direct tools, in declaration order: the seven reads first (the live state, the file
 # inventory, what the printer is, what one of its files is, what that file looks like, what it has
 # printed before, and what its camera sees), then the
 # upload and the start, then the three job controls, then the three peripheral controls, then the
-# CANVAS auto-refill switch. Each is
+# CANVAS auto-refill switch, then the CANVAS tray filament write. Each is
 # registered by its own @mcp.tool() below, and tests assert that
 # this roster and the registered cc2_* set are the same list, so a decorator lost in a refactor fails
 # a test instead of quietly shrinking what a client is shown.
@@ -2149,6 +2150,7 @@ CC2_TOOL_NAMES: tuple[str, ...] = (
     "cc2_upload_gcode", "cc2_start_print",
     "cc2_pause_print", "cc2_resume_print", "cc2_stop_print",
     "cc2_set_light", "cc2_set_print_speed", "cc2_set_temperature", "cc2_set_auto_refill",
+    "cc2_set_tray_filament",
 )
 
 # Every key name a CC2 reply may carry, as the strings this server and its printer/cc2_* adapters
@@ -3466,6 +3468,127 @@ async def cc2_set_auto_refill(
     return await _cc2_auto_refill_tool(_cc2_canvas.refill_params(want), confirm)
 
 
+def _cc2_tray_unverified(reply: dict) -> dict:
+    """The two labels the tray write promises on every reply, refusals included: method 2003 has
+    never been sent to a CC2 by anyone on this project, so a refusal from this tool is as unverified
+    as its acceptance would be, and the reply says so in the same two fields on every exit."""
+    reply = dict(reply)
+    reply.setdefault("verified_on_this_printer", False)
+    reply.setdefault("unverified", _cc2_tray.UNVERIFIED)
+    return reply
+
+
+async def _cc2_tray_filament_tool(params: dict, confirm: bool) -> dict:
+    """The one body behind cc2_set_tray_filament, and the same two phases every other CC2 control
+    runs. Like every direct tool it can only reach a printer once one is configured; with no address
+    set the session seam refuses in-process, before any method of any kind is sent.
+
+    A call that is not exactly ``confirm=True`` borrows the shared CC2 session and sends exactly one
+    read-only 2005 CANVAS read, and hands back the ``confirm_required`` preview carrying this call's
+    own exact nine-field params and what the printer says that tray holds right now, so what a
+    confirmed call would do is on the record before anything is changed and no command ever leaves
+    the wire on a preview path (the tests watch the recorded wire for exactly that). Unlike the
+    auto-refill switch, a roster that will not answer refuses the change here rather than previewing
+    anyway: a tray the printer never named cannot be written, and a tray write without a readable
+    roster is a write to nowhere. A confirmed call sends the one 2003 command once through the
+    adapter, which never resends an unanswered command. The confirmation is a decision-for-a-human
+    device, not an access control: it carries the user's authorization for this action, which their
+    standing yes for this print or session may already supply, so it obliges no fresh question of its
+    own."""
+    async with _cc2_session() as sess:
+        if sess.transport is None:
+            return _cc2_tray_unverified(sess.error)
+        try:
+            if confirm is True:
+                out = (await _cc2_tray.set_tray_filament(sess.transport,
+                                                         params)).as_dict()
+            else:
+                out = await _cc2_tray.read_preview(sess.transport, params)
+        except PrinterError as e:
+            return _cc2_tray_unverified(_cc2_err(e))
+        return _cc2_out(out)
+
+
+@mcp.tool()
+async def cc2_set_tray_filament(
+    tray_id: Annotated[int, Field(description=(
+        "Which CANVAS tray to rewrite, in the printer's own numbering: 0 to 3, the labels A0 to A3 "
+        "on the physical unit. The (canvas_id, tray_id) pair must be one the printer's own roster "
+        "names and reports connected, or the call refuses before any command is sent — a tray the "
+        "printer never listed cannot be written."))],
+    filament_name: Annotated[str, Field(description=(
+        "The material, as an exact key of the vendor's own catalog (e.g. 'PLA', 'PLA+', 'PETG', "
+        "'ABS'; all 50 names). An unknown name refuses before any session opens and carries the "
+        "valid names in full in its reply. This one lookup is what derives filament_type, "
+        "filament_code and both temperatures — exactly as Elegoo's own tray dialog derives them — "
+        "which is why no type, code or temperature is an argument anywhere here: a caller-supplied "
+        "temperature would be the guess the vendor UI never asks for."))],
+    colour: Annotated[str, Field(description=(
+        "The spool's colour as '#RRGGBB': a leading '#' and six hex digits, typed in any case and "
+        "sent upper-case. Anything else refuses with nothing sent."))],
+    brand: Annotated[str, Field(description=(
+        "Who made the filament: stripped, non-empty, at most 32 characters. The vendor dialog "
+        "offers 'ELEGOO' and 'Generic' and allows free text, so free text is allowed here too — and "
+        "a brand beyond those two is simply unproven against this firmware, which the reply says "
+        "itself."))] = "Generic",
+    canvas_id: Annotated[int, Field(description=(
+        "Which CANVAS unit the tray sits in, as the printer numbers it (a whole number >= 0); the "
+        "default 0 is the first unit. The pair with tray_id is what the printer's roster must name "
+        "and report connected."))] = 0,
+    confirm: Annotated[bool, Field(description=(
+        "Second-call only: omitted or false returns a preview and sends nothing; exactly true sends "
+        "the one tray filament command. Confirm once the user has authorized the change: a yes they "
+        "already gave for this printer or session covers it and needs no fresh question, so ask only "
+        "when nothing authorizes it, read them the preview first then."))] = False,
+) -> dict:
+    """Rewrite what one CANVAS tray of the configured CC2 printer says it holds, and read this
+    before calling it: method 2003 has never been sent to a CC2 by anyone on this project, so every
+    reply carries verified_on_this_printer false beside the sentence saying why. The shape is
+    Elegoo's own — the nine fields the tray edit dialog of the printer's current LAN web client
+    sends every time: canvas_id, tray_id, brand, filament_type, filament_name, filament_code,
+    filament_color, filament_min_temp, filament_max_temp — and of those nine a call here supplies
+    only the four the dialog asks a human for (which tray, which material, which colour, which
+    brand); type, code and both temperatures come out of the embedded 50-row copy of the vendor's
+    own catalog, which is also why a name outside it refuses before any session opens with the valid
+    names listed, rather than sending a tray a material with no type, no code and no temperature.
+
+    TWO-PHASE, like every other control here: without confirm=true this sends only the read-only
+    machine-state and CANVAS reads (methods 1002 and 2005) and returns a preview — the exact
+    nine-field 2003 params a confirmed call would send, the printer's own words for what that tray
+    holds right now and the machine reading the gate stood on (machine_now) — and changes nothing;
+    only an exact confirm=true sends it. The gate on both phases is the machine-state read first
+    and the roster read second: the write refuses unless the machine is idle — the 1002 must call
+    the printer idle for a job, so printing, paused, initializing or any state the adapter cannot
+    read refuses before any 2003 goes out, because an unreadable state is never an idle one — and
+    then the (canvas_id, tray_id) pair must appear in the printer's 2005 answer with its unit
+    reporting connected, because a tray the printer never named cannot be written. The idle gate is
+    this adapter's own bar, not the vendor's: the tray dialog itself opens regardless of machine
+    state, so the printer's own behaviour may well allow a tray edit mid-print — what this tool
+    will not do is risk one on a busy or unreadable machine, and the refusal says so.
+
+    One 2003 command, sent once and never resent, waited for 10 s, the longer of the two first-party
+    windows (Elegoo's LAN client passes no override for this method so its 5 s default applies, and
+    the Home Assistant integration waits 10 s for every command it sends). Accepted (an explicit
+    error_code 0, which is the printer not refusing), refused (its code kept, and it earns no
+    further read) and ambiguous (no answer, an unreadable one, or a dropped session) are kept apart
+    exactly as the other controls keep them, and a lost answer is never a refusal and never a reason
+    to send again. After an accepted or unanswered command one quiet read-only CANVAS look reports
+    what the printer says the tray holds now, kept apart from acceptance; a look that contradicts
+    what was just sent is said out loud without earning a second command, and it may lag — the
+    auto-refill readback did.
+
+    What has not been established is whether this firmware answers 2003 at all — the bundle the
+    printer serves itself does not contain the command — what it does with a code or brand it has
+    never seen, whether its 2005 read reflects the change immediately, and whether it accepts a
+    tray edit mid-print: four questions with no answer yet. A refusal from this tool is therefore
+    evidence about this firmware, not a broken printer, and it is worth recording."""
+    try:
+        params = _cc2_tray.parse_request(tray_id, filament_name, colour, brand, canvas_id)
+    except PrinterError as e:
+        return _cc2_tray_unverified(_cc2_err(e))
+    return await _cc2_tray_filament_tool(params, confirm)
+
+
 # --- Tool annotations (title + read-only/destructive hints) -----------------
 # The Claude connectors directory requires every tool to carry a title and the
 # applicable readOnlyHint / destructiveHint. Kept as one table so completeness
@@ -3587,6 +3710,13 @@ _TOOL_ANNOTATIONS: dict[str, tuple[str, bool, bool]] = {
     # in its replies rather than hidden in a hint, and it is a write that reaches the printer over the
     # network with the two-phase confirm enforced in its own body exactly like the others.
     "cc2_set_auto_refill": ("Set the CC2 CANVAS auto-refill switch", False, False),
+    # The tray filament write is the same kind of write as the auto-refill switch and no more
+    # destructive than it: it rewrites what one tray's slot says it holds, nothing is destroyed and
+    # the dialog — or this tool again — can overwrite it, so no destructiveHint. It is a write that
+    # reaches the printer over the network with the two-phase confirm enforced in its own body
+    # exactly like the others, and what makes it careful is that 2003 has never met this firmware,
+    # which is said in its replies rather than hidden in a hint.
+    "cc2_set_tray_filament": ("Set a CC2 CANVAS tray's filament info", False, False),
 }
 
 
@@ -3602,7 +3732,7 @@ _OPEN_WORLD_TOOLS = frozenset({"get_printer_status", "wait_for_printer", "list_p
                                "cc2_upload_gcode", "cc2_start_print", "cc2_pause_print",
                                "cc2_resume_print", "cc2_stop_print", "cc2_set_light",
                                "cc2_set_print_speed", "cc2_set_temperature",
-                               "cc2_set_auto_refill"})
+                               "cc2_set_auto_refill", "cc2_set_tray_filament"})
 _IDEMPOTENT_TOOLS = frozenset({"list_print_history"})
 
 
