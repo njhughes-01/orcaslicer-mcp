@@ -298,6 +298,59 @@ def test_a_multi_tool_file_is_refused_as_such():
     assert "tool" in none.value.message.lower()
 
 
+def test_config_lists_split_on_semicolons_as_well_as_commas():
+    # the real two-tool slice writes ``; filament_type = PLA;PLA`` beside comma lists
+    # (``; nozzle_temperature = 210,210``) in the same config block: both delimiters are the
+    # slicer's own way of writing one value per tool, and a comma-only split would read
+    # "PLA;PLA" as one filament word and call a two-tool file a single-tool one.
+    assert up._config_value("PLA;PLA") == ["PLA", "PLA"]
+    assert up._config_value("210,210") == ["210", "210"]
+    assert up._config_value("PLA; PETG,ABS") == ["PLA", "PETG", "ABS"]
+    assert up._config_value("[PLA;PLA]") == ["PLA", "PLA"]
+    assert up._config_value("PLA;") == ["PLA"]
+    # and the split is not helper-only, it reaches a parse: a semicolon list names a second
+    # material this one-tool file never selects, so it must refuse as more values than tools
+    # rather than pass as a filament type called "PLA;PETG"
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(gcode_text(material="PLA;PETG"))
+    assert "one value" in bad.value.message and "Nothing was sent" in bad.value.message
+
+
+def test_a_per_tool_config_list_shorter_than_the_highest_tool_refuses_naming_the_key():
+    # a key written for tools 0-1 only, in a file selecting tools 0-2, is a tool whose value
+    # the file never says; the refusal names the key so a human can find the line, and which
+    # of the written values the missing tool prints at is never a thing to guess.
+    with pytest.raises(PrinterError) as bad:
+        up._config_per_tool({"nozzle_temperature": ["210,210"]}, "nozzle_temperature",
+                            "steady nozzle temperature", [0, 1, 2])
+    assert "nozzle_temperature" in bad.value.message and "Nothing was sent" in bad.value.message
+    # a single value with one tool is the ordinary single-tool case and works whatever that
+    # tool's number is — a T1-only file's one ``; filament_type = PLA`` is that tool's value
+    assert up._config_per_tool({"filament_type": ["PLA"]}, "filament_type",
+                               "filament type", [1]) == ["PLA", "PLA"]
+
+
+def test_the_one_tool_reference_frame_parses_to_one_tool_settings_equal_to_its_flat_fields():
+    # the flat fields are the first selected tool's values, so for a one-tool file the tool
+    # entry and the flat story must be the same facts, and exactly one entry exists
+    s = up.parse_gcode_text(gcode_text())
+    assert len(s.tools) == 1
+    t = s.tools[0]
+    assert isinstance(t, up.ToolSettings)
+    assert t.tool_index == s.tool_index
+    assert t.material == s.material
+    assert t.nozzle_first_layer_temp == s.nozzle_first_layer_temp
+    assert t.nozzle_temp == s.nozzle_temp
+    assert t.extrusion_nozzle_temps == s.extrusion_nozzle_temps
+    # and that holds whatever the one tool's number is, not just for T0
+    t1 = up.parse_gcode_text(gcode_text(tools=("T1",)))
+    assert [x.tool_index for x in t1.tools] == [1]
+    assert t1.tools[0].nozzle_first_layer_temp == t1.nozzle_first_layer_temp
+    assert t1.tools[0].nozzle_temp == t1.nozzle_temp
+    assert t1.tools[0].material == t1.material
+    assert t1.tools[0].extrusion_nozzle_temps == t1.extrusion_nozzle_temps
+
+
 @pytest.mark.parametrize("text, needle", [
     (gcode_text(omit=("material",)), "filament_type"),
     (gcode_text(omit=("nozzle",)), "nozzle_temperature"),

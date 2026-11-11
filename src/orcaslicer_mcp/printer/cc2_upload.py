@@ -630,6 +630,22 @@ _PLATE_BED_KEYS = {
 
 
 @dataclass(frozen=True)
+class ToolSettings:
+    """What the file says about one of its own tools: the material it prints and the nozzle
+    setpoints it prints at — first layer may legitimately differ from the rest, and both are
+    kept — plus the nozzle temperatures that tool's extrusion was verified to run at, with the
+    same meaning ``Cc2GcodeSettings.extrusion_nozzle_temps`` has. Today a parse that reaches a
+    settings object selects exactly one tool (multi-tool files still refuse), so that tool's
+    extrusion list is the file's single story; when the multi-tool gate lands each tool must
+    carry the temperatures its own extrusions ran behind a verified wait."""
+    tool_index: int
+    material: str
+    nozzle_first_layer_temp: float
+    nozzle_temp: float
+    extrusion_nozzle_temps: tuple[float, ...]
+
+
+@dataclass(frozen=True)
 class Cc2GcodeSettings:
     """What a file says about how it means to be printed, read only from the file's own bytes.
     The four print setpoints are what a start checks a spool against — first layer may
@@ -653,6 +669,7 @@ class Cc2GcodeSettings:
     bed_setpoints: tuple[float, ...]
     extrusion_nozzle_temps: tuple[float, ...]
     bed_plate: str
+    tools: tuple[ToolSettings, ...]
 
 
 def _refuse(what: str, hint: str | None = None) -> PrinterError:
@@ -668,12 +685,15 @@ def _refuse(what: str, hint: str | None = None) -> PrinterError:
 
 
 def _config_value(raw: str) -> list[str]:
-    """One config value, split the way the slicer writes multi-slot lists — comma separated. A
-    bracketed list is a slicer dump of the same list; read it the same way."""
+    """One config value, split the way the slicer writes multi-slot lists — comma **or**
+    semicolon separated (the real two-tool slice writes ``filament_type = PLA;PLA`` beside
+    comma lists like ``nozzle_temperature = 210,210``, so both delimiters are the slicer's
+    own, not a guess). A bracketed list is a slicer dump of the same list; read it the same
+    way. Empty pieces (``PLA;`` and friends) are dropped, as a bare comma always was."""
     text = raw.strip()
     if text.startswith("[") and text.endswith("]"):
         text = text[1:-1]
-    return [piece.strip() for piece in text.split(",") if piece.strip()]
+    return [piece.strip() for piece in re.split(r"[,;]", text) if piece.strip()]
 
 
 def _collect_config(lines: Iterable[str]) -> dict[str, list[str]]:
@@ -728,6 +748,67 @@ def _config_temp(config: dict[str, list[str]], key: str, label: str, *, maximum:
         raise _refuse(f"its {label} is {value}, outside the 0–{maximum:g} °C a printer of this "
                       "family could hold — refusing rather than trusting it")
     return value
+
+
+def _config_per_tool(config: dict[str, list[str]], key: str, label: str,
+                     tools: list[int]) -> list[str]:
+    """One value per tool index for one key, or a refusal naming the key. The slicer writes a
+    per-tool key as one list — comma or semicolon separated (``_config_value``) — and repeats the
+    line across config sections; repeats that disagree for the same tool index are the same
+    inconsistent file ``_config_single`` refuses for a single key. The result is indexable by
+    tool number: entry ``i`` is tool ``i``'s value, and every index up to the file's highest
+    selected tool must exist. A list shorter than the highest selected tool is a tool whose
+    value the file never says, refused with the key named; one value with one tool is the
+    ordinary single-tool case and works whatever that tool's number is (a T1-only file's
+    ``; filament_type = PLA`` is that tool's). More values than the file has tools names tools
+    the file never selects, and refuses too: this reads one value per selected tool, never a
+    prefix of a longer claim. Callers pass the file's own selected tool numbers (non-empty)."""
+    occurrences = config.get(key)
+    if not occurrences:
+        raise _refuse(f"it carries no {label} (no '; {key} =' config line), and print settings "
+                      "are read from the file, never guessed")
+    values: list[str] = []
+    for raw in occurrences:
+        pieces = _config_value(raw)
+        if not pieces:
+            raise _refuse(f"its '{key} =' config line carries no value")
+        for i, piece in enumerate(pieces):
+            if i >= len(values):
+                values.append(piece)
+            elif values[i] != piece:
+                raise _refuse(f"its {label} is not one value per tool: the '{key} =' config "
+                              f"lines name {values[i]!r} and {piece!r} for tool {i}, and a file "
+                              "that disagrees with itself cannot be identified")
+    highest = max(tools)
+    if len(tools) == 1 and len(values) == 1:
+        values = values * (highest + 1)  # the file's one tool, whatever its number, prints at it
+    elif len(values) < highest + 1:
+        raise _refuse(f"its {label} (key '{key}') lists {len(values)} value(s) ({values[:4]}) "
+                      f"while the file selects tool {highest}, so tool {highest}'s value is not "
+                      "in the file — refusing rather than guessing which listed value a tool "
+                      "prints at")
+    elif len(values) > highest + 1:
+        raise _refuse(f"its {label} is not one value per tool but {values[:4]} — the file names "
+                      f"{len(values)} values for '{key}' while its highest selected tool is "
+                      f"T{highest}, and this adapter reads one value per selected tool")
+    return values
+
+
+def _config_temp_per_tool(config: dict[str, list[str]], key: str, label: str,
+                          tools: list[int], *, maximum: float) -> list[float]:
+    """``_config_per_tool`` with each value then held to the same temperature sanity
+    ``_config_temp`` applies to a single value."""
+    temps: list[float] = []
+    for raw in _config_per_tool(config, key, label, tools):
+        try:
+            value = float(raw)
+        except ValueError:
+            raise _refuse(f"its {label} is {raw!r}, which is not a temperature") from None
+        if not 0.0 < value <= maximum:
+            raise _refuse(f"its {label} is {value}, outside the 0–{maximum:g} °C a printer of "
+                          "this family could hold — refusing rather than trusting it")
+        temps.append(value)
+    return temps
 
 
 def _parse_S(token: str) -> float:
@@ -1003,8 +1084,10 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     adapter has read pass, every other number refuses the file, and the end-of-print unload (S9)
     drops the nozzle accounting it cannot carry across, so nothing extrudes after it.
 
-    Config second: material, the plate's first-layer and steady bed temperatures, and the nozzle
-    first-layer and steady setpoints, each refusing to be missing, ambiguous or unphysical.
+    Config second: the plate's first-layer and steady bed temperatures, then — once the file's
+    own tool selects are known — the material and the nozzle first-layer and steady setpoints
+    read per selected tool (``_config_per_tool``), each refusing to be missing, ambiguous or
+    unphysical.
     Cross-check last: every one of the four print setpoints must also appear among the commands —
     a file whose config promises 260 while its G-code never heats to 260 is an inconsistent file,
     and inconsistency is exactly what this parse exists to catch. Command setpoints beyond the
@@ -1016,21 +1099,15 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     text_lines = list(lines)  # small files in tests, real files streamed by the upload; either way once
     config = _collect_config(text_lines)
 
-    material = _config_single(config, "filament_type", "filament type")
-    if (len(material) > 64 or not material.isascii()
-            or not material.isprintable() or any(c.isspace() for c in material)):
-        raise _refuse(f"its filament type {material[:20]!r} is not a plain printable word")
-
+    # the plate decides the bed keys and needs no tool knowledge, so it is read up front; the
+    # per-tool keys (material, the two nozzle setpoints) are read after the scan below, because
+    # "one value per tool" is only knowable once the file's own tool selects have been seen
     plate_word = _config_single(config, "curr_bed_type", "build-plate type").lower()
     if plate_word not in _PLATE_BED_KEYS:
         raise _refuse(f"it prints on plate {plate_word!r}, whose bed-temperature config keys this "
                       "adapter does not know, so its bed setpoints cannot be identified")
     first_key, steady_key = _PLATE_BED_KEYS[plate_word]
 
-    nozzle_first = _config_temp(config, "nozzle_temperature_initial_layer",
-                                "initial-layer nozzle temperature", maximum=_NOZZLE_MAX)
-    nozzle = _config_temp(config, "nozzle_temperature", "steady nozzle temperature",
-                          maximum=_NOZZLE_MAX)
     bed_first = _config_temp(config, first_key, "initial-layer bed temperature", maximum=_BED_MAX)
     bed = _config_temp(config, steady_key, "steady bed temperature", maximum=_BED_MAX)
 
@@ -1213,22 +1290,47 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
         # own doing, whatever the file's own T<n> lines say
         raise _purge_tool_refusal(next(t for t in purge_tools if t not in tools), tools)
 
-    for value, label in ((nozzle_first, "initial-layer nozzle temperature"),
-                         (nozzle, "steady nozzle temperature")):
-        if value not in nozzle_cmds:
-            raise _refuse(f"its config promises a {label} of {value:g} °C but no M104/M109 "
-                          "command ever sets it — the file's config and its commands disagree")
+    # per-tool config, read here because "one value per tool" is decided by the tool selects the
+    # scan above collected; a single tool's single value works whatever that tool's number is
+    materials = _config_per_tool(config, "filament_type", "filament type", tools)
+    for value in materials:
+        if (len(value) > 64 or not value.isascii()
+                or not value.isprintable() or any(c.isspace() for c in value)):
+            raise _refuse(f"its filament type {value[:20]!r} is not a plain printable word")
+    nozzle_firsts = _config_temp_per_tool(config, "nozzle_temperature_initial_layer",
+                                          "initial-layer nozzle temperature", tools,
+                                          maximum=_NOZZLE_MAX)
+    nozzles = _config_temp_per_tool(config, "nozzle_temperature", "steady nozzle temperature",
+                                    tools, maximum=_NOZZLE_MAX)
+
+    for index in tools:  # every selected tool's promises must appear among the commands
+        for value, label in ((nozzle_firsts[index], "initial-layer nozzle temperature"),
+                             (nozzles[index], "steady nozzle temperature")):
+            if value not in nozzle_cmds:
+                raise _refuse(f"its config promises a {label} of {value:g} °C but no M104/M109 "
+                              "command ever sets it — the file's config and its commands disagree")
     for value, label in ((bed_first, "initial-layer bed temperature"), (bed, "steady bed "
                                                                              "temperature")):
         if value not in bed_cmds:
             raise _refuse(f"its config promises a {label} of {value:g} °C but no M140/M190 "
                           "command ever sets it — the file's config and its commands disagree")
-    return Cc2GcodeSettings(material=material,
-                            nozzle_first_layer_temp=nozzle_first, nozzle_temp=nozzle,
-                            bed_first_layer_temp=bed_first, bed_temp=bed, tool_index=tools[0],
+    first_tool = tools[0]
+    # a parse that reaches here selects exactly one tool (multi-tool still refuses above), so the
+    # file's one verified-extrusion story belongs to that tool whole; when the multi-tool gate
+    # lands, extrusion temperatures must be collected per current tool instead
+    tool_settings = tuple(
+        ToolSettings(tool_index=index, material=materials[index],
+                     nozzle_first_layer_temp=nozzle_firsts[index], nozzle_temp=nozzles[index],
+                     extrusion_nozzle_temps=tuple(extrusion_temps))
+        for index in tools)
+    return Cc2GcodeSettings(material=materials[first_tool],
+                            nozzle_first_layer_temp=nozzle_firsts[first_tool],
+                            nozzle_temp=nozzles[first_tool],
+                            bed_first_layer_temp=bed_first, bed_temp=bed, tool_index=first_tool,
                             nozzle_setpoints=tuple(nozzle_cmds), bed_setpoints=tuple(bed_cmds),
                             extrusion_nozzle_temps=tuple(extrusion_temps),
-                            bed_plate=plate_word)
+                            bed_plate=plate_word,
+                            tools=tool_settings)
 
 
 def parse_gcode_text(text: str) -> Cc2GcodeSettings:
