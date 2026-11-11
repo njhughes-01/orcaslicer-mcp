@@ -378,6 +378,45 @@ def test_the_two_tool_fixture_parses_to_two_pla_tools_at_210_flushing_at_240_on_
     assert "M220 S100" in text
 
 
+def test_the_two_tool_fixture_reports_its_templates_stock(gcode_fixture):
+    # design 5: the real slice was cut with the shipped OrcaSlicer 2.4.2 CC2 profiles, so its
+    # five template config keys must each match the verbatim stock text the data module holds
+    # — all five keys present, all five compared, none modified
+    s = up.parse_gcode_text(gcode_fixture("cc2_two_tool"))
+    assert s.vendor_templates == "stock"
+    assert s.templates_compared == 5
+
+
+def test_one_extra_line_in_the_end_template_reports_modified_and_never_refuses(gcode_fixture):
+    # the report's whole point: a hand-edited template is not a refusal (only the commands
+    # gate), it is a named key on the reply. One added line in machine_end_gcode, and only
+    # that key is named; the file still parses
+    text = gcode_fixture("cc2_two_tool")
+    line = next(ln for ln in text.splitlines() if ln.startswith("; machine_end_gcode = "))
+    edited = text.replace(line, line + "\\nM107", 1)  # one extra line in the escaped template
+    assert edited != text
+    s = up.parse_gcode_text(edited)
+    assert s.vendor_templates == "modified: machine_end_gcode"
+    assert s.templates_compared == 5
+
+
+def test_a_frame_without_template_keys_reports_stock_with_nothing_compared():
+    # a key the file never wrote is skipped, never guessed at: with none of the five present,
+    # "stock" here means nothing was compared, and templates_compared says so
+    s = up.parse_gcode_text(gcode_text(omit=("template_traps",)))
+    assert s.vendor_templates == "stock"
+    assert s.templates_compared == 0
+
+
+def test_present_but_non_stock_templates_are_named_in_stock_key_order():
+    # the reference frame's trap template lines quote whole programs that are not the stock
+    # text: both present keys are reported, in the order the stock module lists them, and the
+    # three keys the frame never writes are skipped, not counted
+    s = up.parse_gcode_text(gcode_text())
+    assert s.vendor_templates == "modified: machine_start_gcode, change_filament_gcode"
+    assert s.templates_compared == 2
+
+
 def test_a_file_not_sliced_for_the_centauri_carbon_2_refuses_naming_what_it_said():
     # design 1's gate: this workflow judges every command against one printer's published
     # firmware and uploads to that one printer, so the file's own printer_model must name it

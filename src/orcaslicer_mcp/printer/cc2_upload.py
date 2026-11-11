@@ -154,7 +154,7 @@ from typing import Any
 
 import httpx
 
-from . import cc2_state
+from . import cc2_state, cc2_stock_templates
 from .cc2_receipts import Cc2ReceiptStore, Cc2UploadReceipt, ToolReceipt
 from .cc2_transport import AccessCode, _refusal
 from .errors import PrinterError
@@ -709,7 +709,12 @@ class Cc2GcodeSettings:
     extrusion temperatures and flush temperatures. ``printer_model`` is the file's own
     ``; printer_model =`` config value, which the upload gate demands name this printer exactly —
     an unequal or missing value refuses before this dataclass ever exists, so a value here is
-    always the accepted one."""
+    always the accepted one. ``vendor_templates`` is design 5's report on the file's five
+    machine-level G-code template config keys — ``"stock"`` when every one the file carries
+    matches the shipped OrcaSlicer 2.4.2 CC2 template it should be, ``"modified: key, key"``
+    naming the ones that do not (never a refusal; a key the file never wrote is skipped, not
+    counted against it) — and ``templates_compared`` is how many of the five the file actually
+    carried, so ``("stock", 0)`` means nothing was compared, not that anything was proven."""
     material: str
     nozzle_first_layer_temp: float
     nozzle_temp: float
@@ -722,6 +727,8 @@ class Cc2GcodeSettings:
     bed_plate: str
     tools: tuple[ToolSettings, ...]
     printer_model: str
+    vendor_templates: str
+    templates_compared: int
 
 
 _REFUSE_PREFIX = ("The G-code file cannot be uploaded through this workflow. Nothing was sent "
@@ -783,8 +790,13 @@ CC2_PRINTER_MODEL = "Elegoo Centauri Carbon 2"
 _MODEL_HINT = ("Re-slice with the stock Elegoo Centauri Carbon 2 printer profile: this workflow "
                "reads that printer's published firmware and uploads only to it.")
 
+# The last five are the stock-template keys design 5 reports on: their raw (escaped) values
+# are collected for cc2_stock_templates.compare_verdict, which never refuses — see that
+# module for what is compared and how loosely.
 _WANTED_KEYS = frozenset({"filament_type", "nozzle_temperature", "nozzle_temperature_initial_layer",
                           "nozzle_temperature_range_high", "printer_model",
+                          "machine_start_gcode", "machine_end_gcode", "change_filament_gcode",
+                          "layer_change_gcode", "before_layer_change_gcode",
                           "curr_bed_type", "hot_plate_temp_initial_layer", "hot_plate_temp",
                           "cool_plate_temp_initial_layer", "cool_plate_temp",
                           "textured_plate_temp_initial_layer", "textured_plate_temp",
@@ -1285,7 +1297,11 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     own tool selects are known — the material and the nozzle first-layer and steady setpoints
     read per selected tool (``_config_per_tool``), each refusing to be missing, ambiguous or
     unphysical; the same per-tool read decides any deferred flush-R exception, against the file's
-    declared ``nozzle_temperature_range_high`` list. The config reads that reach into the scan
+    declared ``nozzle_temperature_range_high`` list. Also from config, and never a refusal: the
+    stock-template report (design 5) — ``vendor_templates`` says whether the five machine-level
+    template config keys the file carries match the shipped OrcaSlicer 2.4.2 CC2 templates
+    (``cc2_stock_templates``), and ``templates_compared`` counts how many of the five the file
+    actually wrote. The config reads that reach into the scan
     are design 2's (the layer-two ``M104`` transition) and design 3's (the pending tool-change
     ``M104``): the two nozzle-setpoint keys are merged refusal-free before the scan (``_declared_list_or_none``) and indexed per tool lazily
     (``_declared_for_tool``) — the choice over hoisting the refusing per-tool reads above the
@@ -1761,6 +1777,14 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                 if value not in per_tool_flush.setdefault(tool, []):
                     per_tool_flush[tool].append(value)
 
+    # design 5's report, read from the same config dict and never a refusal: how the file's
+    # template config keys compare to the stock OrcaSlicer 2.4.2 CC2 templates (a file that
+    # carries none of the keys compares as "stock" with zero keys actually compared — nothing
+    # guessed at, nothing proven)
+    vendor_templates, templates_compared = cc2_stock_templates.compare_verdict(
+        {key: raws for key, raws in config.items()
+         if key in cc2_stock_templates.STOCK})
+
     for index in tools:  # every selected tool's promises must appear among the commands
         for value, label in ((nozzle_firsts[index], "initial-layer nozzle temperature"),
                              (nozzles[index], "steady nozzle temperature")):
@@ -1792,7 +1816,9 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                             extrusion_nozzle_temps=tuple(extrusion_temps),
                             bed_plate=plate_word,
                             tools=tool_settings,
-                            printer_model=printer_model)
+                            printer_model=printer_model,
+                            vendor_templates=vendor_templates,
+                            templates_compared=templates_compared)
 
 
 def parse_gcode_text(text: str) -> Cc2GcodeSettings:
