@@ -1,6 +1,9 @@
-# cc2-tray-filament
+# cc2-tray-filament Specification
 
-## ADDED Requirements
+## Purpose
+TBD - created by archiving change cc2-tray-filament-info. Update Purpose after archive.
+
+## Requirements
 
 ### Requirement: Write one CANVAS tray's filament info with method 2003
 The server SHALL offer `cc2_set_tray_filament` which, when confirmed, sends exactly one
@@ -44,3 +47,7 @@ The server SHALL read 1002 once in both phases and refuse the write unless the m
 
 ### Requirement: Unverified label
 Every reply SHALL carry `verified_on_this_printer: false` and a sentence naming why until a live test has run.
+
+#### Scenario: refusals are labelled too
+- **WHEN** the tool refuses (unknown catalog name, no printer address, or the idle or roster gate)
+- **THEN** the reply still carries `verified_on_this_printer: false` and the unverified sentence
