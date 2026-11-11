@@ -777,7 +777,11 @@ async def test_a_printing_temperature_above_the_tray_rating_still_refuses(store)
     hot = ToolReceipt(tool_index=1, material="PLA", nozzle_first_layer_temp=240.0,
                       nozzle_temp=240.0, extrusion_nozzle_temps=(240.0,),
                       flush_nozzle_temps=(240.0,))
-    over.update(tools=(over["tools"][0], hot), commanded_nozzle_setpoints=(210.0, 240.0))
+    # the flat union carries the hot tool's 240 too: a receipt whose tools say more than its
+    # file-wide list is refused as inconsistent before any start (receipt rule), so this test
+    # keeps the two in step and tests the START's range rule, not the receipt's
+    over.update(tools=(over["tools"][0], hot), commanded_nozzle_setpoints=(210.0, 240.0),
+                extrusion_nozzle_temps=(210.0, 240.0))
     save_receipt(store, **over)
     tr = healthy({st.METHOD_CANVAS: canvas_replies(
         active_tray=2, trays=pla_roster(mx1=250, mx2=230))})
