@@ -50,3 +50,19 @@
 Whether the firmware honours a two-entry `slot_map` is proven only by Elegoo's client sending it;
 the fork has never sent one. Every reply of a multi-tool start carries a note saying so until the
 live test runs.
+
+## Amendment (2026-11-11, after task 1.2): flush temperature is not a printing temperature
+Elegoo's catalog rates every PLA tray 190–230 °C while Elegoo's own `change_filament_gcode` flushes PLA
+at `nozzle_temperature_range_high` = 240 °C. Decision 3 as written would refuse every PLA multi-colour
+start on the vendor's own numbers. Decision 9 replaces the "appended to extrusion_nozzle_temps" part
+of decision 3:
+9. **Flush temperatures are their own field.** `ToolSettings` and `ToolReceipt` gain
+   `flush_nozzle_temps: tuple[float, ...]` (every purge R the tool was left or entered at, distinct,
+   first-seen order); R is NOT appended to `extrusion_nozzle_temps`. The parser still requires R to
+   equal both tools' declared `nozzle_temperature_range_high` (so a flush hotter than the file's own
+   declared range still refuses). At start, the tray's rated range must cover `extrusion_nozzle_temps`
+   (printing temperatures verified by an M109 wait) and no commanded setpoint may exceed the rated
+   maximum except a flush temperature, which is compared to the tray's rated maximum and reported in a
+   note either way ("flush at 240 °C against tray rated to 230 °C: the vendor's own profile and
+   catalog disagree by 10 °C; not refused"). Rationale: both numbers are Elegoo's; refusing their own
+   default makes the feature useless for PLA, while the file's declared range already bounds the flush.
