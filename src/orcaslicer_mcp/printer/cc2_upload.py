@@ -75,9 +75,10 @@ current tool's declared ``nozzle_temperature_initial_layer`` up to that tool's d
 ``nozzle_temperature`` is the slicer's own layer-two transition, keeps the wait armed, and has
 its value recorded as one of that tool's verified extrusion temperatures. A second exception
 (design 3): at a wipe-tower tool change a bare ``M104`` to the declared ``nozzle_temperature`` of
-a tool other than the one in force is a *pending tool-change setpoint* — it does not revoke the
-armed wait for retractions (negative-E moves, which run while the hot end still holds the old
-verified temperature), every forward extrusion refuses, and only an ``M6211`` purge consumes the
+a tool other than the one in force (a tool this file selects or purges to) is a *pending
+tool-change setpoint* — while the wait is in force and unbroken and relative-E mode (``M83``) has
+been seen, it does not revoke that wait for retractions (negative-E moves, which run while the hot
+end still holds the old verified temperature), every forward extrusion refuses, and only an ``M6211`` purge consumes the
 pending value: its ``Q`` must be the wait still armed, its ``S`` the declared steady print
 temperature of the tool it switches in (which the firmware's own ``M109 S`` inside the purge
 waits at), and after the purge that ``S`` is the verified temperature the print continues at. A nozzle cooldown (``S0``) before the file's last extrusion contradicts itself — the

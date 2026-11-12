@@ -21,7 +21,7 @@ A bare `M104` to the current tool's declared `nozzle_temperature`, after a verif
 - **THEN** the next extrusion refuses
 
 ### Requirement: Mixed-temperature tool change
-A tool change between filaments at different declared temperatures SHALL be accepted when the tower setpoint equals the next tool's declared temperature, only retracts follow it before the purge, the purge's `Q` equals the wait in force and its `S` equals the next tool's declared temperature.
+A tool change between filaments at different declared temperatures SHALL be accepted when the wait is in force and unbroken, relative-E mode (`M83`) has been seen, the tower setpoint equals the next tool's declared temperature, only retracts follow it before the purge, the purge's `Q` equals the wait in force and its `S` equals the next tool's declared temperature.
 
 #### Scenario: PLA 210 to PLA Basic 220
 - **WHEN** the change block is `M104 S220`, `G1 E-2`, `M6211 T1 ... Q210 R240 S220`, `T1` with tool 1 declared at 220

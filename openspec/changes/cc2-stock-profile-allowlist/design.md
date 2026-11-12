@@ -21,8 +21,10 @@ Evidence: `inventory.md` (union table §A, gaps §D, open questions §E), `stock
    change: `M220 S100`, `G4 S0`, `M104 S<next>`, `G4 S0`, `G1 E-2`, travel, `M6211 T<next> L M N
    Q<old> R<range_high> S<next>`, `T<next>`. Rules:
    a. An `M104` whose value equals the declared `nozzle_temperature` of some tool other than the
-      current one is a *pending tool change* setpoint: it does not revoke the wait for NEGATIVE E
-      moves (retracts run at the old, still-waited temperature) but any POSITIVE E before the
+      current one (a tool the file selects or purges to) is a *pending tool change* setpoint,
+      provided the wait is in force and unbroken and relative-E mode (`M83`) has been seen: it
+      does not revoke the wait for NEGATIVE E moves (retracts run at the old, still-waited
+      temperature) but any POSITIVE E before the
       purge refuses; the pending value must be consumed by an `M6211` whose `S` equals it, else
       the next positive E refuses as today.
    b. The purge: `Q` must equal the wait in force (the old tool's verified temperature) and `S`
