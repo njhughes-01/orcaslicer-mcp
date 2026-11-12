@@ -974,6 +974,13 @@ PENDING_WINDOW_LINES = 24
 # a single line. A move whose distance or feedrate cannot be known (no position yet, no F yet,
 # an arc) breaks the wait too (review finding, PR #13, Codex round 5).
 PENDING_WINDOW_S = 5.0
+# The printer's own axis limits (the stock Orca machine profile the CC2 inherits,
+# fdm_elegoo_3dp_001_common: X/Y 500 mm/s at 20000 mm/s², Z 20 mm/s at 500 mm/s², E 30 mm/s at
+# 5000 mm/s²): the firmware slows any move to these whatever F the file writes, so a huge F
+# counts as no time only on paper — the window's estimate caps every axis at them (review
+# finding, PR #13, Opus round 5).
+_AXIS_CAPS_MM_S = {"xy": 500.0, "z": 20.0, "e": 30.0}
+_AXIS_ACCEL_CAPS = {"xy": 20000.0, "z": 500.0, "e": 5000.0}
 
 
 
@@ -1543,19 +1550,26 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                     elif feed is None or feed <= 0.0 or speed_factor <= 0.0:
                         wait_broken = True      # no known feedrate: time unknowable
                     else:
-                        dist = sum((axes[a] - pos[a]) ** 2 for a in axes) ** 0.5 if axes else 0.0
-                        length = max(dist, e_len)
+                        d_xy = sum((axes[a] - pos[a]) ** 2 for a in axes if a in ("X", "Y")) ** 0.5
+                        d_z = abs(axes["Z"] - pos["Z"]) if "Z" in axes else 0.0
                         v_mm_s = feed * speed_factor / 100.0 / 60.0
                         if max_velocity is not None:
                             v_mm_s = min(v_mm_s, max_velocity)
-                        if v_mm_s <= 0.0:
+                        if v_mm_s <= 0.0 or (max_accel is not None and max_accel <= 0.0
+                                             and (d_xy or d_z or e_len)):
                             wait_broken = True
                         else:
-                            t = length / v_mm_s
-                            if max_accel is not None and max_accel > 0.0 and length > 0.0:
-                                t = max(t, 2.0 * (length / max_accel) ** 0.5)  # ramp-limited
-                            elif max_accel is not None and max_accel <= 0.0 and length > 0.0:
-                                t = float("inf")
+                            t = 0.0
+                            for key, length in (("xy", d_xy), ("z", d_z), ("e", e_len)):
+                                if length <= 0.0:
+                                    continue
+                                v = min(v_mm_s, _AXIS_CAPS_MM_S[key])
+                                a = _AXIS_ACCEL_CAPS[key]
+                                if max_accel is not None:
+                                    a = min(a, max_accel)
+                                # the slower of cruising at v and a pure accelerate/decelerate
+                                # ramp at a: the real move is never faster than either bound
+                                t = max(t, length / v, 2.0 * (length / a) ** 0.5)
                             pending_motion_s += t
                             if pending_motion_s > PENDING_WINDOW_S:
                                 wait_broken = True
@@ -1715,6 +1729,7 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
             # stock start template issues right after the mesh. Head-folded like every command
             # word here, so the lowercase spelling resets it just the same.
             waited, mesh_seen = None, True
+            pos.clear()                 # the mesh pass moves the head: position unknown after it
             continue
         if head == "M6211":  # Elegoo's flush: its T selects filament and its Q/R/S heat the nozzle
             if unload_seen:
@@ -1822,6 +1837,9 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
             # the temperature recorded on the outgoing tool when a mixed-temperature change moves
             # the print from one number to the other.
             leaving_temp = waited
+            pos.clear()                 # the purge lifts Z and travels on its own (G180 S10 and
+                                        # S818 inside M6211): position unknown after it (review
+                                        # finding, PR #13, Opus round 5)
             nozzle_target = waited = purge.final
             wait_broken = False
             purge_seen = True

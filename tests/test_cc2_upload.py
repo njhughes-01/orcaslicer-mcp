@@ -776,8 +776,12 @@ def test_a_welded_dwell_parameter_still_breaks_the_wait():
     ("M220 S100 S1\n", "G1 X200 F30000\n"),                      # a repeated letter: the last wins
     ("", "G1 X200 F30000 F1\n"),                                 # a repeated letter inside
     ("M204 P0.001 T0.001\n", "G1 X200 F30000\n"),                # Klipper's P/T accel form
+    ("", "G1 Z250 F3000000\n" * 2),                               # Z crawls at 20 mm/s whatever F says
+    ("", "G1 E-500 F100000000\n"),                                # E at 30 mm/s: 17 s
+    ("", ("G1 X200 F3000000\nG1 X0 F3000000\n") * 10),           # XY capped at 500 mm/s: 8 s
 ], ids=["g92-x", "g28", "m220", "e-only", "m190", "m140", "arc", "arc-before",
-        "velocity-limit", "accel-limit", "limit-inside", "m220-dup", "f-dup", "m204-pt"])
+        "velocity-limit", "accel-limit", "limit-inside", "m220-dup", "f-dup", "m204-pt",
+        "z-cap", "e-cap", "xy-cap"])
 def test_only_the_towers_own_shape_may_stand_inside_a_pending_window(before, inside):
     # review finding (PR #13, Codex round 6): every loophole was a command the wipe tower never
     # writes, or a global that scales a move's real time. So the window admits only the tower's
@@ -796,6 +800,22 @@ def test_only_the_towers_own_shape_may_stand_inside_a_pending_window(before, ins
                        "G1 X200 F30000\nG1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
     ok = ok.replace("T1\nM109 S210", "T1\nM109 S220", 1)
     assert up.parse_gcode_text(ok).tools[1].extrusion_nozzle_temps[-1] == 220.0
+
+
+def test_the_position_is_unknown_after_a_purge_so_a_crawl_after_it_breaks_the_wait():
+    # review finding (PR #13, Opus round 5): M6211 lifts Z and travels on its own, so the
+    # tracked position is stale after it — a crawl "back to" the old position after a purge
+    # counted as zero distance. The purge clears the position; the next move needs a fresh one.
+    frame = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+    change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
+    # after the first (start) purge the position is unknown: a pending change opened right
+    # after it with a move to X0 Y0 at F1 must break (no known start), not count as zero
+    probe = frame.replace(change, "G1 X0 Y0 F30000\n" + change + "\nT1\nM83\nM104 S220\nG1 X0 Y0 F1\nG1 E-2 F1800\n"
+                          + change.replace("S210", "S220"), 1)
+    assert probe != frame
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "Nothing was sent" in bad.value.message
 
 
 def test_an_empty_position_in_a_per_tool_list_refuses_instead_of_shifting_tool_numbers():
