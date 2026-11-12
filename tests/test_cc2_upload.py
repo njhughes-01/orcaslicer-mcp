@@ -780,12 +780,15 @@ def test_a_welded_dwell_parameter_still_breaks_the_wait():
     ("", "G1 E-500 F100000000\n"),                                # E at 30 mm/s: 17 s
     ("", ("G1 X200 F3000000\nG1 X0 F3000000\n") * 10),           # XY capped at 500 mm/s: 8 s
     ("SET_VELOCITY_LIMIT ACCEL=10000 ACCEL_TO_DECEL=0.001\n", "G1 X200 F30000\n"),  # unmodelled limit
+    ("SET_VELOCITY_LIMIT VELOCITY=nan\n", "G1 X200 F30000\n"),    # not a plain finite number
+    ("SET_VELOCITY_LIMIT VELOCITY=1_00\n", "G1 X200 F30000\n"),   # Python-only spelling
     ("M204 S0.001\nM204 P10000\n", "G1 X200 F30000\n"),          # a lone P never lifts the limit
     ("", "G92\nG1 X200 F60\n"),                                  # a bare G92 resets every axis
     ("M220 S10000\nM220\n", "G1 X200 F60\n"),                   # a bare M220 is back to 100 %
 ], ids=["g92-x", "g28", "m220", "e-only", "m190", "m140", "arc", "arc-before",
         "velocity-limit", "accel-limit", "limit-inside", "m220-dup", "f-dup", "m204-pt",
-        "z-cap", "e-cap", "xy-cap", "unmodelled-limit", "lone-p", "bare-g92", "bare-m220"])
+        "z-cap", "e-cap", "xy-cap", "unmodelled-limit", "nan-limit", "underscore-limit",
+        "lone-p", "bare-g92", "bare-m220"])
 def test_only_the_towers_own_shape_may_stand_inside_a_pending_window(before, inside):
     # review finding (PR #13, Codex round 6): every loophole was a command the wipe tower never
     # writes, or a global that scales a move's real time. So the window admits only the tower's
@@ -793,14 +796,14 @@ def test_only_the_towers_own_shape_may_stand_inside_a_pending_window(before, ins
     # breaks the wait on anything else.
     frame = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
     change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
-    probe = frame.replace(change, "G1 X0 Y0 F30000\n" + before + "M83\nM104 S220\n" + inside
+    probe = frame.replace(change, "G1 X0 Y0 Z0.2 F30000\n" + before + "M83\nM104 S220\n" + inside
                           + "G1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
     assert probe != frame
     with pytest.raises(PrinterError) as bad:
         up.parse_gcode_text(probe)
     assert "Nothing was sent" in bad.value.message
     # and the tower's own shape, with the same globals restored to stock, still passes
-    ok = frame.replace(change, "G1 X0 Y0 F30000\nM83\nM104 S220\nG4 S0\nG92 E0\nM220 S100\n"
+    ok = frame.replace(change, "G1 X0 Y0 Z0.2 F30000\nM83\nM104 S220\nG4 S0\nG92 E0\nM220 S100\n"
                        "G1 X200 F30000\nG1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
     ok = ok.replace("T1\nM109 S210", "T1\nM109 S220", 1)
     assert up.parse_gcode_text(ok).tools[1].extrusion_nozzle_temps[-1] == 220.0
@@ -814,12 +817,15 @@ def test_the_position_is_unknown_after_a_purge_so_a_crawl_after_it_breaks_the_wa
     change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
     # after the first (start) purge the position is unknown: a pending change opened right
     # after it with a move to X0 Y0 at F1 must break (no known start), not count as zero
-    probe = frame.replace(change, "G1 X0 Y0 F30000\n" + change + "\nT1\nM83\nM104 S220\nG1 X0 Y0 F1\nG1 E-2 F1800\n"
-                          + change.replace("S210", "S220"), 1)
-    assert probe != frame
+    start = "M6211 A1 L200 T0 Q210 R210 S210"
+    assert start in frame
+    probe = frame.replace(start, "G1 X0 Y0 Z0.2 F30000\n" + start, 1)   # position known BEFORE
+    probe = probe.replace(change, "M83\nM104 S220\nG1 X0 Y0 Z0.2 F1\nG1 E-2 F1800\n"  # the purge
+                          + change.replace("S210", "S220"), 1)             # cleared it: a crawl
+    assert probe != frame                                                 # "back" is unknowable
     with pytest.raises(PrinterError) as bad:
         up.parse_gcode_text(probe)
-    assert "Nothing was sent" in bad.value.message
+    assert "only retractions" in bad.value.message
 
 
 def test_an_empty_position_in_a_per_tool_list_refuses_instead_of_shifting_tool_numbers():

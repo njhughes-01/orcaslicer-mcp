@@ -974,6 +974,7 @@ PENDING_WINDOW_LINES = 24
 # a single line. A move whose distance or feedrate cannot be known (no position yet, no F yet,
 # an arc) breaks the wait too (review finding, PR #13, Codex round 5).
 PENDING_WINDOW_S = 5.0
+_PLAIN_NUMBER_RE = re.compile(r"[-+]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?")
 # The printer's own axis limits (the stock Orca machine profile the CC2 inherits,
 # fdm_elegoo_3dp_001_common: X/Y 500 mm/s at 20000 mm/s², Z 20 mm/s at 500 mm/s², E 30 mm/s at
 # 5000 mm/s²): the firmware slows any move to these whatever F the file writes, so a huge F
@@ -1725,9 +1726,14 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
         if head == "SET_VELOCITY_LIMIT":
             for token in rest.split():
                 key, _, raw = token.partition("=")
-                try:
-                    number = float(raw)
-                except ValueError:
+                # a plain finite number only (the shape a move parameter has): ``nan``, ``inf``,
+                # ``1_00`` and unicode digits are what Python's float() takes and a C++ firmware
+                # does not, so they are unknowable limits, never silently ignored (Opus round 6)
+                if not _PLAIN_NUMBER_RE.fullmatch(raw):
+                    motion_limits_unknown = True
+                    continue
+                number = float(raw)
+                if number != number or number in (float("inf"), float("-inf")):
                     motion_limits_unknown = True
                     continue
                 if key.upper() == "VELOCITY":
