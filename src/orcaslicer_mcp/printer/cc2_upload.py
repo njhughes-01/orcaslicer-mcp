@@ -1454,6 +1454,10 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     pos: dict[str, float] = {}
     last_feed: float | None = None
     pending_motion_s = 0.0
+    # the M220 speed factor in force (percent): it scales every move's real duration, so the
+    # window's time estimate divides by it (``M220 S1`` makes an F30000 travel a hundred times
+    # slower — review finding, PR #13, Codex round 6)
+    speed_factor = 100.0
     extrusion_temps: list[float] = []
     # per-tool verified-extrusion story: tool index -> temperatures that tool's extrusion ran
     # behind a verified wait, first order seen (the file-wide ``extrusion_temps`` stays the union
@@ -1505,30 +1509,53 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                           "refused rather than skipped, so no extrusion can ride on a heater "
                           "change the file never proved it waited at")
         if pending_tool_temp is not None and pending_since is not None and not wait_broken:
-            if idx - pending_since > PENDING_WINDOW_LINES or head in ("G180", "BED_MESH_CALIBRATE",
-                                                                       "G2", "G3", "G02", "G03"):
+            # Inside a pending tool change only the wipe tower's own shape may appear — the
+            # premise "the hot end still holds the old wait" is true for nothing else. Anything
+            # not listed here (G28 homing, a bed wait, a chamber or heater word, a mesh pass, a
+            # G180 macro, an arc, a coordinate reset on X/Y/Z, a speed-factor change, a pause…)
+            # breaks the wait, and the listed moves accrue estimated time against the budget
+            # (review findings, PR #13, Codex rounds 4–6: line counts bound nothing, and every
+            # loophole was a command the tower never writes).
+            if idx - pending_since > PENDING_WINDOW_LINES:
                 wait_broken = True
             elif head == "G4":
                 dwell = _move_params(rest)
                 if dwell is None or any(letter in ("P", "S", "D") and value > 0.0
                                         for letter, value in dwell):
                     wait_broken = True
-            elif head in _MOVE_HEADS:
+            elif head in ("G0", "G1", "G00", "G01"):
                 mv = _move_params(rest)
                 if mv is None:
                     wait_broken = True
                 else:
                     feed = next((v for l, v in mv if l == "F"), last_feed)
                     axes = {l: v for l, v in mv if l in ("X", "Y", "Z")}
+                    e_len = sum(abs(v) for l, v in mv if l == "E")
                     if axes and any(a not in pos for a in axes):
                         wait_broken = True      # no known start point: distance unknowable
-                    elif feed is None or feed <= 0.0:
+                    elif feed is None or feed <= 0.0 or speed_factor <= 0.0:
                         wait_broken = True      # no known feedrate: time unknowable
                     else:
                         dist = sum((axes[a] - pos[a]) ** 2 for a in axes) ** 0.5 if axes else 0.0
-                        pending_motion_s += dist / feed * 60.0
+                        pending_motion_s += max(dist, e_len) / (feed * speed_factor / 100.0) * 60.0
                         if pending_motion_s > PENDING_WINDOW_S:
                             wait_broken = True
+            elif head == "G92":
+                g92 = _move_params(rest)
+                if g92 is None or any(l in ("X", "Y", "Z") for l, _ in g92):
+                    wait_broken = True          # only the tower's own ``G92 E0`` is its shape
+            elif head == "M220":
+                m220 = _move_params(rest)
+                if m220 is None or m220 != [("S", 100.0)]:
+                    wait_broken = True          # the tower writes exactly ``M220 S100``
+            elif (head in ("M106", "M107", "M73", "M83", "M6211", "M104", "M109",
+                           "SET_PRESSURE_ADVANCE", "SET_VELOCITY_LIMIT", "SET_PRINT_STATS_INFO")
+                  or _TOOL_RE.match(line.upper())):
+                pass                            # the tower's own lines; heater codes are judged
+                                                # by their own branches below (a second bare
+                                                # M104 breaks the wait there, an M109 retires it)
+            else:
+                wait_broken = True
         if head in ("M104", "M109", "M140", "M190"):
             # parameter letters fold to upper case (see _parse_S), so `M104 s140` is the setpoint
             # `M104 S140` is. Only letters fold, never the count: the S parameters are still counted
@@ -1630,6 +1657,17 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
             continue
         if head == "M83":
             relative_e = True      # read here; the allow-list policy below still checks the line
+        if head == "G92":          # a coordinate reset IS the new position (G92 X-200 then
+            g92 = _move_params(rest)  # G1 X0 is a 200 mm move); read here, policy-checked below
+            for letter, value in (g92 or []):
+                if letter in ("X", "Y", "Z"):
+                    pos[letter] = value
+        if head == "G28":          # homing: the position is whatever the firmware's home is
+            pos.clear()
+        if head == "M220":         # the speed factor in force, read here; the policy still checks it
+            m220 = _move_params(rest)
+            if m220 and len(m220) == 1 and m220[0][0] == "S":
+                speed_factor = m220[0][1]
         if head == "BED_MESH_CALIBRATE":
             # design 4 (and the rewritten reason on _SAFE_WORD_COMMANDS): no verified M109 wait
             # is carried across this line — the calibration body is a binary-only library whose

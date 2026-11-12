@@ -761,6 +761,35 @@ def test_a_welded_dwell_parameter_still_breaks_the_wait():
     assert "no M109 was ever waited" in bad.value.message
 
 
+@pytest.mark.parametrize("before, inside", [
+    ("G92 X-200\n", "G1 X0 F60\n"),            # a coordinate reset makes a 200 mm move of X0
+    ("", "G28\n"),                               # homing: unbounded time, position unknown
+    ("M220 S1\n", "G1 X200 F30000\n"),          # a 1 % speed factor: 40 s for an F30000 travel
+    ("", "G1 E-20 F1\n"),                        # an E-only retract at F1: twenty minutes
+    ("", "M190 S100\n"),                         # a bed wait blocks while the nozzle cools
+    ("", "M140 S60\n"),                          # any command the tower never writes
+    ("", "G2 X10 Y10 I5 J5 F30000\n"),           # an arc
+], ids=["g92-x", "g28", "m220", "e-only", "m190", "m140", "arc"])
+def test_only_the_towers_own_shape_may_stand_inside_a_pending_window(before, inside):
+    # review finding (PR #13, Codex round 6): every loophole was a command the wipe tower never
+    # writes, or a global that scales a move's real time. So the window admits only the tower's
+    # own lines, estimates time with the speed factor and coordinate resets in force, and
+    # breaks the wait on anything else.
+    frame = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+    change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
+    probe = frame.replace(change, "G1 X0 Y0 F30000\n" + before + "M83\nM104 S220\n" + inside
+                          + "G1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
+    assert probe != frame
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "Nothing was sent" in bad.value.message
+    # and the tower's own shape, with the same globals restored to stock, still passes
+    ok = frame.replace(change, "G1 X0 Y0 F30000\nM83\nM104 S220\nG4 S0\nG92 E0\nM220 S100\n"
+                       "G1 X200 F30000\nG1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
+    ok = ok.replace("T1\nM109 S210", "T1\nM109 S220", 1)
+    assert up.parse_gcode_text(ok).tools[1].extrusion_nozzle_temps[-1] == 220.0
+
+
 def test_an_empty_position_in_a_per_tool_list_refuses_instead_of_shifting_tool_numbers():
     # review finding (PR #11): ``PLA;;PETG`` once collapsed to ["PLA", "PETG"], handing tool 2's
     # PETG to tool 1 — for a per-tool key the position IS the tool number, so a blank is a tool
