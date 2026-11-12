@@ -1817,7 +1817,10 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                 raise _refuse(f"the move {line[:40]!r} carries a parameter this parser cannot "
                               "read, so it cannot rule out an extrusion hidden in it — refusing "
                               "rather than assuming a move it cannot tokenise does not extrude")
-            if head in ("G0", "G1", "G00", "G01"):   # linear moves carry the position story
+            if head in ("G0", "G1", "G00", "G01", "G2", "G02", "G3", "G03"):
+                # every move with an endpoint carries the position story — arcs included, whose
+                # X/Y/Z are their endpoints (review finding, PR #13, Opus round 4: an arc before
+                # a pending window must not leave a stale position behind)
                 for letter, value in params:
                     if letter in ("X", "Y", "Z"):
                         pos[letter] = value

@@ -769,7 +769,8 @@ def test_a_welded_dwell_parameter_still_breaks_the_wait():
     ("", "M190 S100\n"),                         # a bed wait blocks while the nozzle cools
     ("", "M140 S60\n"),                          # any command the tower never writes
     ("", "G2 X10 Y10 I5 J5 F30000\n"),           # an arc
-], ids=["g92-x", "g28", "m220", "e-only", "m190", "m140", "arc"])
+    ("G2 X200 Y0 I100 J0 F30000\n", "G1 X0 Y0 F60\n"),  # an arc BEFORE the window moved the head
+], ids=["g92-x", "g28", "m220", "e-only", "m190", "m140", "arc", "arc-before"])
 def test_only_the_towers_own_shape_may_stand_inside_a_pending_window(before, inside):
     # review finding (PR #13, Codex round 6): every loophole was a command the wipe tower never
     # writes, or a global that scales a move's real time. So the window admits only the tower's
