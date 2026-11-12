@@ -955,7 +955,8 @@ def _declared_for_tool(values: list[str] | None, tool: int) -> float | None:
         return None
 
 
-def _other_tool_declares(values: list[str] | None, current_tool: int, value: float) -> bool:
+def _other_tool_declares(values: list[str] | None, current_tool: int, value: float,
+                         selected: set[int] | None = None) -> bool:
     """Design 3a: does some tool **other than** the one in force declare a steady
     ``nozzle_temperature`` of exactly ``value``? Read refusal-free off the merged position list
     like design 2's transition check (``_declared_list_or_none``): a value that is not a number
@@ -968,6 +969,8 @@ def _other_tool_declares(values: list[str] | None, current_tool: int, value: flo
     for index, raw in enumerate(values):
         if index == current_tool:
             continue
+        if selected is not None and index not in selected:
+            continue        # a spare filament's temperature arms nothing: the file never uses it
         try:
             declared = float(raw)
         except ValueError:
@@ -1328,11 +1331,19 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     # naming the absence, a list that disagrees with itself refuses naming the values, and a
     # value that is not the one model refuses naming what the file said. The gate lives at the
     # upload; the receipt is unchanged.
-    try:
-        printer_model = _config_single(config, "printer_model", "printer model")
-    except PrinterError as bad:
-        raise PrinterError("protocol_error", bad.message, hint=_MODEL_HINT,
-                           reason="printer_model") from None
+    model_lines = config.get("printer_model") or []
+    model_values: list[str] = []
+    for raw in model_lines:
+        for piece in _config_value(raw):
+            if piece and piece not in model_values:
+                model_values.append(piece)
+    if not model_values:
+        raise _model_refuse("it carries no printer model (no '; printer_model =' config line), "
+                            "and which machine it was sliced for is not a thing to guess")
+    if len(model_values) > 1:
+        raise _model_refuse(f"its '; printer_model =' lines disagree ({model_values[:4]}), and a "
+                            "file that cannot say which one machine it was sliced for is refused")
+    printer_model = model_values[0]
     if printer_model != CC2_PRINTER_MODEL:
         raise _model_refuse(f"its printer model is {printer_model!r}, not {CC2_PRINTER_MODEL!r}: "
                             "this workflow reads one printer's published firmware and uploads to "
@@ -1361,6 +1372,20 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     # only-when-used exception it is.
     firsts_pre = _declared_list_or_none(config, "nozzle_temperature_initial_layer")
     nozzles_pre = _declared_list_or_none(config, "nozzle_temperature")
+    # the tools the file names anywhere — its own T<n> selects and its purges' T — read in one
+    # cheap pass before the scan, so design 3a's "some other tool" means a tool this file
+    # actually uses and never a spare filament of a larger project (review finding, PR #13);
+    # the scan's own tool rules are unchanged by this and still decide what the file's tools ARE
+    selected_pre: set[int] = set()
+    for raw_line in text_lines:
+        stripped = raw_line.split(";", 1)[0].strip()
+        if not stripped:
+            continue
+        if m := _TOOL_RE.match(stripped.upper()):
+            selected_pre.add(int(m.group(1)))
+        elif stripped[:5].upper() == "M6211":
+            if m := re.search(r"(?i)\bT\s*([0-9]+)", stripped[5:]):
+                selected_pre.add(int(m.group(1)))
 
     nozzle_cmds: list[float] = []
     bed_cmds: list[float] = []
@@ -1380,6 +1405,11 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     # steady temperature arms it while the old wait stands; retractions run behind that wait, any
     # forward extrusion refuses, and an ``M6211`` retires it (the firmware waits at its ``S``)
     pending_tool_temp: float | None = None
+    # E mode: the design-3a retract exception trusts the SIGN of an E value, and a negative E
+    # is a retract only in relative-E mode (M83). The firmware starts in absolute mode, where
+    # ``G92 E-100`` then ``G1 E-2`` pushes 98 mm forward — so the exception needs M83 to have
+    # been seen (review finding, PR #13; M82 stays refused, and G90 does not clear M83 on Klipper)
+    relative_e = False
     extrusion_temps: list[float] = []
     # per-tool verified-extrusion story: tool index -> temperatures that tool's extrusion ran
     # behind a verified wait, first order seen (the file-wide ``extrusion_temps`` stays the union
@@ -1486,7 +1516,8 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                         if value not in per_tool_temps.setdefault(current_tool, []):
                             per_tool_temps[current_tool].append(value)
                     elif (armed and current_tool is not None and value != waited
-                            and _other_tool_declares(nozzles_pre, current_tool, value)):
+                            and _other_tool_declares(nozzles_pre, current_tool, value,
+                                                     selected_pre)):
                         # design 3a: the wipe-tower tool change as the slicer writes it — the
                         # observed order is M104 S<next>, a G1 E-2 retract, travel, then the
                         # change_filament M6211 whose S is this very number. The target moves
@@ -1520,6 +1551,8 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                 nozzle_target, waited = None, None
                 pending_tool_temp = None  # nothing past the unload is knowable, pending included
             continue
+        if head == "M83":
+            relative_e = True      # read here; the allow-list policy below still checks the line
         if head == "BED_MESH_CALIBRATE":
             # design 4 (and the rewritten reason on _SAFE_WORD_COMMANDS): no verified M109 wait
             # is carried across this line — the calibration body is a binary-only library whose
@@ -1673,7 +1706,7 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                                   "that is the heater off, and an extrusion there would be a cold one")
                 if waited != nozzle_target:
                     if (pending_tool_temp is not None and waited is not None
-                            and nozzle_target == pending_tool_temp
+                            and nozzle_target == pending_tool_temp and relative_e
                             and all(v < 0.0 for v in e_values)):
                         # design 3a: the wipe-tower retract behind a pending tool-change setpoint.
                         # The hot end still holds the verified wait (the M104 only moved the

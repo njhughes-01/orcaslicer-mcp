@@ -46,8 +46,8 @@ The parser SHALL compare the file's embedded start, end and change-filament temp
 - **THEN** `vendor_templates` is `stock`
 
 ### Requirement: Tray-table note
-Every `cc2_start_print` reply SHALL carry a note that the physical tray is chosen by the printer's persistent colour table inside `M6211`, not by the file's `T`.
+Every start result (accepted, refused after the printer was read, or ambiguous) SHALL carry a note that the physical tray is chosen by the printer's persistent colour table inside `M6211`, not by the file's `T`.
 
 #### Scenario: note present
-- **WHEN** any start returns
+- **WHEN** a start result is built after the printer was read
 - **THEN** its notes include the tray-table sentence

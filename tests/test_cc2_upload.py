@@ -570,15 +570,58 @@ def test_a_pending_tool_setpoint_must_be_the_purges_s():
     assert frame != _two_tool_frame()
     change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
     assert change in frame
-    bad_probe = frame.replace(change, "M104 S220\nG1 E-2 F1800\n" + change, 1)
+    bad_probe = frame.replace(change, "M83\nM104 S220\nG1 E-2 F1800\n" + change, 1)
     with pytest.raises(PrinterError) as bad:
         up.parse_gcode_text(bad_probe)
     assert "tool-change setpoint of 220" in bad.value.message
     # and the honest mixed-temperature change (S 220) passes, with 220 on tool 1 only
-    good = frame.replace(change, "M104 S220\nG1 E-2 F1800\n"
+    good = frame.replace(change, "M83\nM104 S220\nG1 E-2 F1800\n"
                          + change.replace("S210", "S220"), 1).replace("T1\nM109 S210", "T1\nM109 S220", 1)
     s = up.parse_gcode_text(good)
     assert 220.0 in s.tools[1].extrusion_nozzle_temps and 220.0 not in s.tools[0].extrusion_nozzle_temps
+
+
+def test_the_tool_change_retract_exception_needs_relative_e_mode():
+    # review finding (PR #13, Opus): a negative E is a retract only after M83; in the firmware's
+    # default absolute mode ``G92 E-100`` then ``G1 E-2`` pushes 98 mm forward while the target
+    # moves toward an unverified temperature. With every M83 gone the move must refuse; with the
+    # vendor's M83 in place (as in every stock slice) the same change passes.
+    frame = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+    change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
+    good = frame.replace(change, "M83\nM104 S220\nG1 E-2 F1800\n" + change.replace("S210", "S220"),
+                         1).replace("T1\nM109 S210", "T1\nM109 S220", 1)
+    assert up.parse_gcode_text(good).tools[1].extrusion_nozzle_temps[-1] == 220.0
+    absolute = good.replace("M83\n", "", 1).replace("M104 S220\nG1 E-2", "M104 S220\nG92 E-100\nG1 E-2", 1)
+    assert "M83" not in absolute
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(absolute)
+    assert "no M109 was ever waited" in bad.value.message
+
+
+def test_a_spare_filaments_temperature_arms_no_pending_tool_change():
+    # review finding (PR #13, Opus): a one-colour file from a two-filament project declares a
+    # second temperature for a tool it never selects; an M104 to that number is an ordinary
+    # unverified setpoint, never a tool change, so the next extrusion refuses
+    base = gcode_text(nozzle_first=210.0, nozzle=210.0, config_extra=())
+    base = base.replace("; nozzle_temperature = 210\n", "; nozzle_temperature = 210,220\n", 1)
+    base = base.replace("; nozzle_temperature_initial_layer = 210\n",
+                        "; nozzle_temperature_initial_layer = 210,220\n", 1)
+    probe = base.replace("G1 X127 Y-1.2 F20000\n", "M104 S220\nG1 E-1 F1800\nG1 X127 Y-1.2 F20000\n", 1)
+    assert probe != base
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "no M109 was ever waited" in bad.value.message
+
+
+def test_disagreeing_printer_model_lines_refuse_with_their_own_words():
+    base = gcode_text()
+    probe = base.replace("; printer_model = Elegoo Centauri Carbon 2\n",
+                         "; printer_model = Elegoo Centauri Carbon 2\n; printer_model = Elegoo Centauri 2\n", 1)
+    assert probe != base
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert bad.value.details.get("reason") == "printer_model"
+    assert "disagree" in bad.value.message and "plate key" not in bad.value.message
 
 
 def test_an_empty_position_in_a_per_tool_list_refuses_instead_of_shifting_tool_numbers():

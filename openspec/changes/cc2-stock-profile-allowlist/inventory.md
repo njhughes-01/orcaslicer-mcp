@@ -192,7 +192,7 @@ The unmodified control was accepted. All four variants were refused with the mes
 | 6 | **M141 / M191** (plus `M106 P2 S255`) | Generator chamber control (R2#15-16) | Refused | **Keep refused.** R3: no handler, so the chamber would not heat as the file claims. Nathan's rule: never heat the chamber for PETG |
 | 7 | **SET_INPUT_SHAPER** | Generator calibration prints only (R2#20) | Refused | Unknown firmware handler; calibration only |
 | 8 | **G10 / G11** | Generator with `use_firmware_retraction=1` (R2#9) | Refused (blocked) | **Keep refused.** R3: no handler, so the retractions would silently not happen |
-| 9 | **M82** | Generator with `use_relative_e_distances=0` (R2#7), together with writer `G92 E0` resets | Refused | Possibly admissible: the fork gates any E as an extrusion, so absolute E does not weaken the gate. R3 D5 notes M6211's flush amount depends on the E mode. Not stock |
+| 9 | **M82** | Generator with `use_relative_e_distances=0` (R2#7), together with writer `G92 E0` resets | Refused | Keep refused: since PR #13 the tool-change retract exception trusts the sign of E, which only means a retract in relative-E mode (M83), so absolute E would weaken the gate. R3 D5 notes M6211's flush amount depends on the E mode. Not stock |
 
 **Explicit non-gaps.** These are covered today or have no stock emitter:
 - **SET_CONDITION**: only inside G180 bodies; no template or generator writes it (R1§A, R2§A). The fork refusing it in files is right, per R3 finding 3.
