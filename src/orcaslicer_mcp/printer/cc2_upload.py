@@ -964,6 +964,19 @@ def _declared_for_tool(values: list[str] | None, tool: int) -> float | None:
 # steady of 100 °C must never be promoted to a verified wait by the exception).
 LAYER_TWO_STEP_MAX_C = 10.0
 
+# How many lines the wipe tower's own tool-change shape spans between its M104 S<next> and the
+# M6211 (the real two-colour slice: 18 lines — M104, G4 S0, a retract, travels, fan lines).
+# A pending setpoint older than this has had time to cool the hot end and breaks the wait.
+PENDING_WINDOW_LINES = 24
+
+
+def _looks_numeric(text: str) -> bool:
+    try:
+        float(text)
+    except ValueError:
+        return False
+    return True
+
 
 def _other_tool_declares(values: list[str] | None, current_tool: int, value: float,
                          selected: set[int] | None = None) -> bool:
@@ -1425,6 +1438,13 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     # bare M104 restores nothing, because nothing waited for the hot end to get back there
     # (review finding, PR #13: a stale wait resurrected by re-commanding its target)
     wait_broken = False
+    # design 3a stands on "the hot end still holds the old wait" — true only for the wipe tower's
+    # own shape (M104, G4 S0, a retract, a few travels, then the M6211 within a couple of dozen
+    # lines). A dwell with any duration, a firmware macro, a mesh pass, or a window longer than
+    # the tower's between the pending setpoint and its purge is time the hot end spends cooling
+    # toward the pending target, so it breaks the wait (review finding, PR #13: a pending
+    # setpoint must not preserve a stale wait through unlimited cooling)
+    pending_since: int | None = None
     extrusion_temps: list[float] = []
     # per-tool verified-extrusion story: tool index -> temperatures that tool's extrusion ran
     # behind a verified wait, first order seen (the file-wide ``extrusion_temps`` stays the union
@@ -1475,6 +1495,12 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                           "to one M109-verifiable setpoint — Klipper extended heater commands are "
                           "refused rather than skipped, so no extrusion can ride on a heater "
                           "change the file never proved it waited at")
+        if pending_tool_temp is not None and pending_since is not None and not wait_broken:
+            if idx - pending_since > PENDING_WINDOW_LINES or head in ("G180", "BED_MESH_CALIBRATE"):
+                wait_broken = True
+            elif head == "G4" and any(_parse_S(tok) > 0.0 for tok in rest.split()
+                                      if tok[:1].upper() in "PSD" and _looks_numeric(tok[1:])):
+                wait_broken = True
         if head in ("M104", "M109", "M140", "M190"):
             # parameter letters fold to upper case (see _parse_S), so `M104 s140` is the setpoint
             # `M104 S140` is. Only letters fold, never the count: the S parameters are still counted
@@ -1546,6 +1572,7 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                         # keeps today's rule below.
                         nozzle_target = value
                         pending_tool_temp = value
+                        pending_since = idx
                     else:                  # any other bare M104: a target moved without a wait
                         if value != nozzle_target or value != waited:
                             wait_broken = True  # and re-commanding the old number never mends it
@@ -1555,6 +1582,7 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                 else:                     # M109: the target, and a verified wait at exactly it
                     nozzle_target = waited = value
                     wait_broken = False
+                    pending_tool_temp = None  # a real wait at any value retires a pending change
                 if head == "M109":
                     mesh_seen = False     # a fresh wait now stands behind the target again
                     pending_tool_temp = None  # and no tool-change setpoint is pending any more
@@ -1602,11 +1630,16 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                                   "waited at (the most recent verified wait was "
                                   + _wait_lost()
                                   + ") — heat and wait at the purge temperature first")
-            elif waited is None:
+            elif waited is None or wait_broken:
                 raise _refuse(f"the purge command {line[:40]!r} runs mid-tool-change at a "
                               f"pending {pending_tool_temp:g} °C setpoint with no verified wait "
                               "standing (the most recent verified wait was "
-                              + _wait_lost() + ") — the purge retracts, cuts and channel-checks "
+                              + _wait_lost() + ("" if not wait_broken else
+                                                ", and the hot end has had time to cool off it: a "
+                                                "dwell, a macro or more lines than the wipe "
+                                                "tower's own shape came between the setpoint and "
+                                                "this purge")
+                              + ") — the purge retracts, cuts and channel-checks "
                               "the outgoing filament behind that wait, so it must still stand")
             # the purge's own parameters, read the way this printer's firmware reads them: its T is
             # a filament switch and its Q, R and S are the setpoints it heats to (see _PURGE_FIELDS

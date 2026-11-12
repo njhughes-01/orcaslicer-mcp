@@ -671,6 +671,41 @@ def test_the_layer_two_step_is_bounded_by_the_vendor_margin():
         up.parse_gcode_text(big)
 
 
+def test_a_pending_setpoint_cannot_preserve_a_wait_through_a_dwell():
+    # review finding (PR #13, Codex round 4): M109 S210, a pending M104 S100 (tool 1 declared
+    # at 100), then a 600 s dwell — the hot end is at 100 by the time the retract runs, so the
+    # "still holds the old wait" premise of design 3a is gone: the retract and the purge refuse
+    frame = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,100", 1)
+    change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
+    probe = frame.replace(change, "M83\nM104 S100\nG4 S600\nG1 E-2 F1800\n" + change.replace("S210", "S100"), 1)
+    assert probe != frame
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "no M109 was ever waited" in bad.value.message
+    # the same with no retract: the purge itself refuses, naming the cooling
+    probe2 = frame.replace(change, "M83\nM104 S100\nG4 S600\n" + change.replace("S210", "S100"), 1)
+    with pytest.raises(PrinterError) as bad2:
+        up.parse_gcode_text(probe2)
+    assert "time to cool" in bad2.value.message
+    # the tower's own shape (G4 S0, retract, purge within a few lines) still passes — at a
+    # declared 220 here, since the firmware clamps a purge S below 200 and refuses it anyway
+    frame220 = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+    ok = frame220.replace(change, "M83\nM104 S220\nG4 S0\nG1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
+    ok = ok.replace("T1\nM109 S210", "T1\nM109 S220", 1)
+    assert up.parse_gcode_text(ok).tools[1].extrusion_nozzle_temps[-1] == 220.0
+
+
+def test_a_pending_setpoint_older_than_the_towers_shape_breaks_the_wait():
+    frame = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+    change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
+    filler = "G1 X1 Y1 F3000\n" * (up.PENDING_WINDOW_LINES + 1)
+    probe = frame.replace(change, "M83\nM104 S220\n" + filler + change.replace("S210", "S220"), 1)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "time to cool" in bad.value.message
+    assert up.PENDING_WINDOW_LINES == 24
+
+
 def test_an_empty_position_in_a_per_tool_list_refuses_instead_of_shifting_tool_numbers():
     # review finding (PR #11): ``PLA;;PETG`` once collapsed to ["PLA", "PETG"], handing tool 2's
     # PETG to tool 1 — for a per-tool key the position IS the tool number, so a blank is a tool
