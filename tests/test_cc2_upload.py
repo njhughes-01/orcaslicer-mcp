@@ -775,8 +775,9 @@ def test_a_welded_dwell_parameter_still_breaks_the_wait():
     ("", "SET_VELOCITY_LIMIT ACCEL=10000\nG1 X200 F30000\n"),   # a limit word inside the window
     ("M220 S100 S1\n", "G1 X200 F30000\n"),                      # a repeated letter: the last wins
     ("", "G1 X200 F30000 F1\n"),                                 # a repeated letter inside
+    ("M204 P0.001 T0.001\n", "G1 X200 F30000\n"),                # Klipper's P/T accel form
 ], ids=["g92-x", "g28", "m220", "e-only", "m190", "m140", "arc", "arc-before",
-        "velocity-limit", "accel-limit", "limit-inside", "m220-dup", "f-dup"])
+        "velocity-limit", "accel-limit", "limit-inside", "m220-dup", "f-dup", "m204-pt"])
 def test_only_the_towers_own_shape_may_stand_inside_a_pending_window(before, inside):
     # review finding (PR #13, Codex round 6): every loophole was a command the wipe tower never
     # writes, or a global that scales a move's real time. So the window admits only the tower's

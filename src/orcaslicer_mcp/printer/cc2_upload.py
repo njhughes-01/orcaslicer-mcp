@@ -1689,10 +1689,12 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
             for letter, value in (_move_params(rest) or []):
                 if letter == "S":
                     speed_factor = value        # last S wins, as the firmware's map does
-        if head == "M204":         # acceleration limit in force
-            for letter, value in (_move_params(rest) or []):
-                if letter == "S":
-                    max_accel = value
+        if head == "M204":         # acceleration limit in force: Klipper reads S, else the
+            m204 = {l: v for l, v in (_move_params(rest) or [])}   # lesser of P (print) and
+            if "S" in m204:                                        # T (travel) — the firmware
+                max_accel = m204["S"]                              # takes min(P, T) (review
+            elif "P" in m204 or "T" in m204:                       # finding, PR #13, round 8)
+                max_accel = min(v for l, v in m204.items() if l in ("P", "T"))
         if head == "SET_VELOCITY_LIMIT":
             for token in rest.split():
                 key, _, raw = token.partition("=")
