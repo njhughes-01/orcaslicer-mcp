@@ -633,7 +633,7 @@ def test_the_start_blocks_purge_cannot_carry_a_new_wait_either():
     probe = base.replace("M6211 A1 L200 T0 Q220 R220 S220", "M6211 A1 L200 T0 Q220 R220 S225", 1)
     with pytest.raises(PrinterError) as bad:
         up.parse_gcode_text(probe)
-    assert "no tool in force yet" in bad.value.message
+    assert "before any purge in this file" in bad.value.message
 
 
 def test_re_commanding_the_old_target_never_mends_a_broken_wait():
@@ -704,6 +704,28 @@ def test_a_pending_setpoint_older_than_the_towers_shape_breaks_the_wait():
         up.parse_gcode_text(probe)
     assert "time to cool" in bad.value.message
     assert up.PENDING_WINDOW_LINES == 24
+
+
+def test_a_bare_select_is_not_a_purge_so_the_first_purge_cannot_carry_a_new_wait():
+    # review finding (PR #13, Opus round 3): a bare T0 is inert on this firmware, so after
+    # "M109 S210, T0, extrude" the loaded channel is still unknown and the first M6211 may be
+    # the same-channel purge the firmware skips — its S 220 is no wait, and the extrusion
+    # after it at 220 must refuse
+    frame = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+    start = "M6211 A1 L200 T0 Q210 R210 S210\n"
+    assert start in frame
+    no_start_purge = frame.replace(start, "", 1)
+    change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
+    probe = no_start_purge.replace(change, "M83\nM104 S220\nG1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
+    probe = probe.replace("T1\nM109 S210", "T1", 1)  # no M109 after the purge: it rode on S alone
+    assert probe != no_start_purge
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "before any purge in this file" in bad.value.message
+    # with the vendor's start-block purge present the same change passes (a purge has switched)
+    with_start = frame.replace(change, "M83\nM104 S220\nG1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
+    with_start = with_start.replace("T1\nM109 S210", "T1\nM109 S220", 1)
+    assert up.parse_gcode_text(with_start).tools[1].extrusion_nozzle_temps[-1] == 220.0
 
 
 def test_an_empty_position_in_a_per_tool_list_refuses_instead_of_shifting_tool_numbers():

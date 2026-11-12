@@ -1445,6 +1445,11 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     # toward the pending target, so it breaks the wait (review finding, PR #13: a pending
     # setpoint must not preserve a stale wait through unlimited cooling)
     pending_since: int | None = None
+    # whether any purge has been accepted yet: a bare T<n> is inert on this firmware
+    # (firmware-macros.md §C), so until an M6211 has actually switched a channel the loaded
+    # channel is unknown and ANY purge may be the same-channel one the firmware skips (review
+    # finding, PR #13, Opus round 3)
+    purge_seen = False
     extrusion_temps: list[float] = []
     # per-tool verified-extrusion story: tool index -> temperatures that tool's extrusion ran
     # behind a verified wait, first order seen (the file-wide ``extrusion_temps`` stays the union
@@ -1675,15 +1680,16 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                                         f"{purge.tool})")
                     + " — a mixed-temperature change must end with the purge waiting at the "
                     "incoming tool's declared steady temperature, the one the tower set")
-            if (current_tool is None or purge.tool == current_tool) and purge.final != waited:
+            if (not purge_seen or purge.tool == current_tool) and purge.final != waited:
                 # a purge naming the channel already loaded is one the firmware may skip outright
                 # (M6211 step 0 returns early when the tray is the current one — firmware-macros.md),
                 # so its internal M109 at S may never run: such a purge can carry no wait of its
                 # own, and its S must be the wait already in force (review finding, PR #13)
                 raise _refuse(
                     f"the purge command {line[:36]!r} switches to tool {purge.tool}, "
-                    + ("the tool already in force" if current_tool is not None else
-                       "with no tool in force yet (the firmware may already hold that channel)")
+                    + ("the tool already in force" if purge_seen else
+                       "before any purge in this file (a bare T<n> is inert on this firmware, so "
+                       "the firmware may already hold that channel)")
                     + f", and sets S to {purge.final:g} °C while the verified wait "
                     f"is {waited:g} °C — the firmware may skip a same-channel purge entirely, so "
                     "its S is no wait; heat and wait at the new temperature with an M109 instead")
@@ -1718,6 +1724,7 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
             leaving_temp = waited
             nozzle_target = waited = purge.final
             wait_broken = False
+            purge_seen = True
             pending_tool_temp = None
             if purge.final not in extrusion_temps:
                 extrusion_temps.append(purge.final)
