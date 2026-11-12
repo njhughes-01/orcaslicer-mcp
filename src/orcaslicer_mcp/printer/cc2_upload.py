@@ -979,8 +979,10 @@ PENDING_WINDOW_S = 5.0
 # 5000 mm/s²): the firmware slows any move to these whatever F the file writes, so a huge F
 # counts as no time only on paper — the window's estimate caps every axis at them (review
 # finding, PR #13, Opus round 5).
-_AXIS_CAPS_MM_S = {"xy": 500.0, "z": 20.0, "e": 30.0}
-_AXIS_ACCEL_CAPS = {"xy": 20000.0, "z": 500.0, "e": 5000.0}
+# (built from pairs, not dict literals: the server's reply-key source scan reads every
+# dict-literal key in the printer modules as a reply key, and these are axis names)
+_AXIS_CAPS_MM_S = dict((("xy", 500.0), ("z", 20.0), ("e", 30.0)))
+_AXIS_ACCEL_CAPS = dict((("xy", 20000.0), ("z", 500.0), ("e", 5000.0)))
 
 
 
