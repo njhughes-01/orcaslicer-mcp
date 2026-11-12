@@ -624,6 +624,33 @@ def test_disagreeing_printer_model_lines_refuse_with_their_own_words():
     assert "disagree" in bad.value.message and "plate key" not in bad.value.message
 
 
+def test_the_start_blocks_purge_cannot_carry_a_new_wait_either():
+    # review finding (PR #13, Codex round 2): with no tool in force yet the start-block purge
+    # may name a channel the firmware already holds and skip; its S is no wait, so S 225 after
+    # an M109 at 220 refuses just as a same-channel purge later in the file does
+    base = gcode_text(nozzle_first=220.0, nozzle=225.0)
+    assert "M6211 A1 L200 T0 Q220 R220 S220" in base
+    probe = base.replace("M6211 A1 L200 T0 Q220 R220 S220", "M6211 A1 L200 T0 Q220 R220 S225", 1)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "no tool in force yet" in bad.value.message
+
+
+def test_re_commanding_the_old_target_never_mends_a_broken_wait():
+    # review finding (PR #13, Codex round 2): M109 S220, a bare M104 S100 (wait broken), then a
+    # bare M104 S220 restores the NUMBER but nothing waited for the hot end to return — the
+    # layer-two step to 225 must not fire and the next extrusion must refuse
+    base = gcode_text(nozzle_first=220.0, nozzle=225.0)
+    probe = base.replace("M109 S225\n", "M104 S100\nG4 S600\nM104 S220\nM104 S225\n", 1)
+    assert probe != base
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "no M109 was ever waited" in bad.value.message
+    # and a fresh M109 mends it: the same file with M109 S220 instead of the bare restore passes
+    mended = base.replace("M109 S225\n", "M104 S100\nG4 S600\nM109 S220\nM104 S225\n", 1)
+    assert up.parse_gcode_text(mended).tools[0].extrusion_nozzle_temps == (220.0, 225.0)
+
+
 def test_an_empty_position_in_a_per_tool_list_refuses_instead_of_shifting_tool_numbers():
     # review finding (PR #11): ``PLA;;PETG`` once collapsed to ["PLA", "PETG"], handing tool 2's
     # PETG to tool 1 — for a per-tool key the position IS the tool number, so a blank is a tool
