@@ -1472,6 +1472,11 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     # so the window's time estimate honours them (review finding, PR #13, Codex round 7)
     max_velocity: float | None = None
     max_accel: float | None = None
+    # any motion-limit word this estimate does not model (SET_VELOCITY_LIMIT's
+    # ACCEL_TO_DECEL, MINIMUM_CRUISE_RATIO, SQUARE_CORNER_VELOCITY, …) makes every later move's
+    # real duration unknowable, so a pending window opened after it breaks at its first move
+    # (review finding, PR #13, Codex round 9); stock slices only ever write ACCEL=
+    motion_limits_unknown = False
     extrusion_temps: list[float] = []
     # per-tool verified-extrusion story: tool index -> temperatures that tool's extrusion ran
     # behind a verified wait, first order seen (the file-wide ``extrusion_temps`` stays the union
@@ -1540,7 +1545,7 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
             elif head in ("G0", "G1", "G00", "G01"):
                 mv = _move_params(rest)
                 letters = [l for l, _ in mv] if mv else []
-                if mv is None or len(set(letters)) != len(letters):
+                if mv is None or len(set(letters)) != len(letters) or motion_limits_unknown:
                     wait_broken = True          # unreadable, or a repeated letter (the firmware
                                                 # keeps the LAST, a reader the first: refuse both)
                 else:
@@ -1577,8 +1582,9 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                                 wait_broken = True
             elif head == "G92":
                 g92 = _move_params(rest)
-                if g92 is None or any(l in ("X", "Y", "Z") for l, _ in g92):
+                if not g92 or any(l != "E" for l, _ in g92):
                     wait_broken = True          # only the tower's own ``G92 E0`` is its shape
+                                                # (a bare G92 resets every axis: not the tower's)
             elif head == "M220":
                 m220 = _move_params(rest)
                 if m220 is None or m220 != [("S", 100.0)]:
@@ -1696,32 +1702,41 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
             relative_e = True      # read here; the allow-list policy below still checks the line
         if head == "G92":          # a coordinate reset IS the new position (G92 X-200 then
             g92 = _move_params(rest)  # G1 X0 is a 200 mm move); read here, policy-checked below
+            if not g92:
+                pos.clear()            # a bare G92 resets every axis: position unknown after it
             for letter, value in (g92 or []):
                 if letter in ("X", "Y", "Z"):
                     pos[letter] = value
         if head == "G28":          # homing: the position is whatever the firmware's home is
             pos.clear()
         if head == "M220":         # the speed factor in force, read here; the policy still checks it
-            for letter, value in (_move_params(rest) or []):
+            m220 = _move_params(rest) or []
+            if not any(l == "S" for l, _ in m220):
+                speed_factor = 100.0            # a bare M220 is the firmware's "back to 100 %"
+            for letter, value in m220:
                 if letter == "S":
                     speed_factor = value        # last S wins, as the firmware's map does
-        if head == "M204":         # acceleration limit in force: Klipper reads S, else the
-            m204 = {l: v for l, v in (_move_params(rest) or [])}   # lesser of P (print) and
-            if "S" in m204:                                        # T (travel) — the firmware
-                max_accel = m204["S"]                              # takes min(P, T) (review
-            elif "P" in m204 or "T" in m204:                       # finding, PR #13, round 8)
-                max_accel = min(v for l, v in m204.items() if l in ("P", "T"))
+        if head == "M204":         # acceleration limit in force: Klipper reads S, else BOTH P
+            m204 = {l: v for l, v in (_move_params(rest) or [])}   # and T (the lesser); a lone
+            if "S" in m204:                                        # P or T is ignored by the
+                max_accel = m204["S"]                              # firmware and keeps the old
+            elif "P" in m204 and "T" in m204:                      # limit (review findings,
+                max_accel = min(m204["P"], m204["T"])              # PR #13, rounds 8 and 9)
         if head == "SET_VELOCITY_LIMIT":
             for token in rest.split():
                 key, _, raw = token.partition("=")
                 try:
                     number = float(raw)
                 except ValueError:
+                    motion_limits_unknown = True
                     continue
                 if key.upper() == "VELOCITY":
                     max_velocity = number
                 elif key.upper() == "ACCEL":
                     max_accel = number
+                else:
+                    motion_limits_unknown = True   # ACCEL_TO_DECEL, MINIMUM_CRUISE_RATIO,
+                                                   # SQUARE_CORNER_VELOCITY, …: not modelled
         if head == "BED_MESH_CALIBRATE":
             # design 4 (and the rewritten reason on _SAFE_WORD_COMMANDS): no verified M109 wait
             # is carried across this line — the calibration body is a binary-only library whose

@@ -779,9 +779,13 @@ def test_a_welded_dwell_parameter_still_breaks_the_wait():
     ("", "G1 Z250 F3000000\n" * 2),                               # Z crawls at 20 mm/s whatever F says
     ("", "G1 E-500 F100000000\n"),                                # E at 30 mm/s: 17 s
     ("", ("G1 X200 F3000000\nG1 X0 F3000000\n") * 10),           # XY capped at 500 mm/s: 8 s
+    ("SET_VELOCITY_LIMIT ACCEL=10000 ACCEL_TO_DECEL=0.001\n", "G1 X200 F30000\n"),  # unmodelled limit
+    ("M204 S0.001\nM204 P10000\n", "G1 X200 F30000\n"),          # a lone P never lifts the limit
+    ("", "G92\nG1 X200 F60\n"),                                  # a bare G92 resets every axis
+    ("M220 S10000\nM220\n", "G1 X200 F60\n"),                   # a bare M220 is back to 100 %
 ], ids=["g92-x", "g28", "m220", "e-only", "m190", "m140", "arc", "arc-before",
         "velocity-limit", "accel-limit", "limit-inside", "m220-dup", "f-dup", "m204-pt",
-        "z-cap", "e-cap", "xy-cap"])
+        "z-cap", "e-cap", "xy-cap", "unmodelled-limit", "lone-p", "bare-g92", "bare-m220"])
 def test_only_the_towers_own_shape_may_stand_inside_a_pending_window(before, inside):
     # review finding (PR #13, Codex round 6): every loophole was a command the wipe tower never
     # writes, or a global that scales a move's real time. So the window admits only the tower's
