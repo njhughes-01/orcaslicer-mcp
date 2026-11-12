@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import stat
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -69,7 +70,9 @@ def gcode_text(*, material="PETG", plate="High Temp Plate",
     as on its own, a repeat ``M109`` before the purge move, one mid-print ``M140`` carrying the
     layer-apply temperature, the end block's S0 cooldowns, then the tail config block. The traps
     are load-bearing: ``M6211`` carries a T parameter, and the template config lines quote whole
-    start-G-code programs — a parser that reads comments or substrings as commands fails here."""
+    start-G-code programs — a parser that reads comments or substrings as commands fails here.
+    Every frame it writes declares the CC2 printer model (design 1's gate): omit it with
+    ``omit=("model",)``."""
     o = set(omit)
 
     def cmd(line, key):
@@ -101,6 +104,8 @@ def gcode_text(*, material="PETG", plate="High Temp Plate",
     if tail_cool:
         text += "M104 S0\nM140 S0 ;Turn-off bed\n"
     text += "; CONFIG_BLOCK_START\n"
+    if "model" not in o:
+        text += "; printer_model = Elegoo Centauri Carbon 2\n"
     if plate is not None and "plate" not in o:
         text += f"; curr_bed_type = {plate}\n"
     if material is not None and "material" not in o:
@@ -305,7 +310,8 @@ def _two_tool_frame(*, r_flush=240.0, range_high="240,240", nozzle=210.0):
             f"M6211 A1 L200 T0 Q{n} R{n} S{n}", "T0", f"M109 S{n}", "G1 E6 F251.567",
             f"M6211 T1 L34.9 M523 N523 Q{n} R{r_flush:g} S{n}", "T1", f"M109 S{n}",
             "G1 E3 F251.567", "M104 S0", "M140 S0"]
-    cfg = ("; curr_bed_type = High Temp Plate\n; filament_type = PLA;PLA\n"
+    cfg = ("; printer_model = Elegoo Centauri Carbon 2\n"
+           "; curr_bed_type = High Temp Plate\n; filament_type = PLA;PLA\n"
            f"; nozzle_temperature = {n},{n}\n"
            f"; nozzle_temperature_initial_layer = {n},{n}\n"
            f"; nozzle_temperature_range_high = {range_high}\n"
@@ -356,6 +362,8 @@ def test_the_two_tool_fixture_parses_to_two_pla_tools_at_210_flushing_at_240_on_
     # (tests/fixtures/cc2_two_tool.gcode.xz; raw .gcode is ignored by the repo rule).
     text = gcode_fixture("cc2_two_tool")
     s = up.parse_gcode_text(text)
+    # design 1: the real slice names the one printer this workflow serves, and the parse says so
+    assert s.printer_model == "Elegoo Centauri Carbon 2"
     assert [t.tool_index for t in s.tools] == [0, 1]
     assert [t.material for t in s.tools] == ["PLA", "PLA"]
     assert all((t.nozzle_first_layer_temp, t.nozzle_temp) == (210.0, 210.0) for t in s.tools)
@@ -369,6 +377,70 @@ def test_the_two_tool_fixture_parses_to_two_pla_tools_at_210_flushing_at_240_on_
     assert s.nozzle_setpoints == (140.0, 210.0)
     # and the real slice writes its speed overrides (M220 S100) — allowed by design 5, below
     assert "M220 S100" in text
+
+
+def test_the_two_tool_fixture_reports_its_templates_stock(gcode_fixture):
+    # design 5: the real slice was cut with the shipped OrcaSlicer 2.4.2 CC2 profiles, so its
+    # five template config keys must each match the verbatim stock text the data module holds
+    # — all five keys present, all five compared, none modified
+    s = up.parse_gcode_text(gcode_fixture("cc2_two_tool"))
+    assert s.vendor_templates == "stock"
+    assert s.templates_compared == 5
+
+
+def test_one_extra_line_in_the_end_template_reports_modified_and_never_refuses(gcode_fixture):
+    # the report's whole point: a hand-edited template is not a refusal (only the commands
+    # gate), it is a named key on the reply. One added line in machine_end_gcode, and only
+    # that key is named; the file still parses
+    text = gcode_fixture("cc2_two_tool")
+    line = next(ln for ln in text.splitlines() if ln.startswith("; machine_end_gcode = "))
+    edited = text.replace(line, line + "\\nM107", 1)  # one extra line in the escaped template
+    assert edited != text
+    s = up.parse_gcode_text(edited)
+    assert s.vendor_templates == "modified: machine_end_gcode"
+    assert s.templates_compared == 5
+
+
+def test_a_frame_without_template_keys_reports_stock_with_nothing_compared():
+    # a key the file never wrote is skipped, never guessed at: with none of the five present,
+    # "stock" here means nothing was compared, and templates_compared says so
+    s = up.parse_gcode_text(gcode_text(omit=("template_traps",)))
+    assert s.vendor_templates == "stock"
+    assert s.templates_compared == 0
+
+
+def test_present_but_non_stock_templates_are_named_in_stock_key_order():
+    # the reference frame's trap template lines quote whole programs that are not the stock
+    # text: both present keys are reported, in the order the stock module lists them, and the
+    # three keys the frame never writes are skipped, not counted
+    s = up.parse_gcode_text(gcode_text())
+    assert s.vendor_templates == "modified: machine_start_gcode, change_filament_gcode"
+    assert s.templates_compared == 2
+
+
+def test_a_file_not_sliced_for_the_centauri_carbon_2_refuses_naming_what_it_said():
+    # design 1's gate: this workflow judges every command against one printer's published
+    # firmware and uploads to that one printer, so the file's own printer_model must name it
+    # exactly. A near-miss name refuses and quotes it back; the accepted frame carries it.
+    near = gcode_text().replace("; printer_model = Elegoo Centauri Carbon 2",
+                                "; printer_model = Elegoo Centauri 2", 1)
+    assert near != gcode_text()
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(near)
+    assert bad.value.details["reason"] == "printer_model"
+    assert "'Elegoo Centauri 2'" in bad.value.message and "Nothing was sent" in bad.value.message
+
+
+def test_a_file_with_no_printer_model_line_refuses_naming_its_absence():
+    # a file that never says what it was sliced for is a file sliced for an unknown machine —
+    # refused for the same reason as a wrong name, with the missing key on the record
+    missing = gcode_text(omit=("model",))
+    assert "printer_model" not in missing
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(missing)
+    assert bad.value.details["reason"] == "printer_model"
+    assert "no '; printer_model =' config line" in bad.value.message
+    assert "Nothing was sent" in bad.value.message
 
 
 def test_a_flush_r_may_stand_off_the_verified_target_only_as_both_tools_declared_range_high():
@@ -461,6 +533,299 @@ def test_a_longer_per_tool_list_is_the_spare_filaments_of_a_larger_project():
                                "material", [0, 1]) == ["PLA", "PLA", "PETG", "ABS"]
     assert up._config_per_tool({"nozzle_temperature": ["210,210"]}, "nozzle_temperature",
                                "steady nozzle temperature", [0]) == ["210", "210"]
+
+
+def test_a_same_channel_purge_cannot_carry_a_new_wait():
+    # review finding (PR #13): M6211 naming the tool already loaded may be skipped outright by
+    # the firmware (step 0 returns early), so its internal M109 at S may never run — a second
+    # same-tool purge claiming S 225 after a 220 wait must refuse, never be recorded as waited
+    base = gcode_text(nozzle_first=220.0, nozzle=225.0)
+    probe = base.replace("M109 S225\n", "M6211 T0 L0 M523 N523 Q220 R220 S225\nT0\n", 1)
+    assert probe != base
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "already in force" in bad.value.message and "Nothing was sent" in bad.value.message
+
+
+def test_a_stale_wait_never_resurrects_the_layer_two_exception():
+    # review finding (PR #13): after M109 S220 a bare M104 S100 moves the target off the wait;
+    # a later M104 S225 (the declared steady temperature) is then an ordinary unverified
+    # setpoint, not the layer-two transition — the wait must be IN FORCE for the exception
+    base = gcode_text(nozzle_first=220.0, nozzle=225.0)
+    probe = base.replace("M109 S225\n", "M104 S100\nG4 S600\nM104 S225\n", 1)
+    assert probe != base
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "no M109 was ever waited" in bad.value.message
+    # the genuine transition (wait in force at 220, M104 to the declared 225) still passes
+    ok = base.replace("M109 S225\n", "M104 S225\n", 1)
+    s = up.parse_gcode_text(ok)
+    assert s.tools[0].extrusion_nozzle_temps == (220.0, 225.0)
+
+
+def test_a_pending_tool_setpoint_must_be_the_purges_s():
+    # review finding (PR #13): the wipe tower commanded 220 for the incoming tool; a purge whose
+    # S is 210 (the old wait) must refuse rather than silently consume the pending setpoint
+    frame = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+    assert frame != _two_tool_frame()
+    change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
+    assert change in frame
+    bad_probe = frame.replace(change, "M83\nM104 S220\nG1 E-2 F1800\n" + change, 1)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(bad_probe)
+    assert "tool-change setpoint of 220" in bad.value.message
+    # and the honest mixed-temperature change (S 220) passes, with 220 on tool 1 only
+    good = frame.replace(change, "M83\nM104 S220\nG1 E-2 F1800\n"
+                         + change.replace("S210", "S220"), 1).replace("T1\nM109 S210", "T1\nM109 S220", 1)
+    s = up.parse_gcode_text(good)
+    assert 220.0 in s.tools[1].extrusion_nozzle_temps and 220.0 not in s.tools[0].extrusion_nozzle_temps
+
+
+def test_the_tool_change_retract_exception_needs_relative_e_mode():
+    # review finding (PR #13, Opus): a negative E is a retract only after M83; in the firmware's
+    # default absolute mode ``G92 E-100`` then ``G1 E-2`` pushes 98 mm forward while the target
+    # moves toward an unverified temperature. With every M83 gone the move must refuse; with the
+    # vendor's M83 in place (as in every stock slice) the same change passes.
+    frame = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+    change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
+    good = frame.replace(change, "M83\nM104 S220\nG1 E-2 F1800\n" + change.replace("S210", "S220"),
+                         1).replace("T1\nM109 S210", "T1\nM109 S220", 1)
+    assert up.parse_gcode_text(good).tools[1].extrusion_nozzle_temps[-1] == 220.0
+    absolute = good.replace("M83\n", "", 1).replace("M104 S220\nG1 E-2", "M104 S220\nG92 E-100\nG1 E-2", 1)
+    assert "M83" not in absolute
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(absolute)
+    assert "no M109 was ever waited" in bad.value.message
+
+
+def test_a_spare_filaments_temperature_arms_no_pending_tool_change():
+    # review finding (PR #13, Opus): a one-colour file from a two-filament project declares a
+    # second temperature for a tool it never selects; an M104 to that number is an ordinary
+    # unverified setpoint, never a tool change, so the next extrusion refuses
+    base = gcode_text(nozzle_first=210.0, nozzle=210.0, config_extra=())
+    base = base.replace("; nozzle_temperature = 210\n", "; nozzle_temperature = 210,220\n", 1)
+    base = base.replace("; nozzle_temperature_initial_layer = 210\n",
+                        "; nozzle_temperature_initial_layer = 210,220\n", 1)
+    probe = base.replace("G1 X127 Y-1.2 F20000\n", "M104 S220\nG1 E-1 F1800\nG1 X127 Y-1.2 F20000\n", 1)
+    assert probe != base
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "no M109 was ever waited" in bad.value.message
+
+
+def test_disagreeing_printer_model_lines_refuse_with_their_own_words():
+    base = gcode_text()
+    probe = base.replace("; printer_model = Elegoo Centauri Carbon 2\n",
+                         "; printer_model = Elegoo Centauri Carbon 2\n; printer_model = Elegoo Centauri 2\n", 1)
+    assert probe != base
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert bad.value.details.get("reason") == "printer_model"
+    assert "disagree" in bad.value.message and "plate key" not in bad.value.message
+
+
+def test_the_start_blocks_purge_cannot_carry_a_new_wait_either():
+    # review finding (PR #13, Codex round 2): with no tool in force yet the start-block purge
+    # may name a channel the firmware already holds and skip; its S is no wait, so S 225 after
+    # an M109 at 220 refuses just as a same-channel purge later in the file does
+    base = gcode_text(nozzle_first=220.0, nozzle=225.0)
+    assert "M6211 A1 L200 T0 Q220 R220 S220" in base
+    probe = base.replace("M6211 A1 L200 T0 Q220 R220 S220", "M6211 A1 L200 T0 Q220 R220 S225", 1)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "before any purge in this file" in bad.value.message
+
+
+def test_re_commanding_the_old_target_never_mends_a_broken_wait():
+    # review finding (PR #13, Codex round 2): M109 S220, a bare M104 S100 (wait broken), then a
+    # bare M104 S220 restores the NUMBER but nothing waited for the hot end to return — the
+    # layer-two step to 225 must not fire and the next extrusion must refuse
+    base = gcode_text(nozzle_first=220.0, nozzle=225.0)
+    probe = base.replace("M109 S225\n", "M104 S100\nG4 S600\nM104 S220\nM104 S225\n", 1)
+    assert probe != base
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "no M109 was ever waited" in bad.value.message
+    # and a fresh M109 mends it: the same file with M109 S220 instead of the bare restore passes
+    mended = base.replace("M109 S225\n", "M104 S100\nG4 S600\nM109 S220\nM104 S225\n", 1)
+    assert up.parse_gcode_text(mended).tools[0].extrusion_nozzle_temps == (220.0, 225.0)
+
+
+def test_the_layer_two_step_is_bounded_by_the_vendor_margin():
+    # review finding (PR #13, Codex round 3): a file declaring a steady temperature of 100 °C
+    # after a 220 °C first layer must not have its bare M104 S100 promoted to a verified wait —
+    # the exception covers the slicer's small step (stock presets move 5 or 10 °C), nothing more
+    base = gcode_text(nozzle_first=220.0, nozzle=100.0)
+    probe = base.replace("M109 S100\n", "M104 S100\nG4 S600\n", 1)
+    assert probe != base
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "no M109 was ever waited" in bad.value.message
+    assert up.LAYER_TWO_STEP_MAX_C == 10.0
+    # the stock 10 °C step (Generic ABS 260→270) still rides the wait
+    abs_frame = gcode_text(nozzle_first=260.0, nozzle=270.0).replace("M109 S270\n", "M104 S270\n", 1)
+    assert up.parse_gcode_text(abs_frame).tools[0].extrusion_nozzle_temps == (260.0, 270.0)
+    # and an 11 °C step needs its M109
+    big = gcode_text(nozzle_first=220.0, nozzle=231.0).replace("M109 S231\n", "M104 S231\n", 1)
+    with pytest.raises(PrinterError):
+        up.parse_gcode_text(big)
+
+
+def test_a_pending_setpoint_cannot_preserve_a_wait_through_a_dwell():
+    # review finding (PR #13, Codex round 4): M109 S210, a pending M104 S100 (tool 1 declared
+    # at 100), then a 600 s dwell — the hot end is at 100 by the time the retract runs, so the
+    # "still holds the old wait" premise of design 3a is gone: the retract and the purge refuse
+    frame = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,100", 1)
+    change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
+    probe = frame.replace(change, "M83\nM104 S100\nG4 S600\nG1 E-2 F1800\n" + change.replace("S210", "S100"), 1)
+    assert probe != frame
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "no M109 was ever waited" in bad.value.message
+    # the same with no retract: the purge itself refuses, naming the cooling
+    probe2 = frame.replace(change, "M83\nM104 S100\nG4 S600\n" + change.replace("S210", "S100"), 1)
+    with pytest.raises(PrinterError) as bad2:
+        up.parse_gcode_text(probe2)
+    assert "time to cool" in bad2.value.message
+    # the tower's own shape (G4 S0, retract, purge within a few lines) still passes — at a
+    # declared 220 here, since the firmware clamps a purge S below 200 and refuses it anyway
+    frame220 = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+    ok = frame220.replace(change, "M83\nM104 S220\nG4 S0\nG1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
+    ok = ok.replace("T1\nM109 S210", "T1\nM109 S220", 1)
+    assert up.parse_gcode_text(ok).tools[1].extrusion_nozzle_temps[-1] == 220.0
+
+
+def test_a_pending_setpoint_older_than_the_towers_shape_breaks_the_wait():
+    frame = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+    change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
+    filler = "G1 X1 Y1 F3000\n" * (up.PENDING_WINDOW_LINES + 1)
+    probe = frame.replace(change, "M83\nM104 S220\n" + filler + change.replace("S210", "S220"), 1)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "time to cool" in bad.value.message
+    assert up.PENDING_WINDOW_LINES == 24
+
+
+def test_a_bare_select_is_not_a_purge_so_the_first_purge_cannot_carry_a_new_wait():
+    # review finding (PR #13, Opus round 3): a bare T0 is inert on this firmware, so after
+    # "M109 S210, T0, extrude" the loaded channel is still unknown and the first M6211 may be
+    # the same-channel purge the firmware skips — its S 220 is no wait, and the extrusion
+    # after it at 220 must refuse
+    frame = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+    start = "M6211 A1 L200 T0 Q210 R210 S210\n"
+    assert start in frame
+    no_start_purge = frame.replace(start, "", 1)
+    change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
+    probe = no_start_purge.replace(change, "M83\nM104 S220\nG1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
+    probe = probe.replace("T1\nM109 S210", "T1", 1)  # no M109 after the purge: it rode on S alone
+    assert probe != no_start_purge
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "before any purge in this file" in bad.value.message
+    # with the vendor's start-block purge present the same change passes (a purge has switched)
+    with_start = frame.replace(change, "M83\nM104 S220\nG1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
+    with_start = with_start.replace("T1\nM109 S210", "T1\nM109 S220", 1)
+    assert up.parse_gcode_text(with_start).tools[1].extrusion_nozzle_temps[-1] == 220.0
+
+
+def test_a_slow_travel_inside_the_pending_window_breaks_the_wait():
+    # review finding (PR #13, Codex round 5): the window must bound TIME, not lines — one slow
+    # travel (200 mm at F1 is hours) cools the nozzle as surely as a dwell. Position and feed
+    # come from the file's own G1 words; the tower's own travels at F30000 stay well inside
+    frame = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+    change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
+    head = "G1 X0 Y0 F30000\nM83\nM104 S220\n"    # a known start point before the window
+    slow = frame.replace(change, head + "G1 X200 F1\nG1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(slow)
+    assert "no M109 was ever waited" in bad.value.message
+    # the same travel at the tower's own speed passes
+    fast = frame.replace(change, head + "G1 X200 F30000\nG1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
+    fast = fast.replace("T1\nM109 S210", "T1\nM109 S220", 1)
+    assert up.parse_gcode_text(fast).tools[1].extrusion_nozzle_temps[-1] == 220.0
+    # a move with no known feedrate or start position breaks it too
+    unknown = frame.replace(change, "M83\nM104 S220\nG1 X200\nG1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
+    with pytest.raises(PrinterError):
+        up.parse_gcode_text(unknown)
+    assert up.PENDING_WINDOW_S == 5.0
+
+
+def test_a_welded_dwell_parameter_still_breaks_the_wait():
+    # review finding (PR #13, Codex round 5): ``G4 P600000S0`` is a ten-minute dwell written
+    # without spaces; the dwell must be read with the same tokenizer as a move, never split
+    frame = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+    change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
+    probe = frame.replace(change, "M83\nM104 S220\nG4 P600000S0\nG1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "no M109 was ever waited" in bad.value.message
+
+
+@pytest.mark.parametrize("before, inside", [
+    ("G92 X-200\n", "G1 X0 F60\n"),            # a coordinate reset makes a 200 mm move of X0
+    ("", "G28\n"),                               # homing: unbounded time, position unknown
+    ("M220 S1\n", "G1 X200 F30000\n"),          # a 1 % speed factor: 40 s for an F30000 travel
+    ("", "G1 E-20 F1\n"),                        # an E-only retract at F1: twenty minutes
+    ("", "M190 S100\n"),                         # a bed wait blocks while the nozzle cools
+    ("", "M140 S60\n"),                          # any command the tower never writes
+    ("", "G2 X10 Y10 I5 J5 F30000\n"),           # an arc
+    ("G2 X200 Y0 I100 J0 F30000\n", "G1 X0 Y0 F60\n"),  # an arc BEFORE the window moved the head
+    ("SET_VELOCITY_LIMIT VELOCITY=0.01\n", "G1 X200 F30000\n"),  # a velocity limit set earlier
+    ("M204 S0.001\n", "G1 X200 F30000\n"),                       # an acceleration limit set earlier
+    ("", "SET_VELOCITY_LIMIT ACCEL=10000\nG1 X200 F30000\n"),   # a limit word inside the window
+    ("M220 S100 S1\n", "G1 X200 F30000\n"),                      # a repeated letter: the last wins
+    ("", "G1 X200 F30000 F1\n"),                                 # a repeated letter inside
+    ("M204 P0.001 T0.001\n", "G1 X200 F30000\n"),                # Klipper's P/T accel form
+    ("", "G1 Z250 F3000000\n" * 2),                               # Z crawls at 20 mm/s whatever F says
+    ("", "G1 E-500 F100000000\n"),                                # E at 30 mm/s: 17 s
+    ("", ("G1 X200 F3000000\nG1 X0 F3000000\n") * 10),           # XY capped at 500 mm/s: 8 s
+    ("SET_VELOCITY_LIMIT ACCEL=10000 ACCEL_TO_DECEL=0.001\n", "G1 X200 F30000\n"),  # unmodelled limit
+    ("SET_VELOCITY_LIMIT VELOCITY=nan\n", "G1 X200 F30000\n"),    # not a plain finite number
+    ("SET_VELOCITY_LIMIT VELOCITY=1_00\n", "G1 X200 F30000\n"),   # Python-only spelling
+    ("M204 S0.001\nM204 P10000\n", "G1 X200 F30000\n"),          # a lone P never lifts the limit
+    ("", "G92\nG1 X200 F60\n"),                                  # a bare G92 resets every axis
+    ("M220 S10000\nM220\n", "G1 X200 F60\n"),                   # a bare M220 is back to 100 %
+], ids=["g92-x", "g28", "m220", "e-only", "m190", "m140", "arc", "arc-before",
+        "velocity-limit", "accel-limit", "limit-inside", "m220-dup", "f-dup", "m204-pt",
+        "z-cap", "e-cap", "xy-cap", "unmodelled-limit", "nan-limit", "underscore-limit",
+        "lone-p", "bare-g92", "bare-m220"])
+def test_only_the_towers_own_shape_may_stand_inside_a_pending_window(before, inside):
+    # review finding (PR #13, Codex round 6): every loophole was a command the wipe tower never
+    # writes, or a global that scales a move's real time. So the window admits only the tower's
+    # own lines, estimates time with the speed factor and coordinate resets in force, and
+    # breaks the wait on anything else.
+    frame = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+    change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
+    probe = frame.replace(change, "G1 X0 Y0 Z0.2 F30000\n" + before + "M83\nM104 S220\n" + inside
+                          + "G1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
+    assert probe != frame
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "Nothing was sent" in bad.value.message
+    # and the tower's own shape, with the same globals restored to stock, still passes
+    ok = frame.replace(change, "G1 X0 Y0 Z0.2 F30000\nM83\nM104 S220\nG4 S0\nG92 E0\nM220 S100\n"
+                       "G1 X200 F30000\nG1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
+    ok = ok.replace("T1\nM109 S210", "T1\nM109 S220", 1)
+    assert up.parse_gcode_text(ok).tools[1].extrusion_nozzle_temps[-1] == 220.0
+
+
+def test_the_position_is_unknown_after_a_purge_so_a_crawl_after_it_breaks_the_wait():
+    # review finding (PR #13, Opus round 5): M6211 lifts Z and travels on its own, so the
+    # tracked position is stale after it — a crawl "back to" the old position after a purge
+    # counted as zero distance. The purge clears the position; the next move needs a fresh one.
+    frame = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+    change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
+    # after the first (start) purge the position is unknown: a pending change opened right
+    # after it with a move to X0 Y0 at F1 must break (no known start), not count as zero
+    start = "M6211 A1 L200 T0 Q210 R210 S210"
+    assert start in frame
+    probe = frame.replace(start, "G1 X0 Y0 Z0.2 F30000\n" + start, 1)   # position known BEFORE
+    probe = probe.replace(change, "M83\nM104 S220\nG1 X0 Y0 Z0.2 F1\nG1 E-2 F1800\n"  # the purge
+                          + change.replace("S210", "S220"), 1)             # cleared it: a crawl
+    assert probe != frame                                                 # "back" is unknowable
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "only retractions" in bad.value.message
 
 
 def test_an_empty_position_in_a_per_tool_list_refuses_instead_of_shifting_tool_numbers():
@@ -581,6 +946,7 @@ def test_the_plate_decides_which_bed_keys_count():
     cool = (
         "M104 S140\nM140 S50\nM190 S50 A\nM109 S240\nT0\nM109 S240\n"
         "M140 S45\nM104 S0\nM140 S0\n"
+        "; printer_model = Elegoo Centauri Carbon 2\n"
         "; curr_bed_type = Cool Plate\n; filament_type = PLA\n"
         "; nozzle_temperature = 240\n; nozzle_temperature_initial_layer = 240\n"
         "; hot_plate_temp = 60\n; hot_plate_temp_initial_layer = 60\n"
@@ -607,7 +973,8 @@ def test_a_file_naming_no_plate_is_refused():
 def _heat_frame(*lines, material="PLA", plate="High Temp Plate", nozzle=240.0, bed=60.0):
     """A minimal single-tool file with these command lines and this config block, the commands
     kept verbatim and in the order given — so an order test tests exactly its own order."""
-    cfg = (f"; curr_bed_type = {plate}\n; filament_type = {material}\n"
+    cfg = ("; printer_model = Elegoo Centauri Carbon 2\n"
+           f"; curr_bed_type = {plate}\n; filament_type = {material}\n"
            f"; nozzle_temperature = {nozzle:g}\n"
            f"; nozzle_temperature_initial_layer = {nozzle:g}\n"
            f"; hot_plate_temp = {bed:g}\n; hot_plate_temp_initial_layer = {bed:g}\n")
@@ -665,6 +1032,184 @@ def test_a_matching_wait_at_the_changed_target_re_accepts_extrusion_and_records_
     assert s.nozzle_setpoints == (260.0, 220.0)
 
 
+def _transition_frame(*, initial=220.0, steady=225.0, step=None):
+    """Design 2's shape as the generator writes it, one tool: the start wait at the declared
+    initial-layer temperature, a purge and an extrusion behind it, then the layer-two step — a
+    bare ``M104 S<steady>`` and another extrusion, with **no M109** at the steady setpoint
+    anywhere. ``step`` overrides the M104 value (for the undeclared-setpoint refusal below)."""
+    step = steady if step is None else step
+    i, st = f"{initial:g}", f"{step:g}"
+    cmds = ["M140 S60", "M190 S60 A", f"M109 S{i}",
+            f"M6211 A1 L200 T0 Q{i} R{i} S{i}", "T0", "G1 E6 F251.567",
+            f"M104 S{st}", "G1 E3 F251.567", "M104 S0", "M140 S0"]
+    cfg = ("; printer_model = Elegoo Centauri Carbon 2\n"
+           "; curr_bed_type = High Temp Plate\n; filament_type = PLA\n"
+           f"; nozzle_temperature = {steady:g}\n"
+           f"; nozzle_temperature_initial_layer = {initial:g}\n"
+           "; hot_plate_temp = 60\n; hot_plate_temp_initial_layer = 60\n")
+    return "\n".join(cmds) + "\n" + cfg
+
+
+def test_the_layer_two_m104_to_the_declared_steady_temperature_keeps_the_wait_armed():
+    # design 2: the slicer's own layer-two transition — a verified wait at the tool's declared
+    # initial-layer temperature, extrusion, then a bare M104 up to that tool's declared steady
+    # temperature and more extrusion with no M109 between. Both numbers are this file's own
+    # per-tool config and the firmware's M109 tolerates ±5 °C, so the wait armed at 220 carries
+    # to 225 — and both are recorded as verified extrusion temperatures, because both must then
+    # fit the tray at start.
+    s = up.parse_gcode_text(_transition_frame())
+    assert s.extrusion_nozzle_temps == (220.0, 225.0)
+    assert [t.extrusion_nozzle_temps for t in s.tools] == [(220.0, 225.0)]
+    assert s.nozzle_setpoints == (220.0, 225.0)
+
+
+def test_a_layer_two_m104_to_an_undeclared_temperature_still_needs_a_matching_wait():
+    # the acceptance is for the file's OWN declared steady value and nothing else: 230 is
+    # neither the 220 wait it steps away from nor the 225 the config declares, so today's rule
+    # stands — the target moves, the wait does not follow, and the next extrusion refuses
+    # naming the target no M109 ever waited at
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(_transition_frame(step=230.0))
+    assert "230" in bad.value.message and "no M109 was ever waited at" in bad.value.message
+    assert "Nothing was sent" in bad.value.message
+
+
+def test_a_layer_two_transition_fires_only_for_the_tool_in_force():
+    # design 2 is read per tool: tool 0 declares 210/210 and tool 1 declares 210/220, the
+    # change-filament purge and reselect put tool 1's filament in force at a verified 210, and
+    # only THEN the layer-two M104 S220 arrives — it carries tool 1 to its own declared steady
+    # temperature (and 220 would be no tool-two number at all under tool 0's 210/210), while
+    # tool 0's verified story stays the 210 its own moves and purges ran behind
+    cmds = ["M104 S140", "M140 S60", "M190 S60 A", "M109 S210",
+            "M6211 A1 L200 T0 Q210 R210 S210", "T0", "G1 E6 F251.567",
+            "M6211 T1 L34.9 M523 N523 Q210 R210 S210", "T1", "G1 E3 F251.567",
+            "M104 S220", "G1 E2 F251.567", "M104 S0", "M140 S0"]
+    cfg = ("; printer_model = Elegoo Centauri Carbon 2\n"
+           "; curr_bed_type = High Temp Plate\n; filament_type = PLA;PLA\n"
+           "; nozzle_temperature = 210,220\n"
+           "; nozzle_temperature_initial_layer = 210,210\n"
+           "; nozzle_temperature_range_high = 240,250\n"
+           "; hot_plate_temp = 60,60\n; hot_plate_temp_initial_layer = 60,60\n")
+    s = up.parse_gcode_text("\n".join(cmds) + "\n" + cfg)
+    assert [t.extrusion_nozzle_temps for t in s.tools] == [(210.0,), (210.0, 220.0)]
+    assert s.extrusion_nozzle_temps == (210.0, 220.0)
+
+
+# --- design 3: a mixed-temperature tool change, in the real slice's own shape ---------------------
+#
+# The observed tower order (inventory B.2 O2, the grey/black Penelope-tag slice): ``M220 S100``,
+# ``G4 S0``, ``M104 S<next>``, ``G4 S0``, ``G1 E-2``, travel, then the change-filament block
+# ``M6211 T<next> L M N Q<old> R<range high> S<next>`` and its ``T<next>`` restatement. The fixture
+# prints both tools at 210 °C, so its own tower M104 is a no-op; the frame below moves tool 1's
+# declared steady temperature to 220 °C and edits that one change block to match — the tower
+# M104, the retract behind it, and the purge with ``Q`` at the old tool's waited 210 and ``S`` at
+# the incoming tool's declared 220, which the firmware's own ``M109 S`` inside the purge waits at.
+
+
+def _mixed_change_fixture(load) -> str:
+    """The two-tool fixture as a mixed-temperature change: tool 1 declares 210 initial / 220
+    steady, the tower commands ``M104 S220``, and the change-filament purge reads
+    ``Q210 R240 S220``. Everything else — both other purges, both range highs at 240, the tail —
+    stays the real slice's own text. ``load`` is the session's ``gcode_fixture`` loader."""
+    original = load("cc2_two_tool")
+    text = (original
+            .replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+            .replace("M104 S210", "M104 S220", 1)
+            .replace("M6211 T1 L34.9231 M523 N523 Q210 R240 S210",
+                     "M6211 T1 L34.9231 M523 N523 Q210 R240 S220", 1))
+    assert text != original, "the fixture lost the lines the mixed change edits"
+    return text
+
+
+def test_a_mixed_temperature_tool_change_parses_with_the_purges_waited_s_recorded(gcode_fixture):
+    # design 3: the tower's bare M104 to tool 1's declared 220 arms a pending tool-change
+    # setpoint, the G1 E-2 that follows runs behind tool 0's still-armed 210 wait, and the purge
+    # consumes it: Q 210 is the wait in force (tool 0's story), S 220 is tool 1's own declared
+    # steady temperature and the wait the print continues at, so 220 joins tool 1's verified
+    # extrusion story and the file-wide one — while tool 0 keeps only its 210, and the vendor's
+    # 240 flush R stays a flush temperature of both spools exactly as on the equal-temperature
+    # original. The T1 select and every later 220 °C extrusion parse behind the purge's own wait.
+    s = up.parse_gcode_text(_mixed_change_fixture(gcode_fixture))
+    assert [t.tool_index for t in s.tools] == [0, 1]
+    tool0, tool1 = s.tools
+    assert tool1.nozzle_temp == 220.0
+    assert tool1.extrusion_nozzle_temps == (220.0,)
+    assert tool0.extrusion_nozzle_temps == (210.0,)
+    assert s.extrusion_nozzle_temps == (210.0, 220.0)
+    assert [t.flush_nozzle_temps for t in s.tools] == [(240.0,), (240.0,)]
+    assert 220.0 in s.nozzle_setpoints and 240.0 not in s.nozzle_setpoints
+
+
+def test_a_mixed_tool_change_purge_q_that_is_not_the_wait_in_force_refuses(gcode_fixture):
+    # Q is what the purge runs its retract, cut and channel-check steps at, on the filament
+    # still in force — 230 is neither tool 0's waited 210 nor any wait the file holds, so the
+    # purge would move the hot end un-waited immediately before a filament switch that pushes
+    # filament, and the refusal names Q and both numbers
+    text = _mixed_change_fixture(gcode_fixture).replace(
+        "M6211 T1 L34.9231 M523 N523 Q210 R240 S220",
+        "M6211 T1 L34.9231 M523 N523 Q230 R240 S220", 1)
+    assert text != _mixed_change_fixture(gcode_fixture)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(text)
+    assert "sets Q to 230" in bad.value.message and "210" in bad.value.message
+    assert "Nothing was sent" in bad.value.message
+
+
+def test_a_forward_extrusion_between_the_tower_m104_and_its_purge_refuses(gcode_fixture):
+    # between the tower's M104 S220 and the purge that waits at 220, only the negative-E
+    # retraction may run: a forward E there would push the outgoing tool's filament toward an
+    # un-waited target (and after the switch, the incoming's at a number no wait has proved at
+    # that point), so it refuses naming the pending setpoint and the purge that must come first
+    text = _mixed_change_fixture(gcode_fixture).replace(
+        "M104 S220\nG4 S0\nG1 E-2\n", "M104 S220\nG4 S0\nG1 E-2\nG1 E1 F300\n", 1)
+    assert text != _mixed_change_fixture(gcode_fixture)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(text)
+    msg = bad.value.message
+    assert "220" in msg and "tool-change setpoint" in msg and "M6211" in msg
+    assert "Nothing was sent" in msg
+
+
+def test_the_unedited_two_tool_fixture_still_parses_identically(gcode_fixture):
+    # the equal-temperature change is the mixed change's ordinary case and satisfies the new
+    # Q/S rules unchanged: the unedited fixture — both tools at 210, the purge's Q and S both
+    # the waited 210 — parses to exactly the story it parsed to before design 3, down to the
+    # tuple-for-tuple temperature lists and the flat setpoints
+    s = up.parse_gcode_text(gcode_fixture("cc2_two_tool"))
+    assert [t.extrusion_nozzle_temps for t in s.tools] == [(210.0,), (210.0,)]
+    assert [t.flush_nozzle_temps for t in s.tools] == [(240.0,), (240.0,)]
+    assert s.extrusion_nozzle_temps == (210.0,)
+    assert s.nozzle_setpoints == (140.0, 210.0)
+
+
+@pytest.mark.parametrize("mesh", ["BED_MESH_CALIBRATE",
+                                  "bed_mesh_calibrate ADAPTIVE=0 FROM_SLICER=1"])
+def test_a_bed_mesh_resets_the_verified_wait_so_the_next_extrusion_needs_a_fresh_m109(mesh):
+    # design 4: the calibration body is a binary-only library whose strings carry heater
+    # commands, so no verified M109 wait is carried across the line — a mesh after the wait and
+    # an E move with no M109 between is an extrusion at a target nothing proved at that point,
+    # and the refusal must name the mesh as what dropped the wait
+    meshed = _heat_frame("M140 S60", "M190 S60 A", "M109 S240",
+                         "M6211 A1 L200 T0 Q240 R240 S240", "T0",
+                         mesh, "G1 E6 F131.773", "M104 S0", "M140 S0", nozzle=240.0)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(meshed)
+    assert "BED_MESH_CALIBRATE" in bad.value.message and "240" in bad.value.message
+    assert "Nothing was sent" in bad.value.message
+
+
+def test_the_stock_start_order_of_mesh_then_home_then_wait_still_parses():
+    # the reset above costs stock files nothing: the stock start template issues
+    # BED_MESH_CALIBRATE, G28, then M109 S[nozzle_temperature_initial_layer], so the wait its
+    # extrusions and purge run behind is built after the mesh, never carried across it
+    stock = _heat_frame("BED_MESH_CALIBRATE", "G28", "M140 S60", "M190 S60 A", "M109 S240",
+                        "M6211 A1 L200 T0 Q240 R240 S240", "T0", "G1 E6 F131.773",
+                        "M104 S0", "M140 S0", nozzle=240.0)
+    s = up.parse_gcode_text(stock)
+    assert s.extrusion_nozzle_temps == (240.0,)
+    assert s.nozzle_setpoints == (240.0,)
+
+
 def test_extrusion_before_any_nozzle_command_at_all_is_refused():
     body = _heat_frame("M140 S60", "M190 S60 A", "T0", "G1 E6 F131.773", "M109 S240",
                        "M104 S0", "M140 S0", nozzle=240.0)
@@ -706,6 +1251,7 @@ def test_a_bed_cooldown_mid_file_is_not_the_nozzle_rule():
     text = ("M104 S140\nM140 S60\nM190 S60 A\nM109 S240\nT0\nG1 E6 F131.773\n"
             "M140 S0 ; bed off for a moment\nM140 S60\nG1 E3 F120\n"
             "M104 S0\nM140 S0\n"
+            "; printer_model = Elegoo Centauri Carbon 2\n"
             "; curr_bed_type = High Temp Plate\n; filament_type = PLA\n"
             "; nozzle_temperature = 240\n; nozzle_temperature_initial_layer = 240\n"
             "; hot_plate_temp = 60\n; hot_plate_temp_initial_layer = 60\n")
@@ -723,13 +1269,15 @@ def test_no_printing_temperature_range_is_hardcoded_anywhere(preheat, first, lat
     # (no verified wait), never by any threshold it hardcodes — 90 or 120 for a preheat, 315 or
     # 235 for the print — because the printing range belongs to the CANVAS spool at start
     if plate == "cool plate":
-        cfg = (f"; curr_bed_type = Cool Plate\n; filament_type = PLA\n"
+        cfg = ("; printer_model = Elegoo Centauri Carbon 2\n"
+               f"; curr_bed_type = Cool Plate\n; filament_type = PLA\n"
                f"; nozzle_temperature = {later:g}\n"
                f"; nozzle_temperature_initial_layer = {first:g}\n"
                f"; cool_plate_temp = 45\n; cool_plate_temp_initial_layer = 50\n")
         bed_cmds = "M140 S50\nM190 S50 A\nM140 S45\n"
     else:
-        cfg = (f"; curr_bed_type = High Temp Plate\n; filament_type = PETG\n"
+        cfg = ("; printer_model = Elegoo Centauri Carbon 2\n"
+               f"; curr_bed_type = High Temp Plate\n; filament_type = PETG\n"
                f"; nozzle_temperature = {later:g}\n"
                f"; nozzle_temperature_initial_layer = {first:g}\n"
                f"; hot_plate_temp = 70\n; hot_plate_temp_initial_layer = 70\n")
@@ -751,7 +1299,7 @@ def test_no_printing_temperature_range_is_hardcoded_anywhere(preheat, first, lat
 # M140/M104 before it ever reaches the reproduction; to test the reproductions' *own* case-
 # insensitivity we fold just their command words and leave the config and the rest as written.
 _CONFIG_PREFIXES = ("; curr_bed_type", "; filament_type", "; nozzle_temp", "; hot_plate",
-                    "; cool_plate", "; eng_plate", "; textured_plate")
+                    "; cool_plate", "; eng_plate", "; textured_plate", "; printer_model")
 
 
 def _fold(text: str, *, upper: bool) -> str:
@@ -844,11 +1392,12 @@ def test_compact_e_is_counted_as_extrusion_and_recorded_by_a_verified_wait():
     "M204 S=1500 T=5000", "M73 P50", "M84",       # acceleration, progress display, steppers off
     "G1 X50 Y50 F6000", "G1 X127 Y-1.2 F20000",   # the two travel spellings the fixture writes
     "G2 X10 Y10 I5 J5",                            # a non-extruding arc
-    "BED_MESH_CALIBRATE",                          # a probe pass: Z moves, no filament, no nozzle
+    # BED_MESH_CALIBRATE left this list for design 4: it is still an allowed word, but it now
+    # drops the M109 wait in force, so it is tested with that rule (both case spellings) above
     "SET_PRESSURE_ADVANCE ADVANCE=0.04",           # a flow-tuning number
     "SET_PRINT_STATS_INFO TOTAL_LAYER=120 CURRENT_LAYER=3",
     "SET_VELOCITY_LIMIT VELOCITY=300",
-    "bed_mesh_calibrate", "set_velocity_limit velocity=300",   # Klipper matches words by case
+    "set_velocity_limit velocity=300",             # Klipper matches words by case
 ])
 def test_the_allowed_commands_from_the_mount_fixture_still_parse(line):
     # every one of these changes no heater target and moves no filament on its own — the file must
@@ -1417,7 +1966,7 @@ def test_the_purges_tool_may_be_the_files_only_tool_while_a_frame_with_no_select
     ("M6211 A L200 T0 Q260 R260 S260", "A"),             # a bare flag: stoi reads an uninitialised int
     ("M6211 A1 L200 T0 Q2o0 R260 S260", "Q"),            # not a number at all
     ("M6211 A1 L200 T0 Q=260 R260 S260", "Q"),           # an = where a digit belongs
-    ("M6211 A1 L200 T0 Q260 R260 S260 Z5", "Z"),         # a fourteenth letter: CMD_M6211 reads thirteen
+    ("M6211 A1 L200 T0 Q260 R260 S260 Z5", "Z"),         # a fifteenth letter: CMD_M6211 reads fourteen
     ("M6211 A1 L200 T0 Q260 R260 S260 E5", "E"),         # even an E, whose meaning nobody would guess
 ])
 def test_a_purge_value_the_firmware_would_not_read_as_written_refuses(purge, letter):
@@ -1929,6 +2478,14 @@ async def test_a_final_listing_cannot_be_proven_complete_so_nothing_is_claimed(t
 # --------------------------------------------------------------------------- the receipt, private to the byte
 
 
+def _as_written_to_disk(receipt: Cc2UploadReceipt) -> Cc2UploadReceipt:
+    """The same receipt as this store can hand it back. The three upload-only parse facts
+    (designs 1 and 5) are never written to disk, so a receipt that carried them returns from the
+    store without them; comparing that shape is what keeps the round-trip assertions below
+    asserting the round trip, rather than quietly comparing two different receipts."""
+    return replace(receipt, printer_model=None, vendor_templates=None, templates_compared=None)
+
+
 async def test_the_receipt_binds_printer_name_size_hash_and_every_parsed_setting(
         tmp_path, store):
     src = write_gcode(tmp_path, nozzle_first=265.0, nozzle=255.0, bed_first=80.0, bed=70.0)
@@ -1952,7 +2509,8 @@ async def test_the_receipt_binds_printer_name_size_hash_and_every_parsed_setting
 
     path = store.path_for(SN, DEST)
     raw = path.read_bytes()
-    assert receipt == store.load(SN, DEST)  # round-trips through disk, exactly
+    assert _as_written_to_disk(receipt) == store.load(SN, DEST)  # round-trips exactly; the three
+    # upload-only parse facts (designs 1 and 5) are the only thing disk does not keep
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE(store.root.stat().st_mode) == 0o700
     assert stat.S_IMODE((store.root / "receipts").stat().st_mode) == 0o700
@@ -2181,8 +2739,57 @@ async def test_an_uploaded_two_tool_file_records_every_tool_on_its_receipt(tmp_p
     assert (receipt.tool_index, receipt.material, receipt.nozzle_temp) == (0, "PLA", 210.0)
     assert receipt.extrusion_nozzle_temps == (210.0,)  # flat union, first order seen
     assert 240.0 not in receipt.commanded_nozzle_setpoints  # the flush R is no setpoint
-    assert store.load(SN, DEST) == receipt  # every tool of it survives the store too
+    assert store.load(SN, DEST) == _as_written_to_disk(receipt)  # every tool survives the store too
 
+
+
+def test_the_upload_only_parse_facts_never_join_the_receipt_on_disk():
+    # design 1 and 5's facts ride the receipt only as far as the reply that answers the upload:
+    # to_dict does not write them, from_dict never reads them, and the format and version a start
+    # trusts are untouched — a receipt read back describes the file on the printer, re-checked by
+    # nobody, so it says nothing about templates
+    r = _sample_receipt(printer_model="Elegoo Centauri Carbon 2",
+                        vendor_templates="modified: machine_end_gcode", templates_compared=3)
+    data = r.to_dict()
+    assert not ({"printer_model", "vendor_templates", "templates_compared"} & data.keys())
+    assert data["version"] == RECEIPT_VERSION
+    back = Cc2UploadReceipt.from_dict(data)
+    assert (back.printer_model, back.vendor_templates, back.templates_compared) == (None, None,
+                                                                                    None)
+    assert back != r  # the honest statement of what a round trip does: it drops exactly these
+    assert back.to_dict() == data  # and writes the identical bytes on the way back out
+    for kw in (dict(templates_compared=6),      # more than the five templates this build knows
+               dict(templates_compared=True),   # a flag is not a count
+               dict(templates_compared=-1),
+               dict(vendor_templates=""),       # a verdict that says nothing
+               dict(printer_model="bad\nserial")):
+        with pytest.raises(PrinterError):  # validated on the way in like every other field
+            _sample_receipt(**kw)
+
+
+async def test_the_uploaded_receipt_carries_the_model_and_template_verdict_the_parse_found(
+        tmp_path, store, gcode_fixture):
+    # the same facts from the writer, on the file that really is two-colour and really is stock:
+    # the upload returns them, so cc2_upload_gcode's reply needs no re-parse and no getattr
+    # guesswork, and the receipt the store hands a later start carries none of them
+    src = tmp_path / "penelope-two-colour.gcode"
+    src.write_text(gcode_fixture("cc2_two_tool"), encoding="utf-8")
+    body = src.read_bytes()
+    tr = FakeTransport([("other.gcode", 1)], [("other.gcode", 1), (DEST, len(body))])
+    receipt, http = await run(tr, src, store=store)
+
+    assert receipt.printer_model == "Elegoo Centauri Carbon 2"  # the model the gate accepted
+    assert receipt.vendor_templates == "stock"                  # all five templates are stock
+    assert receipt.templates_compared == 5                       # and all five were compared
+    raw = store.path_for(SN, DEST).read_bytes()
+    for never in (b"printer_model", b"vendor_templates", b"templates_compared",
+                  b"machine_start_gcode", b"Elegoo"):  # the model line, the verdict and the
+        assert never not in raw                        # template text never reach the store
+
+    loaded = store.load(SN, DEST)
+    assert (loaded.printer_model, loaded.vendor_templates,
+            loaded.templates_compared) == (None, None, None)
+    assert loaded == _as_written_to_disk(receipt)  # everything else still round-trips exactly
 
 
 def test_a_tool_extrusion_temperature_the_flat_union_lacks_refuses_the_receipt():

@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .cc2_stock_templates import STOCK as _STOCK_TEMPLATES
 from .errors import PrinterError
 
 # Version 2 added ``extrusion_nozzle_temps``: the nozzle temperatures extrusion was verified to
@@ -212,7 +213,19 @@ class Cc2UploadReceipt:
     whole reason the loosened rule costs nothing. ``tools`` carries one ``ToolReceipt`` per
     tool the file selects, in the parse's first-seen order; the flat ``material``,
     ``tool_index`` and nozzle fields are that first entry's values, and a v3 receipt whose flat
-    fields and first tool disagree is not one this store wrote."""
+    fields and first tool disagree is not one this store wrote.
+
+    ``printer_model``, ``vendor_templates`` and ``templates_compared`` are the parse's own
+    upload-time facts (the stock-profile allow list's designs 1 and 5), carried on the receipt so
+    the upload reply can say them: which model the file named, whether its five machine-level
+    G-code templates are the shipped stock ones, and how many of the five the file actually
+    carried. They are NOT part of the on-disk shape — ``to_dict`` never writes them and
+    ``from_dict`` never reads them — because the receipt on disk is the proof about the file that
+    sits on the printer, while a template verdict is a fact about the parse that ran a moment
+    ago, which a later start must not read as though the file had been re-checked. A receipt
+    loaded back from the store therefore always carries all three as ``None``; only the receipt
+    object the upload just returned carries values. Neither the receipt format nor its version
+    changes for them, so an upload's reply and a start's proof stay exactly as they were."""
     printer_sn: str
     remote_filename: str
     reported_size_bytes: int
@@ -230,6 +243,11 @@ class Cc2UploadReceipt:
     uploaded_at: datetime
     printer_display: str | None = None
     tools: tuple[ToolReceipt, ...] = ()
+    # the upload-only facts (design 1's model gate verdict and design 5's template report), read
+    # by the upload reply and never written to disk — see the class docstring
+    printer_model: str | None = None
+    vendor_templates: str | None = None
+    templates_compared: int | None = None
 
     def __post_init__(self) -> None:
         # normalise before validating: a receipt read back from JSON carries lists where the
@@ -326,12 +344,32 @@ class Cc2UploadReceipt:
                                "called fresh or stale, so it is refused.", reason="receipt_invalid")
         if self.printer_display is not None:
             _checked_str(self.printer_display, "printer display name", 255)
+        # the upload-only facts are validated on the way in like every other field: a receipt
+        # built with a nonsense verdict in it is refused rather than half-trusted. Nothing reads
+        # them back, so the only writer of a non-None value is the parse that just ran, and a
+        # count outside the templates this build knows is a receipt it could not have written.
+        if self.printer_model is not None:
+            _checked_str(self.printer_model, "printer model", 255)
+        if self.vendor_templates is not None:
+            _checked_str(self.vendor_templates, "stock-template verdict", 255)
+        if self.templates_compared is not None:
+            if (isinstance(self.templates_compared, bool)
+                    or not isinstance(self.templates_compared, int)
+                    or not 0 <= self.templates_compared <= len(_STOCK_TEMPLATES)):
+                raise PrinterError(
+                    "protocol_error",
+                    f"A receipt would say {self.templates_compared!r} stock templates were "
+                    f"compared, which no read of one file could report (this build knows "
+                    f"{len(_STOCK_TEMPLATES)}), so it is refused.", reason="receipt_invalid")
 
     # ---- the on-disk shape ------------------------------------------------------------------
 
     def to_dict(self) -> dict:
         """Plain JSON data. Field order here is the order written; nothing that never belongs in
-        a receipt (tokens, codes, replies) has a field to arrive in."""
+        a receipt (tokens, codes, replies) has a field to arrive in — and neither do the three
+        upload-only facts (``printer_model``, ``vendor_templates``, ``templates_compared``), which
+        describe the parse that just ran rather than the file on the printer, so they live only in
+        the receipt object the upload returns and never on disk."""
         return {
             "version": RECEIPT_VERSION,
             "printer_sn": self.printer_sn,
