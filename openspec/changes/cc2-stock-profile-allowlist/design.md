@@ -61,3 +61,13 @@ Evidence: `inventory.md` (union table §A, gaps §D, open questions §E), `stock
 ## Not verified
 Whether the running firmware 02.01.00.00 matches the published source (`inventory.md` E1); what
 the bed-mesh library really heats (E2); the colour table's contents at start (E5).
+
+## Amendment (2026-11-12, review rounds)
+8. The layer-two step (decision 2) fires only within `LAYER_TWO_STEP_MAX_C` = 10 °C of the
+   first-layer wait (stock presets step 5 or 10 °C; firmware M109 tolerance ±5 °C); a larger
+   declared step needs its own M109. Both exceptions (2 and 3a) require the wait to be in force
+   (`nozzle_target == waited` and not broken); any ordinary bare M104 that moves the target
+   breaks the wait and only an M109 or a purge's own waited S mends it. The retract exception
+   (3a) requires relative-E mode (M83 seen). A purge naming the tool in force, or any purge
+   while no tool is in force yet, may be skipped by the firmware and so must keep S at the wait
+   in force. "Some other tool" in 3a means a tool the file selects or purges to (pre-scan).

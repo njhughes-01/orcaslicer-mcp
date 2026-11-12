@@ -651,6 +651,26 @@ def test_re_commanding_the_old_target_never_mends_a_broken_wait():
     assert up.parse_gcode_text(mended).tools[0].extrusion_nozzle_temps == (220.0, 225.0)
 
 
+def test_the_layer_two_step_is_bounded_by_the_vendor_margin():
+    # review finding (PR #13, Codex round 3): a file declaring a steady temperature of 100 °C
+    # after a 220 °C first layer must not have its bare M104 S100 promoted to a verified wait —
+    # the exception covers the slicer's small step (stock presets move 5 or 10 °C), nothing more
+    base = gcode_text(nozzle_first=220.0, nozzle=100.0)
+    probe = base.replace("M109 S100\n", "M104 S100\nG4 S600\n", 1)
+    assert probe != base
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "no M109 was ever waited" in bad.value.message
+    assert up.LAYER_TWO_STEP_MAX_C == 10.0
+    # the stock 10 °C step (Generic ABS 260→270) still rides the wait
+    abs_frame = gcode_text(nozzle_first=260.0, nozzle=270.0).replace("M109 S270\n", "M104 S270\n", 1)
+    assert up.parse_gcode_text(abs_frame).tools[0].extrusion_nozzle_temps == (260.0, 270.0)
+    # and an 11 °C step needs its M109
+    big = gcode_text(nozzle_first=220.0, nozzle=231.0).replace("M109 S231\n", "M104 S231\n", 1)
+    with pytest.raises(PrinterError):
+        up.parse_gcode_text(big)
+
+
 def test_an_empty_position_in_a_per_tool_list_refuses_instead_of_shifting_tool_numbers():
     # review finding (PR #11): ``PLA;;PETG`` once collapsed to ["PLA", "PETG"], handing tool 2's
     # PETG to tool 1 — for a per-tool key the position IS the tool number, so a blank is a tool

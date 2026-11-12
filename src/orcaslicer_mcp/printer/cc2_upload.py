@@ -955,6 +955,15 @@ def _declared_for_tool(values: list[str] | None, tool: int) -> float | None:
         return None
 
 
+# How far the layer-two step (design 2) may move the target without a fresh M109: the stock
+# presets that step at all move 5 or 10 °C (Inland PLA 220→225, Generic ABS 260→270, ABS-CF
+# 250→260 — inventory.md gap D1), and the firmware's own M109 tolerance is ±5 °C. A declared
+# steady temperature further from the first-layer wait than this is not a transition the hot
+# end rides through while printing; it needs its own wait (review finding, PR #13: a declared
+# steady of 100 °C must never be promoted to a verified wait by the exception).
+LAYER_TWO_STEP_MAX_C = 10.0
+
+
 def _other_tool_declares(values: list[str] | None, current_tool: int, value: float,
                          selected: set[int] | None = None) -> bool:
     """Design 3a: does some tool **other than** the one in force declare a steady
@@ -1503,6 +1512,7 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                     # (review finding, PR #13: a stale `waited` must never resurrect a wait)
                     armed = waited is not None and nozzle_target == waited and not wait_broken
                     if (armed and current_tool is not None and value != waited
+                            and abs(value - waited) <= LAYER_TWO_STEP_MAX_C
                             and waited == _declared_for_tool(firsts_pre, current_tool)
                             and value == _declared_for_tool(nozzles_pre, current_tool)):
                         # design 2: the slicer's own layer-two transition on every Klipper
