@@ -1458,6 +1458,11 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     # window's time estimate divides by it (``M220 S1`` makes an F30000 travel a hundred times
     # slower — review finding, PR #13, Codex round 6)
     speed_factor = 100.0
+    # the motion limits in force (Klipper's SET_VELOCITY_LIMIT VELOCITY= in mm/s and ACCEL= /
+    # M204 S in mm/s²): a tiny limit set anywhere earlier makes an F30000 travel take minutes,
+    # so the window's time estimate honours them (review finding, PR #13, Codex round 7)
+    max_velocity: float | None = None
+    max_accel: float | None = None
     extrusion_temps: list[float] = []
     # per-tool verified-extrusion story: tool index -> temperatures that tool's extrusion ran
     # behind a verified wait, first order seen (the file-wide ``extrusion_temps`` stays the union
@@ -1525,8 +1530,10 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                     wait_broken = True
             elif head in ("G0", "G1", "G00", "G01"):
                 mv = _move_params(rest)
-                if mv is None:
-                    wait_broken = True
+                letters = [l for l, _ in mv] if mv else []
+                if mv is None or len(set(letters)) != len(letters):
+                    wait_broken = True          # unreadable, or a repeated letter (the firmware
+                                                # keeps the LAST, a reader the first: refuse both)
                 else:
                     feed = next((v for l, v in mv if l == "F"), last_feed)
                     axes = {l: v for l, v in mv if l in ("X", "Y", "Z")}
@@ -1537,9 +1544,21 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                         wait_broken = True      # no known feedrate: time unknowable
                     else:
                         dist = sum((axes[a] - pos[a]) ** 2 for a in axes) ** 0.5 if axes else 0.0
-                        pending_motion_s += max(dist, e_len) / (feed * speed_factor / 100.0) * 60.0
-                        if pending_motion_s > PENDING_WINDOW_S:
+                        length = max(dist, e_len)
+                        v_mm_s = feed * speed_factor / 100.0 / 60.0
+                        if max_velocity is not None:
+                            v_mm_s = min(v_mm_s, max_velocity)
+                        if v_mm_s <= 0.0:
                             wait_broken = True
+                        else:
+                            t = length / v_mm_s
+                            if max_accel is not None and max_accel > 0.0 and length > 0.0:
+                                t = max(t, 2.0 * (length / max_accel) ** 0.5)  # ramp-limited
+                            elif max_accel is not None and max_accel <= 0.0 and length > 0.0:
+                                t = float("inf")
+                            pending_motion_s += t
+                            if pending_motion_s > PENDING_WINDOW_S:
+                                wait_broken = True
             elif head == "G92":
                 g92 = _move_params(rest)
                 if g92 is None or any(l in ("X", "Y", "Z") for l, _ in g92):
@@ -1549,8 +1568,10 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                 if m220 is None or m220 != [("S", 100.0)]:
                     wait_broken = True          # the tower writes exactly ``M220 S100``
             elif (head in ("M106", "M107", "M73", "M83", "M6211", "M104", "M109",
-                           "SET_PRESSURE_ADVANCE", "SET_VELOCITY_LIMIT", "SET_PRINT_STATS_INFO")
+                           "SET_PRESSURE_ADVANCE", "SET_PRINT_STATS_INFO")
                   or _TOOL_RE.match(line.upper())):
+                # (SET_VELOCITY_LIMIT and M204 are NOT the tower's: the real change block writes
+                # neither, and either could slow every following move — they break the wait)
                 pass                            # the tower's own lines; heater codes are judged
                                                 # by their own branches below (a second bare
                                                 # M104 breaks the wait there, an M109 retires it)
@@ -1665,9 +1686,24 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
         if head == "G28":          # homing: the position is whatever the firmware's home is
             pos.clear()
         if head == "M220":         # the speed factor in force, read here; the policy still checks it
-            m220 = _move_params(rest)
-            if m220 and len(m220) == 1 and m220[0][0] == "S":
-                speed_factor = m220[0][1]
+            for letter, value in (_move_params(rest) or []):
+                if letter == "S":
+                    speed_factor = value        # last S wins, as the firmware's map does
+        if head == "M204":         # acceleration limit in force
+            for letter, value in (_move_params(rest) or []):
+                if letter == "S":
+                    max_accel = value
+        if head == "SET_VELOCITY_LIMIT":
+            for token in rest.split():
+                key, _, raw = token.partition("=")
+                try:
+                    number = float(raw)
+                except ValueError:
+                    continue
+                if key.upper() == "VELOCITY":
+                    max_velocity = number
+                elif key.upper() == "ACCEL":
+                    max_accel = number
         if head == "BED_MESH_CALIBRATE":
             # design 4 (and the rewritten reason on _SAFE_WORD_COMMANDS): no verified M109 wait
             # is carried across this line — the calibration body is a binary-only library whose
@@ -1821,8 +1857,8 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                 # every move with an endpoint carries the position story — arcs included, whose
                 # X/Y/Z are their endpoints (review finding, PR #13, Opus round 4: an arc before
                 # a pending window must not leave a stale position behind)
-                for letter, value in params:
-                    if letter in ("X", "Y", "Z"):
+                for letter, value in params:    # in file order, so a repeated letter's LAST
+                    if letter in ("X", "Y", "Z"):   # value wins, as the firmware's map does
                         pos[letter] = value
                     elif letter == "F":
                         last_feed = value
