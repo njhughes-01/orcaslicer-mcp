@@ -968,14 +968,13 @@ LAYER_TWO_STEP_MAX_C = 10.0
 # M6211 (the real two-colour slice: 18 lines — M104, G4 S0, a retract, travels, fan lines).
 # A pending setpoint older than this has had time to cool the hot end and breaks the wait.
 PENDING_WINDOW_LINES = 24
+# ... and how much estimated motion time (distance / feedrate, from the file's own absolute
+# coordinates and F values) that window may hold: the real tower's travels run at 500 mm/s and
+# sum to well under a second, while a slow travel (``G1 X200 F1``) is minutes of cooling with
+# a single line. A move whose distance or feedrate cannot be known (no position yet, no F yet,
+# an arc) breaks the wait too (review finding, PR #13, Codex round 5).
+PENDING_WINDOW_S = 5.0
 
-
-def _looks_numeric(text: str) -> bool:
-    try:
-        float(text)
-    except ValueError:
-        return False
-    return True
 
 
 def _other_tool_declares(values: list[str] | None, current_tool: int, value: float,
@@ -1450,6 +1449,11 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
     # channel is unknown and ANY purge may be the same-channel one the firmware skips (review
     # finding, PR #13, Opus round 3)
     purge_seen = False
+    # absolute position and last feedrate, from the file's own G0/G1 words (G90 is the stock
+    # mode and G91 is refused), so a pending window's motion time can be estimated
+    pos: dict[str, float] = {}
+    last_feed: float | None = None
+    pending_motion_s = 0.0
     extrusion_temps: list[float] = []
     # per-tool verified-extrusion story: tool index -> temperatures that tool's extrusion ran
     # behind a verified wait, first order seen (the file-wide ``extrusion_temps`` stays the union
@@ -1501,11 +1505,30 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                           "refused rather than skipped, so no extrusion can ride on a heater "
                           "change the file never proved it waited at")
         if pending_tool_temp is not None and pending_since is not None and not wait_broken:
-            if idx - pending_since > PENDING_WINDOW_LINES or head in ("G180", "BED_MESH_CALIBRATE"):
+            if idx - pending_since > PENDING_WINDOW_LINES or head in ("G180", "BED_MESH_CALIBRATE",
+                                                                       "G2", "G3", "G02", "G03"):
                 wait_broken = True
-            elif head == "G4" and any(_parse_S(tok) > 0.0 for tok in rest.split()
-                                      if tok[:1].upper() in "PSD" and _looks_numeric(tok[1:])):
-                wait_broken = True
+            elif head == "G4":
+                dwell = _move_params(rest)
+                if dwell is None or any(letter in ("P", "S", "D") and value > 0.0
+                                        for letter, value in dwell):
+                    wait_broken = True
+            elif head in _MOVE_HEADS:
+                mv = _move_params(rest)
+                if mv is None:
+                    wait_broken = True
+                else:
+                    feed = next((v for l, v in mv if l == "F"), last_feed)
+                    axes = {l: v for l, v in mv if l in ("X", "Y", "Z")}
+                    if axes and any(a not in pos for a in axes):
+                        wait_broken = True      # no known start point: distance unknowable
+                    elif feed is None or feed <= 0.0:
+                        wait_broken = True      # no known feedrate: time unknowable
+                    else:
+                        dist = sum((axes[a] - pos[a]) ** 2 for a in axes) ** 0.5 if axes else 0.0
+                        pending_motion_s += dist / feed * 60.0
+                        if pending_motion_s > PENDING_WINDOW_S:
+                            wait_broken = True
         if head in ("M104", "M109", "M140", "M190"):
             # parameter letters fold to upper case (see _parse_S), so `M104 s140` is the setpoint
             # `M104 S140` is. Only letters fold, never the count: the S parameters are still counted
@@ -1578,6 +1601,7 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                         nozzle_target = value
                         pending_tool_temp = value
                         pending_since = idx
+                        pending_motion_s = 0.0
                     else:                  # any other bare M104: a target moved without a wait
                         if value != nozzle_target or value != waited:
                             wait_broken = True  # and re-commanding the old number never mends it
@@ -1755,6 +1779,12 @@ def parse_gcode_settings(lines: Iterable[str]) -> Cc2GcodeSettings:
                 raise _refuse(f"the move {line[:40]!r} carries a parameter this parser cannot "
                               "read, so it cannot rule out an extrusion hidden in it — refusing "
                               "rather than assuming a move it cannot tokenise does not extrude")
+            if head in ("G0", "G1", "G00", "G01"):   # linear moves carry the position story
+                for letter, value in params:
+                    if letter in ("X", "Y", "Z"):
+                        pos[letter] = value
+                    elif letter == "F":
+                        last_feed = value
             e_values = [v for letter, v in params if letter == "E"]
             if e_values:
                 where = f"the E move {line[:40]!r}"

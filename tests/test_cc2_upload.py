@@ -728,6 +728,39 @@ def test_a_bare_select_is_not_a_purge_so_the_first_purge_cannot_carry_a_new_wait
     assert up.parse_gcode_text(with_start).tools[1].extrusion_nozzle_temps[-1] == 220.0
 
 
+def test_a_slow_travel_inside_the_pending_window_breaks_the_wait():
+    # review finding (PR #13, Codex round 5): the window must bound TIME, not lines — one slow
+    # travel (200 mm at F1 is hours) cools the nozzle as surely as a dwell. Position and feed
+    # come from the file's own G1 words; the tower's own travels at F30000 stay well inside
+    frame = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+    change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
+    head = "G1 X0 Y0 F30000\nM83\nM104 S220\n"    # a known start point before the window
+    slow = frame.replace(change, head + "G1 X200 F1\nG1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(slow)
+    assert "no M109 was ever waited" in bad.value.message
+    # the same travel at the tower's own speed passes
+    fast = frame.replace(change, head + "G1 X200 F30000\nG1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
+    fast = fast.replace("T1\nM109 S210", "T1\nM109 S220", 1)
+    assert up.parse_gcode_text(fast).tools[1].extrusion_nozzle_temps[-1] == 220.0
+    # a move with no known feedrate or start position breaks it too
+    unknown = frame.replace(change, "M83\nM104 S220\nG1 X200\nG1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
+    with pytest.raises(PrinterError):
+        up.parse_gcode_text(unknown)
+    assert up.PENDING_WINDOW_S == 5.0
+
+
+def test_a_welded_dwell_parameter_still_breaks_the_wait():
+    # review finding (PR #13, Codex round 5): ``G4 P600000S0`` is a ten-minute dwell written
+    # without spaces; the dwell must be read with the same tokenizer as a move, never split
+    frame = _two_tool_frame().replace("; nozzle_temperature = 210,210", "; nozzle_temperature = 210,220", 1)
+    change = "M6211 T1 L34.9 M523 N523 Q210 R240 S210"
+    probe = frame.replace(change, "M83\nM104 S220\nG4 P600000S0\nG1 E-2 F1800\n" + change.replace("S210", "S220"), 1)
+    with pytest.raises(PrinterError) as bad:
+        up.parse_gcode_text(probe)
+    assert "no M109 was ever waited" in bad.value.message
+
+
 def test_an_empty_position_in_a_per_tool_list_refuses_instead_of_shifting_tool_numbers():
     # review finding (PR #11): ``PLA;;PETG`` once collapsed to ["PLA", "PETG"], handing tool 2's
     # PETG to tool 1 — for a per-tool key the position IS the tool number, so a blank is a tool
